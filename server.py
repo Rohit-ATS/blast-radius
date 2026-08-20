@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import blast
+import intel
 from hydra import Hydra, HydraError, nid
 from ingest import DEPS_DB, SIDECAR_SCHEMA
 
@@ -366,6 +367,38 @@ async def api_lockfile(request: Request,
     return {**result, "latency_ms": round(ms, 1)}
 
 
+@app.post("/api/audit")
+async def api_audit(request: Request,
+                    max_detail: int = Query(60, ge=1, le=300)):
+    """Scan a whole package-lock.json against the live advisory database.
+
+    Distinct from /api/lockfile, which answers "am I exposed to *this* named
+    incident". This asks the question you actually have before anyone tells you
+    there is an incident: is anything in my tree already known to be malicious?
+    It needs no graph coverage at all — the lockfile is the tree.
+    """
+    raw = await request.body()
+    if not raw:
+        return fail("empty body — POST the package-lock.json as the request body")
+    if len(raw) > 64 * 1024 * 1024:
+        return fail("lockfile larger than 64MB", status=413)
+    try:
+        resolved = blast.parse_lockfile(raw.decode("utf-8"))
+    except UnicodeDecodeError:
+        return fail("lockfile is not valid UTF-8")
+    except json.JSONDecodeError as e:
+        return fail(f"not valid JSON: {e}")
+    except ValueError as e:
+        return fail(str(e))
+    if not resolved:
+        return fail("no resolved packages found in that lockfile")
+
+    result = intel.audit_tree(resolved, max_detail=max_detail)
+    verdict = ("COMPROMISED" if result["malicious_count"]
+               else "VULNERABLE" if result["vulnerable_count"] else "CLEAN")
+    return {**result, "verdict": verdict}
+
+
 @app.get("/api/maintainers")
 def api_maintainers(name: str = Query(..., min_length=1, max_length=214),
                     limit: int = Query(200, ge=1, le=2000)):
@@ -379,6 +412,49 @@ def api_maintainers(name: str = Query(..., min_length=1, max_length=214),
         result["message"] = (f"'{name}' is in the graph, but the crawl has not "
                              f"recorded its maintainers yet.")
     return {**result, "name": name, "latency_ms": round(ms, 1)}
+
+
+@app.get("/api/intel")
+def api_intel(name: str = Query(..., min_length=1, max_length=214),
+              version: str | None = Query(None, max_length=64)):
+    """Is this package real, current, and compromised? — live, for any of npm.
+
+    This is the half the graph cannot answer. The crawl covers 27k packages;
+    npm has 4.3 million, and none of them carry a "this is malware" flag in
+    their dependency edges. Registry and OSV are queried at request time, so
+    this works for a package published a minute ago.
+    """
+    result = intel.assess(name, version)
+    with db() as conn:
+        row = conn.execute("SELECT crawled FROM packages WHERE name = ?",
+                           (name,)).fetchone()
+    result["in_graph"] = row is not None
+    result["blast_radius_available"] = bool(row and row[0])
+    return JSONResponse(result, status_code=200 if result.get("exists") else 404)
+
+
+@app.get("/api/fix")
+def api_fix(name: str = Query(..., min_length=1, max_length=214),
+            bad_version: str = Query(..., min_length=1, max_length=64),
+            depth: int = Query(5, ge=1, le=blast.MAX_DEPTH)):
+    """A remediation bundle: the safe version, the exact commands, the
+    `overrides` block, and a self-contained brief for a coding agent.
+
+    Knowing you are exposed is only half of it. This is the half that closes
+    the incident — and the safe version it names is checked against OSV rather
+    than assumed to be `latest`.
+    """
+    dependents: list[str] = []
+    try:
+        ok, _ = known(name)
+        if ok:
+            victims, _ = blast.victim_set(hydra, name, depth)
+            dependents = sorted(victims)
+    except HydraError:
+        pass                       # remediation must work with the graph down
+    result = intel.remediation(name, bad_version, dependents=dependents)
+    return JSONResponse(result,
+                        status_code=200 if result.get("verdict") != "unknown_package" else 404)
 
 
 @app.get("/api/subgraph")
