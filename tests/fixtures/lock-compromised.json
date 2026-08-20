@@ -1,0 +1,29 @@
+{
+  "name": "victim-app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {
+      "name": "victim-app",
+      "version": "1.0.0"
+    },
+    "node_modules/express": {
+      "version": "4.18.2"
+    },
+    "node_modules/debug": {
+      "version": "4.4.2"
+    },
+    "node_modules/ua-parser-js": {
+      "version": "0.7.29"
+    },
+    "node_modules/lodash": {
+      "version": "4.17.20"
+    },
+    "node_modules/ms": {
+      "version": "2.0.0"
+    },
+    "node_modules/react": {
+      "version": "18.2.0"
+    }
+  }
+}
