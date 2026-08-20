@@ -86,10 +86,27 @@ def new_edges(db, kind, pairs):
 
 # --------------------------------------------------------------------------
 
-def do_maintainers(h, db, chunk):
-    rows = db.execute("SELECT maintainer, package FROM maintainers").fetchall()
+def do_maintainers(h, db, chunk, min_dependents=10):
+    """Only maintainers of packages that something actually depends on.
+
+    Measured the hard way: HydraDB 0.1.0 traversal cost scales with the *total*
+    size of the store, not just the edges being walked. Loading all 77,232
+    maintainer links tripled the store and pushed depth-4 and depth-5
+    REQUIRED_BY traversals past the engine's own 30-second query ceiling — the
+    product's hot path stopped working because of edges it never touches.
+
+    A maintainer whose packages have no dependents has no blast radius to
+    compute, so the cut costs nothing that matters and keeps the store inside
+    the envelope where deep traversals complete.
+    """
+    rows = db.execute(
+        """SELECT m.maintainer, m.package FROM maintainers m
+           WHERE (SELECT count(*) FROM deps d
+                  WHERE d.dst = m.package AND d.kind = 'prod') >= ?""",
+        (min_dependents,)).fetchall()
     names = sorted({m for m, _ in rows})
-    print(f"[maintainers] {len(names):,} people, {len(rows):,} relationships")
+    print(f"[maintainers] {len(names):,} people, {len(rows):,} relationships "
+          f"(packages with >= {min_dependents} dependents)")
 
     h.write_batch(UPSERT_NODES % "Maintainer",
                   [{"id": nid("maint:" + m), "name": m} for m in names],
@@ -233,6 +250,8 @@ def main():
                    help="packages to ask OSV about")
     p.add_argument("--top", type=int, default=4000,
                    help="most-depended-on names to build SIMILAR_TO around")
+    p.add_argument("--min-dependents", type=int, default=10,
+                   help="only link maintainers of packages this depended-upon")
     p.add_argument("--only", choices=("maintainers", "advisories", "similar"))
     args = p.parse_args()
 
@@ -244,7 +263,7 @@ def main():
 
     started = time.time()
     if args.only in (None, "maintainers"):
-        do_maintainers(h, db, args.chunk)
+        do_maintainers(h, db, args.chunk, args.min_dependents)
     if args.only in (None, "advisories"):
         do_advisories(h, db, args.chunk, args.limit)
     if args.only in (None, "similar"):

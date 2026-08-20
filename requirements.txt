@@ -8,6 +8,7 @@
 requests>=2.31           # HydraDB HTTP client + npm registry crawler
 fastapi>=0.110           # the API
 uvicorn[standard]>=0.29  # ASGI server for it
+pyyaml>=6.0              # yarn-berry and pnpm lockfiles are YAML
 
 # --- development ---------------------------------------------------------
 pytest>=8.0              # py -m pytest tests

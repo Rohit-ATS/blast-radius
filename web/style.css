@@ -81,8 +81,8 @@ code, pre, .mono { font-family: var(--mono); text-transform: none; }
 .nav { display: flex; gap: 18px; margin-left: 8px; }
 .nav a { color: var(--ink-2); text-decoration: none; font-size: 13.5px; }
 .nav a:hover { color: var(--ink); }
+#resetall { margin-left: auto; }
 .livestats {
-  margin-left: auto;
   display: flex;
   align-items: center;
   gap: 8px;
