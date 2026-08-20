@@ -474,6 +474,27 @@ function boot() {
   wireEvents();
   loadPeeks();
 
+  // One control that puts the page back to a cold start. Recording a video
+  // means running the same flow repeatedly, and reloading loses the warm
+  // caches that make the second take fast.
+  $('#resetall').addEventListener('click', () => {
+    $('#results').hidden = true;
+    $('#auditresult').hidden = true;
+    $('#lockresult').hidden = true;
+    $('#pkg').value = '';
+    $('#ver').value = '';
+    $('#verdictline').innerHTML = '';
+    $('#latency').textContent = '—';
+    $('#latencysub').textContent = '';
+    ['#hist', '#victims', '#semver', '#maint', '#typos', '#auditfindings',
+     '#lockdetail'].forEach(sel => { const el = $(sel); if (el) el.innerHTML = ''; });
+    closeSuggest();
+    resetGraph();
+    expandNode('debug', 'package', true);
+    syncUrl('', '');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  });
+
   // A result is a thing you send to a colleague at 2am, so every query is
   // reflected in the URL and every URL restores the query.
   const params = new URLSearchParams(location.search);

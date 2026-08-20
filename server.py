@@ -78,6 +78,44 @@ RATE_LIMIT = int(os.environ.get("RATE_LIMIT", "120"))
 # npm's published package count, used only to state coverage honestly.
 NPM_TOTAL = 4_310_000
 
+# Demo safety. DEMO_MODE=1 serves captured real responses for the preset
+# incidents, so a recording is deterministic and instant. Independently of that
+# flag, a captured response is used as a *fallback* whenever a live call fails:
+# better to show the real answer recorded ten minutes ago than a stack trace
+# because the wifi dropped. Anything served this way says so — `demo: true` —
+# because a fixture presented as a live query would be a lie.
+DEMO_MODE = os.environ.get("DEMO_MODE", "") == "1"
+DEMO_PATH = os.path.join(HERE, "fixtures", "demo.json")
+_demo: dict = {}
+
+
+def load_demo():
+    global _demo
+    try:
+        with open(DEMO_PATH, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        _demo = {v["path"]: v for v in raw.values()}
+        return len(_demo)
+    except Exception:
+        _demo = {}
+        return 0
+
+
+def demo_key(request) -> str:
+    q = request.url.query
+    return f"{request.url.path}?{q}" if q else request.url.path
+
+
+def demo_for(request):
+    """A captured response for this exact path and query string, or None."""
+    hit = _demo.get(demo_key(request))
+    if not hit:
+        return None
+    body = dict(hit["body"])
+    body["demo"] = True
+    body["demo_captured_at"] = hit.get("captured_at")
+    return JSONResponse(body, status_code=hit.get("status", 200))
+
 
 def db() -> sqlite3.Connection:
     """A fresh read connection per request. WAL means readers never block the
@@ -226,11 +264,32 @@ async def envelope(request: Request, call_next):
                 status_code=429,
                 headers={"Retry-After": str(retry), "X-Request-Id": rid})
 
+    if DEMO_MODE and path.startswith("/api/"):
+        canned = demo_for(request)
+        if canned is not None:
+            canned.headers["X-Request-Id"] = rid
+            canned.headers["X-Demo-Mode"] = "1"
+            return canned
+
     try:
         response = await call_next(request)
     except HydraError as exc:
+        canned = demo_for(request)
+        if canned is not None:
+            apimeta.log("served_fixture", request_id=rid, path=path,
+                        reason="hydra_error")
+            canned.headers["X-Request-Id"] = rid
+            canned.headers["X-Demo-Fallback"] = "1"
+            return canned
         response = await hydra_down(request, exc)
     except Exception as exc:                       # never a bare 500
+        canned = demo_for(request)
+        if canned is not None:
+            apimeta.log("served_fixture", request_id=rid, path=path,
+                        reason=exc.__class__.__name__)
+            canned.headers["X-Request-Id"] = rid
+            canned.headers["X-Demo-Fallback"] = "1"
+            return canned
         apimeta.log("unhandled", request_id=rid, path=path,
                     error=f"{exc.__class__.__name__}: {exc}"[:300])
         response = JSONResponse(
@@ -325,17 +384,30 @@ def _probe_writable() -> None:
         time.sleep(WRITE_PROBE_INTERVAL)
 
 
+_warm_done: set[tuple[str, int]] = set()
+
+
 def _warm_once() -> None:
-    """Walk the depths in order for a few high-fan-in packages.
+    """Walk the depths in order for a few high-fan-in packages, incrementally.
 
     In order on purpose: depth 1 is cheap and caches the pages depth 2 needs,
     and so on. Going straight to depth 5 on a cold store just burns the query
-    timeout repeatedly without making progress.
+    timeout without making progress.
+
+    Crucially this remembers what already succeeded. The first version
+    restarted the whole sequence whenever any depth failed, so a store where
+    depth 4 needed three attempts would re-run depths 1-3 forever and never
+    converge — it sat at "warming" for 811 seconds in testing while a manual
+    retry of depth 4 succeeded on the third try. Each pass now only attempts
+    what is still outstanding, so every attempt moves forward.
     """
-    for name in WARM_PACKAGES:
-        for depth in range(1, blast.MAX_DEPTH_DEFAULT + 1):
-            hydra_patient.query(blast.REACH_COUNT % depth, {"id": nid(name)},
-                                retries=1)
+    outstanding = [(n, d) for n in WARM_PACKAGES
+                   for d in range(1, blast.MAX_DEPTH_DEFAULT + 1)
+                   if (n, d) not in _warm_done]
+    for name, depth in outstanding:
+        hydra_patient.query(blast.REACH_COUNT % depth, {"id": nid(name)},
+                            retries=1)
+        _warm_done.add((name, depth))
 
 
 def _warm_supervisor() -> None:
@@ -363,9 +435,11 @@ def _warm_supervisor() -> None:
                 _warm["event"].set()
                 break
             except Exception as e:
+                total = len(WARM_PACKAGES) * blast.MAX_DEPTH_DEFAULT
                 _warm.update(state="warming", detail=str(e)[:160],
+                             progress=f"{len(_warm_done)}/{total}",
                              elapsed_s=round(time.time() - started, 1))
-                time.sleep(3)
+                time.sleep(2)
         # Warm. Watch for it going away again.
         while True:
             time.sleep(WARM_PROBE_INTERVAL)
@@ -373,12 +447,16 @@ def _warm_supervisor() -> None:
                 hydra_patient.query(blast.REACH_COUNT % 1,
                                     {"id": nid(WARM_PACKAGES[0])}, retries=1)
             except Exception as e:
+                _warm_done.clear()
                 _warm.update(state="warming", detail=f"probe failed: {e}"[:160])
                 break
 
 
 @app.on_event("startup")
 def _start_background_threads():
+    n = load_demo()
+    apimeta.log("startup", demo_mode=DEMO_MODE, fixtures=n,
+                rate_limit=RATE_LIMIT)
     threading.Thread(target=_warm_supervisor, daemon=True, name="warm").start()
     threading.Thread(target=_probe_writable, daemon=True, name="writable").start()
     threading.Thread(target=_refresh_graph_counts, daemon=True,
@@ -552,7 +630,15 @@ async def api_audit(request: Request,
     except lockfiles.LockfileError as e:
         return fail(str(e), code="unreadable_lockfile")
 
-    result = intel.audit_tree(resolved, max_detail=max_detail)
+    try:
+        result = intel.audit_tree(resolved, max_detail=max_detail)
+    except Exception:
+        canned = _demo.get("/api/audit")
+        if canned is None:
+            raise
+        body = dict(canned["body"])
+        body["demo"] = True
+        return JSONResponse(body)
     result["lockfile_format"] = kind
     verdict = ("COMPROMISED" if result["malicious_count"]
                else "VULNERABLE" if result["vulnerable_count"] else "CLEAN")
