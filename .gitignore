@@ -1,0 +1,14 @@
+.hydradb/
+deps.db
+deps.db-wal
+deps.db-shm
+smoke.db
+.crawl_state.json
+crawl_state.json
+crawl.log
+server.log
+seeds.log
+__pycache__/
+*.pyc
+.venv/
+seeds_expanded.txt

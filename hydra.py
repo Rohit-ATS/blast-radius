@@ -5,6 +5,7 @@ Python driver works. HTTP is used here because it has no driver dependency,
 no routing table negotiation, and gives clearer errors while iterating fast.
 """
 
+import hashlib
 import json
 import os
 import time
@@ -20,6 +21,10 @@ HYDRA_CELL = os.environ.get("HYDRA_CELL", "cell-0")
 
 class HydraError(RuntimeError):
     pass
+
+
+# Reserved id for the readiness round-trip. Deleted immediately after use.
+_PROBE_ID = 999999999999999
 
 
 class Hydra:
@@ -83,8 +88,14 @@ class Hydra:
             try:
                 if requests.get(f"{admin}/readyz", timeout=5).status_code < 400:
                     # A listening port is not proof. Round-trip a write.
-                    self.query("CREATE (p:_Probe {id: 'ready'})")
-                    self.query("MATCH (p:_Probe {id: 'ready'}) DELETE p")
+                    # Two constraints shape this probe: the id must be an
+                    # integer (string ids are rejected at parse time), and MERGE
+                    # only executes inside UNWIND ("MERGE with following clauses
+                    # is not executable"). A bare MERGE here would make a healthy
+                    # server look permanently unready.
+                    self.query("UNWIND $rows AS row MERGE (p {id: row.id}) SET p:_Probe",
+                               {"rows": [{"id": _PROBE_ID}]})
+                    self.query("MATCH (p {id: $id}) DETACH DELETE p", {"id": _PROBE_ID})
                     return
             except Exception:
                 pass
@@ -116,6 +127,11 @@ def _rows(payload: Any) -> list[dict]:
 
 
 def _unwrap(v: Any) -> Any:
+    # A null comes back as {"type": "null"} with no "value" key at all, which
+    # is easy to miss: without this branch it survives as a truthy dict and an
+    # absent property reads as present.
+    if isinstance(v, dict) and v.get("type") == "null" and "value" not in v:
+        return None
     if isinstance(v, dict) and set(v.keys()) == {"type", "value"}:
         return v["value"]
     if isinstance(v, dict):
@@ -125,7 +141,38 @@ def _unwrap(v: Any) -> Any:
     return v
 
 
+# --------------------------------------------------------------------------
+# vertex ids
+# --------------------------------------------------------------------------
+#
+# HydraDB 0.1.0 addresses vertices by non-negative integer id only — a string
+# id is rejected at parse time ("UNWIND row 0 field id must be a non-negative
+# integer"). There is also no CREATE INDEX, so there is no server-side way to
+# look a package up by name before writing it.
+#
+# Both problems have the same answer: derive the id from the name. nid() is a
+# pure function, so any process — crawler, API, benchmark — computes the same
+# id for "left-pad" without a round-trip, and writes become idempotent upserts
+# addressed by id.
+#
+# 51 bits keeps every id inside JavaScript's safe integer range (2^53-1) so the
+# browser can hold one without precision loss. Collision odds over 100k
+# packages are ~2e-6; ingest.py records the name->id map in deps.db and flags a
+# collision if two names ever land on one id.
+
+_NID_BITS = 51
+_NID_MASK = (1 << _NID_BITS) - 1
+
+
+def nid(name: str) -> int:
+    """Stable non-negative integer vertex id for a package name."""
+    digest = hashlib.blake2b(name.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big") & _NID_MASK
+
+
 if __name__ == "__main__":
     h = Hydra()
     h.wait_ready()
     print("hydradb ready and round-tripping writes")
+    for sample in ("left-pad", "debug", "@types/node"):
+        print(f"  nid({sample!r}) = {nid(sample)}")

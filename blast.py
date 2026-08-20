@@ -11,157 +11,353 @@ Five questions, one per feature in the demo:
                            (i.e. what gets attacked next)
   5. typosquat_ring()      Which near-miss names sit next to the target?
 
-Everything returns (rows, latency_ms) so the UI can show real numbers.
+Everything returns (result, latency_ms) so the UI can show real numbers. The
+latency is measured around the actual call, not estimated.
+
+Which store answers which question
+----------------------------------
+Reachability — "who is transitively exposed" — is the graph's job, and the only
+part of this that a relational database does badly. Everything that is a
+*predicate* rather than a *traversal* (does this range admit 4.4.2, who else
+does this maintainer publish) is answered from the deps.db sidecar, because
+HydraDB 0.1.0 cannot filter on edge properties mid-traversal. See ingest.py.
 """
 
 import json
 import re
+import sqlite3
 from functools import lru_cache
 
-from hydra import Hydra
+from hydra import Hydra, nid
+
+MAX_DEPTH = 8
+
+
+def _depth(depth: int) -> int:
+    """HydraDB rejects a parameter as the hop bound ("unbounded variable-length
+    MATCH requires an explicit max hop"), so the depth is interpolated into the
+    query string. That makes it the one piece of user input that reaches Cypher
+    as text — clamp it to a small integer and never pass it through raw."""
+    d = int(depth)
+    if d < 1 or d > MAX_DEPTH:
+        raise ValueError(f"depth must be 1..{MAX_DEPTH}, got {depth}")
+    return d
+
 
 # --------------------------------------------------------------------------
-# 1. blast radius — collapsed REQUIRES layer, one variable-length hop
+# 0. is this package even in the graph yet?
 # --------------------------------------------------------------------------
 
-BLAST_RADIUS = """
-MATCH path = (victim:Package)-[:REQUIRES*1..%d]->(target:Package {name: $name})
-RETURN victim.name AS victim,
-       length(path) AS depth
-ORDER BY depth ASC, victim ASC
-LIMIT $limit
-"""
+# The label matters. `MATCH (p {id: $id})` addresses a vertex slot directly and
+# happily returns a row of nulls for an id that was never written, so it can
+# never say "no". Scoping to :Package makes it an actual existence test.
+EXISTS = "MATCH (p:Package {id: $id}) RETURN p.name"
 
-BLAST_COUNT_BY_DEPTH = """
-MATCH path = (victim:Package)-[:REQUIRES*1..%d]->(target:Package {name: $name})
-RETURN length(path) AS depth, count(DISTINCT victim.name) AS packages
-ORDER BY depth ASC
-"""
 
-# The same shape via HydraDB's native path procedure. Snapshot-scoped,
-# GraphBLAS-backed, no client-side fan-out. Use for the deep/wide case.
-BLAST_RADIUS_NATIVE = """
-CALL algo.SSpaths({
-  sourceLabel: 'Package',
-  sourceProperty: 'name',
-  sourceValues: [$name],
-  relTypes: ['REQUIRES'],
-  relDirection: 'incoming',
-  maxLen: $depth,
-  pathCount: $path_count,
-  resultLimit: $limit
-})
-YIELD path
-RETURN path
-"""
+def resolve_package(h: Hydra, name: str):
+    """(known, latency_ms). The crawl runs in the background, so 'not here yet'
+    is a normal answer during a demo, not an error — the API says so plainly
+    instead of returning an empty blast radius that looks like safety."""
+    rows, ms = h.timed(EXISTS, {"id": nid(name)})
+    return bool(rows and rows[0].get("p.name")), ms
+
+
+# --------------------------------------------------------------------------
+# 1. blast radius — one traversal from the compromised package
+# --------------------------------------------------------------------------
+#
+# The edge is stored (dependency)-[:REQUIRED_BY]->(dependent), so this walks
+# *outward* from the compromised package to everything that transitively pulls
+# it. See ingest.py for why the edge points that way.
+#
+# count(*) on a variable-length match returns the number of distinct reachable
+# vertices, not the number of paths — verified against a diamond-shaped graph
+# in probe_counts.py. That is what makes the depth histogram cheap: ask for the
+# cumulative count at each bound and difference the series, rather than
+# enumerating paths and grouping by length (which needs length(path), and
+# HydraDB 0.1.0 only returns <binding>.<property> or count(*)).
+
+REACH_COUNT = "MATCH (t {id: $id})-[:REQUIRED_BY*1..%d]->(v) RETURN count(*)"
+REACH_NAMES = "MATCH (t {id: $id})-[:REQUIRED_BY*1..%d]->(v) RETURN DISTINCT v.name LIMIT $limit"
 
 
 def blast_radius(h: Hydra, name: str, depth: int = 5, limit: int = 5000):
-    return h.timed(BLAST_RADIUS % depth, {"name": name, "limit": limit})
+    """Everything that transitively depends on `name`, with a per-depth
+    breakdown. Returns ({total, histogram, victims, truncated}, latency_ms)."""
+    d = _depth(depth)
+    target = nid(name)
+    ms_total = 0.0
+
+    cumulative = []
+    for k in range(1, d + 1):
+        rows, ms = h.timed(REACH_COUNT % k, {"id": target})
+        ms_total += ms
+        cumulative.append(rows[0]["count(*)"] if rows else 0)
+
+    # Differencing the cumulative reach gives packages *first* reached at k.
+    histogram = []
+    prev = 0
+    for k, total in enumerate(cumulative, start=1):
+        histogram.append({"depth": k, "packages": max(total - prev, 0)})
+        prev = total
+
+    rows, ms = h.timed(REACH_NAMES % d, {"id": target, "limit": limit})
+    ms_total += ms
+    victims = sorted(r["v.name"] for r in rows if r.get("v.name"))
+
+    return {
+        "total": cumulative[-1] if cumulative else 0,
+        "histogram": histogram,
+        "victims": victims,
+        "truncated": len(victims) >= limit,
+        "depth": d,
+    }, ms_total
 
 
-def blast_summary(h: Hydra, name: str, depth: int = 5):
-    return h.timed(BLAST_COUNT_BY_DEPTH % depth, {"name": name})
+def victim_set(h: Hydra, name: str, depth: int = 5, limit: int = 200_000):
+    """Just the reachable names, as a set. Used by the lockfile check."""
+    d = _depth(depth)
+    rows, ms = h.timed(REACH_NAMES % d, {"id": nid(name), "limit": limit})
+    return {r["v.name"] for r in rows if r.get("v.name")}, ms
+
+
+def stats(h: Hydra, db: sqlite3.Connection | None = None):
+    """Graph size + crawl progress. Both counts are real queries; HydraDB plans
+    them as full scans (it warns as much in its own logs), which is why the
+    server caches the result for a few seconds rather than asking per request."""
+    ms_total = 0.0
+    rows, ms = h.timed("MATCH (p:Package) RETURN count(*)")
+    ms_total += ms
+    packages = rows[0]["count(*)"] if rows else 0
+    rows, ms = h.timed("MATCH ()-[r:REQUIRED_BY]->() RETURN count(*)")
+    ms_total += ms
+    edges = rows[0]["count(*)"] if rows else 0
+
+    out = {"packages": packages, "edges": edges, "latency_ms": round(ms_total, 1)}
+    if db is not None:
+        meta = dict(db.execute("SELECT key, value FROM meta"))
+        crawled = db.execute("SELECT count(*) FROM packages WHERE crawled = 1").fetchone()[0]
+        out["crawl"] = {
+            "crawled": crawled,
+            "known": db.execute("SELECT count(*) FROM packages").fetchone()[0],
+            "queued": int(meta.get("queued", 0)),
+            "running": "finished_at" not in meta,
+            "collisions": db.execute("SELECT count(*) FROM collisions").fetchone()[0],
+        }
+    return out
 
 
 # --------------------------------------------------------------------------
 # 2. would-resolve — the query a vector index cannot express at all
 # --------------------------------------------------------------------------
 
-DIRECT_DEPENDERS = """
-MATCH (r:Release)-[d:DEPENDS_ON]->(p:Package {name: $name})
-RETURN r.id AS release, r.name AS package, r.version AS version,
-       r.published_at AS published_at, d.range AS range, d.kind AS kind
-LIMIT $limit
+DEPENDERS_SQL = """
+SELECT name, version, range, kind
+FROM release_deps
+WHERE dep = ?
+ORDER BY name, version
 """
 
 
-def would_resolve(h: Hydra, name: str, bad_version: str, limit: int = 20000):
+def would_resolve(db: sqlite3.Connection, name: str, bad_version: str, limit: int = 20000):
     """Of everyone who depends on the package, whose declared semver range
     actually admits the malicious version? Listing a dependency is not the
     same as pulling it. This is the difference between a scary number and a
-    true one."""
-    rows, ms = h.timed(DIRECT_DEPENDERS, {"name": name, "limit": limit})
-    hits, safe = [], 0
-    for r in rows:
-        if satisfies(bad_version, r.get("range", "")):
-            hits.append(r)
-        else:
-            safe += 1
-    return {"exposed": hits, "shielded_by_pin": safe, "checked": len(rows)}, ms
+    true one.
+
+    Ranges live in SQLite rather than on the graph edges because HydraDB 0.1.0
+    cannot filter on edge properties during a traversal — the range would be
+    unreachable exactly when it matters.
+    """
+    import time
+    t0 = time.perf_counter()
+    rows = db.execute(DEPENDERS_SQL, (name,)).fetchall()[:limit]
+
+    exposed, shielded = {}, {}
+    for dependent, version, rng, kind in rows:
+        if dependent == name:
+            continue
+        bucket = exposed if satisfies(bad_version, rng or "") else shielded
+        bucket.setdefault(dependent, []).append(
+            {"version": version, "range": rng, "kind": kind})
+
+    # A package counts as exposed if *any* of its releases would have pulled it.
+    for dependent in list(shielded):
+        if dependent in exposed:
+            del shielded[dependent]
+
+    ms = (time.perf_counter() - t0) * 1000.0
+    return {
+        "bad_version": bad_version,
+        "exposed_count": len(exposed),
+        "shielded_count": len(shielded),
+        "checked": len(rows),
+        "exposed": [{"name": k, "ranges": sorted({r["range"] for r in v})}
+                    for k, v in sorted(exposed.items())],
+        "shielded": [{"name": k, "ranges": sorted({r["range"] for r in v})}
+                     for k, v in sorted(shielded.items())],
+    }, ms
 
 
 # --------------------------------------------------------------------------
 # 3. lockfile exposure
 # --------------------------------------------------------------------------
 
-LOCKFILE_PATHS = """
-UNWIND $names AS mine
-MATCH path = (m:Package {name: mine})-[:REQUIRES*0..%d]->(t:Package {name: $name})
-RETURN mine AS entry, length(path) AS depth
-ORDER BY depth ASC
-LIMIT $limit
-"""
-
 
 def parse_lockfile(text: str) -> dict[str, str]:
-    """package-lock.json v2/v3 -> {name: resolved_version}."""
+    """package-lock.json v1/v2/v3 -> {name: resolved_version}.
+
+    v2/v3 carry a flat `packages` map keyed by install path; v1 carries a
+    *nested* `dependencies` tree, so that branch recurses. Both shapes appear
+    in the wild and npm still emits v1 for older projects.
+    """
     data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("lockfile must be a JSON object")
     out: dict[str, str] = {}
+
     for path, meta in (data.get("packages") or {}).items():
         if not path or not isinstance(meta, dict):
             continue
         name = meta.get("name") or path.split("node_modules/")[-1]
         if name and meta.get("version"):
             out[name] = meta["version"]
-    for name, meta in (data.get("dependencies") or {}).items():
-        if isinstance(meta, dict) and meta.get("version"):
-            out.setdefault(name, meta["version"])
+
+    def walk(tree: dict) -> None:
+        for name, meta in (tree or {}).items():
+            if not isinstance(meta, dict):
+                continue
+            if meta.get("version"):
+                out.setdefault(name, meta["version"])
+            walk(meta.get("dependencies") or {})
+
+    walk(data.get("dependencies") or {})
     return out
 
 
-def lockfile_exposure(h: Hydra, lock_text: str, name: str, bad_version: str | None = None,
-                      depth: int = 5, limit: int = 2000):
+def shortest_path(db: sqlite3.Connection, roots: list[str], target: str,
+                  max_depth: int = 8) -> list[str] | None:
+    """Reconstruct one concrete root -> ... -> target chain.
+
+    The graph answers *whether* you are exposed. It cannot hand back the path:
+    HydraDB 0.1.0 has no path binding in RETURN. The chain is rebuilt from the
+    sidecar's edge table, walking backwards from the compromised package to
+    whichever of your direct dependencies reaches it first.
+    """
+    if target in roots:
+        return [target]
+    seen = {target}
+    frontier = [target]
+    parent: dict[str, str] = {}
+    rootset = set(roots)
+    for _ in range(max_depth):
+        if not frontier:
+            break
+        placeholders = ",".join("?" * len(frontier))
+        rows = db.execute(
+            f"SELECT src, dst FROM deps WHERE dst IN ({placeholders}) AND kind = 'prod'",
+            frontier).fetchall()
+        nxt = []
+        for src, dst in rows:
+            if src in seen:
+                continue
+            seen.add(src)
+            parent[src] = dst
+            if src in rootset:
+                chain = [src]
+                while chain[-1] in parent:
+                    chain.append(parent[chain[-1]])
+                return chain
+            nxt.append(src)
+        frontier = nxt
+    return None
+
+
+def lockfile_exposure(h: Hydra, db: sqlite3.Connection, lock_text: str, name: str,
+                      bad_version: str | None = None, depth: int = 5,
+                      max_paths: int = 12):
+    """Verdict for a real package-lock.json: EXPOSED / SHIELDED / CLEAR.
+
+    EXPOSED  the compromised package is in your tree (directly or transitively)
+    SHIELDED it is in your tree, but the version you resolved is not the bad one
+    CLEAR    it is not in your tree at all
+    """
     resolved = parse_lockfile(lock_text)
+    victims, ms = victim_set(h, name, depth)
+
+    affected = sorted(set(resolved) & victims)
     direct = None
     if name in resolved:
-        v = resolved[name]
-        direct = {"version": v, "malicious": bad_version is not None and v == bad_version}
-    rows, ms = h.timed(LOCKFILE_PATHS % depth,
-                       {"names": list(resolved.keys()), "name": name, "limit": limit})
-    return {"resolved_count": len(resolved), "direct": direct, "paths": rows}, ms
+        pinned = resolved[name]
+        direct = {"version": pinned,
+                  "malicious": bad_version is not None and pinned == bad_version}
+
+    if name in resolved:
+        verdict = "EXPOSED" if (bad_version is None or direct["malicious"]) else "SHIELDED"
+    elif affected:
+        verdict = "EXPOSED"
+    else:
+        verdict = "CLEAR"
+
+    paths = []
+    for entry in affected[:max_paths]:
+        chain = shortest_path(db, [entry], name)
+        if chain:
+            paths.append({"entry": entry, "path": chain, "depth": len(chain) - 1})
+    if name in resolved and not paths:
+        paths.append({"entry": name, "path": [name], "depth": 0})
+
+    return {
+        "verdict": verdict,
+        "resolved_count": len(resolved),
+        "compromised": name,
+        "bad_version": bad_version,
+        "direct": direct,
+        "affected": affected,
+        "affected_count": len(affected),
+        "paths": paths,
+    }, ms
 
 
 # --------------------------------------------------------------------------
 # 4. maintainer pivot — where the attacker goes next
 # --------------------------------------------------------------------------
 
-MAINTAINER_PIVOT = """
-MATCH (compromised:Package {name: $name})-[:MAINTAINED_BY]->(m:Maintainer)
-MATCH (sibling:Package)-[:MAINTAINED_BY]->(m)
-WHERE sibling.name <> $name
-OPTIONAL MATCH (dependent:Package)-[:REQUIRES]->(sibling)
-RETURN m.name AS maintainer, sibling.name AS also_controls,
-       count(DISTINCT dependent) AS direct_dependents
-ORDER BY direct_dependents DESC
-LIMIT $limit
-"""
 
+def maintainer_pivot(db: sqlite3.Connection, name: str, limit: int = 200):
+    """Everything else the compromised package's maintainers publish. One
+    stolen npm token is rarely one package — this is the next blast radius.
 
-def maintainer_pivot(h: Hydra, name: str, limit: int = 200):
-    return h.timed(MAINTAINER_PIVOT, {"name": name, "limit": limit})
+    Ownership is a two-hop join, not a transitive walk, so it belongs in the
+    sidecar. `direct_dependents` is a real count from the same edge table the
+    graph was built from.
+    """
+    import time
+    t0 = time.perf_counter()
+    owners = [r[0] for r in db.execute(
+        "SELECT maintainer FROM maintainers WHERE package = ?", (name,))]
+    siblings = []
+    if owners:
+        placeholders = ",".join("?" * len(owners))
+        rows = db.execute(
+            f"""SELECT m.package, group_concat(DISTINCT m.maintainer),
+                       (SELECT count(*) FROM deps d WHERE d.dst = m.package)
+                FROM maintainers m
+                WHERE m.maintainer IN ({placeholders}) AND m.package <> ?
+                GROUP BY m.package
+                ORDER BY 3 DESC, 1 ASC
+                LIMIT ?""",
+            (*owners, name, limit)).fetchall()
+        siblings = [{"package": p, "maintainers": (o or "").split(","),
+                     "direct_dependents": n} for p, o, n in rows]
+    ms = (time.perf_counter() - t0) * 1000.0
+    return {"maintainers": owners, "also_controls": siblings,
+            "sibling_count": len(siblings)}, ms
 
 
 # --------------------------------------------------------------------------
 # 5. typosquat ring
 # --------------------------------------------------------------------------
-
-NEIGHBOR_NAMES = """
-UNWIND $candidates AS cand
-MATCH (p:Package {name: cand})
-OPTIONAL MATCH (d:Package)-[:REQUIRES]->(p)
-RETURN p.name AS name, p.latest AS latest, count(d) AS dependents
-"""
 
 
 def edit1(name: str) -> set[str]:
@@ -179,8 +375,37 @@ def edit1(name: str) -> set[str]:
     return {n for n in out if len(n) > 2}
 
 
-def typosquat_ring(h: Hydra, name: str):
-    return h.timed(NEIGHBOR_NAMES, {"candidates": sorted(edit1(name))})
+def typosquat_ring(db: sqlite3.Connection, name: str):
+    """Which one-edit neighbours of this name actually exist on npm."""
+    import time
+    t0 = time.perf_counter()
+    cands = sorted(edit1(name))
+    hits = []
+    if cands:
+        placeholders = ",".join("?" * len(cands))
+        hits = [{"name": n, "latest": v,
+                 "direct_dependents": db.execute(
+                     "SELECT count(*) FROM deps WHERE dst = ?", (n,)).fetchone()[0]}
+                for n, v in db.execute(
+                    f"SELECT name, latest FROM packages WHERE name IN ({placeholders})",
+                    cands)]
+    ms = (time.perf_counter() - t0) * 1000.0
+    return {"candidates": len(cands), "existing": sorted(
+        hits, key=lambda r: -r["direct_dependents"])}, ms
+
+
+def search(db: sqlite3.Connection, q: str, limit: int = 12):
+    """Autocomplete over every package name the crawl has seen."""
+    import time
+    t0 = time.perf_counter()
+    rows = db.execute(
+        """SELECT name, latest, crawled FROM packages
+           WHERE name LIKE ? ESCAPE '\\'
+           ORDER BY crawled DESC, length(name) ASC, name ASC LIMIT ?""",
+        (q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%", limit)
+    ).fetchall()
+    ms = (time.perf_counter() - t0) * 1000.0
+    return [{"name": n, "latest": v, "crawled": bool(c)} for n, v, c in rows], ms
 
 
 # --------------------------------------------------------------------------
