@@ -16,3 +16,4 @@ __pycache__/
 *.pyc
 .venv/
 seeds_expanded.txt
+bench.log
