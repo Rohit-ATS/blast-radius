@@ -17,12 +17,17 @@ import threading
 import time
 
 from fastapi import FastAPI, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
 
+import apimeta
 import blast
 import chains
 import intel
+import lockfiles
 import scan
 from hydra import Hydra, HydraError, nid
 from ingest import DEPS_DB, SIDECAR_SCHEMA
@@ -66,6 +71,13 @@ _writable: dict = {"ok": None, "detail": "not probed yet", "at": 0.0}
 WRITE_PROBE_INTERVAL = 300.0
 _WRITE_PROBE_ID = 999999999999998
 
+# Requests per minute per IP. The server makes OSV and registry calls on the
+# caller's behalf, so an unbounded client is an unbounded bill for someone.
+RATE_LIMIT = int(os.environ.get("RATE_LIMIT", "120"))
+
+# npm's published package count, used only to state coverage honestly.
+NPM_TOTAL = 4_310_000
+
 
 def db() -> sqlite3.Connection:
     """A fresh read connection per request. WAL means readers never block the
@@ -84,8 +96,10 @@ def ensure_db() -> None:
         conn.close()
 
 
-def fail(message: str, status: int = 400, **extra):
-    return JSONResponse({"error": message, **extra}, status_code=status)
+def fail(message: str, status: int = 400, code: str = "bad_request", **extra):
+    """Every failure carries a machine-readable code as well as prose."""
+    return JSONResponse({"ok": False, "error": code, "message": message, **extra},
+                        status_code=status)
 
 
 @app.exception_handler(HydraError)
@@ -147,6 +161,131 @@ def not_yet(name: str, ms: float):
         "packages_crawled": crawled,
         "latency_ms": round(ms, 1),
     }, status_code=404)
+
+
+# --------------------------------------------------------------------------
+# cross-cutting: envelope, rate limit, compression, request id, logging
+# --------------------------------------------------------------------------
+
+apimeta.setup_logging()
+_cache = apimeta.Cache()
+_limiter = apimeta.RateLimiter(limit=RATE_LIMIT, window=60.0)
+
+# Which store actually answered each path, so a response can say so rather than
+# leaving the reader to guess whether a number came from the graph or a cache.
+_SOURCE = {
+    "/api/blast": "hydradb", "/api/subgraph": "hydradb", "/api/expand": "hydradb",
+    "/api/attack-surface": "hydradb", "/api/why-exposed": "hydradb",
+    "/api/blast-advisory": "hydradb", "/api/typosquat-risk": "hydradb",
+    "/api/stats": "sidecar", "/api/health": "sidecar", "/api/search": "sidecar",
+    "/api/maintainers": "sidecar", "/api/resolve": "sidecar",
+    "/api/lockfile": "hydradb",
+    "/api/intel": "osv", "/api/audit": "osv", "/api/fix": "osv",
+    "/api/typosquats": "registry", "/api/scan": "registry",
+}
+
+
+def graph_coverage():
+    """How much of npm the graph actually holds. Published on every response
+    because it is the single honest caveat on any traversal answer."""
+    try:
+        with db() as conn:
+            crawled = conn.execute(
+                "SELECT count(*) FROM packages WHERE crawled = 1").fetchone()[0]
+            known = conn.execute("SELECT count(*) FROM packages").fetchone()[0]
+        return {"packages_in_graph": known, "packages_crawled": crawled,
+                "npm_total_estimate": NPM_TOTAL,
+                "fraction": round(known / NPM_TOTAL, 5)}
+    except Exception:
+        return None
+
+
+app.add_middleware(GZipMiddleware, minimum_size=800)
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["*"],
+    expose_headers=["X-Request-Id", "X-Response-Time-Ms"],
+)
+
+
+@app.middleware("http")
+async def envelope(request: Request, call_next):
+    rid = apimeta.request_id()
+    request.state.request_id = rid
+    started = time.perf_counter()
+    path = request.url.path
+
+    if path.startswith("/api/") and path not in ("/api/health", "/api/events"):
+        ok, retry = _limiter.check(request.client.host if request.client else "?")
+        if not ok:
+            return JSONResponse(
+                {"ok": False, "error": "rate_limited",
+                 "message": f"more than {RATE_LIMIT} requests a minute from this "
+                            f"address; try again in {retry}s.",
+                 "retry_after_s": retry, "request_id": rid},
+                status_code=429,
+                headers={"Retry-After": str(retry), "X-Request-Id": rid})
+
+    try:
+        response = await call_next(request)
+    except HydraError as exc:
+        response = await hydra_down(request, exc)
+    except Exception as exc:                       # never a bare 500
+        apimeta.log("unhandled", request_id=rid, path=path,
+                    error=f"{exc.__class__.__name__}: {exc}"[:300])
+        response = JSONResponse(
+            {"ok": False, "error": "internal_error",
+             "message": "the server failed to handle this request.",
+             "detail": f"{exc.__class__.__name__}: {exc}"[:300],
+             "request_id": rid},
+            status_code=500)
+
+    took = (time.perf_counter() - started) * 1000
+    response.headers["X-Request-Id"] = rid
+    response.headers["X-Response-Time-Ms"] = f"{took:.1f}"
+    if path.startswith("/api/"):
+        apimeta.log("request", request_id=rid, path=path,
+                    method=request.method, status=response.status_code,
+                    ms=round(took, 1))
+    return response
+
+
+class EnvelopeRoute(APIRoute):
+    """Attach the same metadata to every JSON body the API returns."""
+
+    def get_route_handler(self):
+        original = super().get_route_handler()
+
+        async def handler(request: Request):
+            response = await original(request)
+            ctype = response.headers.get("content-type", "")
+            if not ctype.startswith("application/json"):
+                return response
+            try:
+                body = json.loads(response.body)
+            except Exception:
+                return response
+            if not isinstance(body, dict):
+                return response
+
+            path = request.url.path
+            body.setdefault("ok", response.status_code < 400)
+            body.setdefault("source", _SOURCE.get(path, "hydradb"))
+            body.setdefault("request_id", getattr(request.state, "request_id", None))
+            if path not in ("/api/health",):
+                cov = graph_coverage()
+                if cov:
+                    body.setdefault("graph_coverage", cov)
+            body.setdefault("cached", False)
+            return JSONResponse(body, status_code=response.status_code,
+                                headers={k: v for k, v in response.headers.items()
+                                         if k.lower() not in ("content-length",
+                                                              "content-type")})
+
+        return handler
+
+
+app.router.route_class = EnvelopeRoute
 
 
 # --------------------------------------------------------------------------
@@ -302,6 +441,23 @@ def api_health():
     if out["status"] == "ok" and _warm["state"] != "warm":
         out["status"] = "warming"
 
+    t_osv = time.perf_counter()
+    try:
+        probe = intel.osv_query("debug", "4.4.2")
+        out["components"]["osv"] = {
+            "up": bool(probe.get("ok")),
+            "latency_ms": round((time.perf_counter() - t_osv) * 1000, 1),
+            "advisories_for_probe": len(probe.get("vulns", [])),
+        }
+        if not probe.get("ok"):
+            out["components"]["osv"]["error"] = probe.get("error")
+    except Exception as e:
+        out["components"]["osv"] = {"up": False, "error": str(e)[:160]}
+
+    out["uptime_s"] = apimeta.uptime_seconds()
+    out["cache"] = _cache.stats()
+    out["rate_limit"] = {"per_minute": RATE_LIMIT}
+
     measured = _graph_cache.get("value")
     out["components"]["graph_measurement"] = (
         {"taken": True, "age_s": round(time.time() - _graph_cache["at"], 1), **measured}
@@ -371,7 +527,10 @@ async def api_lockfile(request: Request,
 
 @app.post("/api/audit")
 async def api_audit(request: Request,
-                    max_detail: int = Query(60, ge=1, le=300)):
+                    max_detail: int = Query(60, ge=1, le=300),
+                    filename: str = Query("", max_length=120,
+                                          description="used only to disambiguate "
+                                                      "the lockfile format")):
     """Scan a whole package-lock.json against the live advisory database.
 
     Distinct from /api/lockfile, which answers "am I exposed to *this* named
@@ -385,17 +544,16 @@ async def api_audit(request: Request,
     if len(raw) > 64 * 1024 * 1024:
         return fail("lockfile larger than 64MB", status=413)
     try:
-        resolved = blast.parse_lockfile(raw.decode("utf-8"))
+        text = raw.decode("utf-8")
     except UnicodeDecodeError:
-        return fail("lockfile is not valid UTF-8")
-    except json.JSONDecodeError as e:
-        return fail(f"not valid JSON: {e}")
-    except ValueError as e:
-        return fail(str(e))
-    if not resolved:
-        return fail("no resolved packages found in that lockfile")
+        return fail("lockfile is not valid UTF-8", code="bad_encoding")
+    try:
+        resolved, kind = lockfiles.parse_any(text, filename)
+    except lockfiles.LockfileError as e:
+        return fail(str(e), code="unreadable_lockfile")
 
     result = intel.audit_tree(resolved, max_detail=max_detail)
+    result["lockfile_format"] = kind
     verdict = ("COMPROMISED" if result["malicious_count"]
                else "VULNERABLE" if result["vulnerable_count"] else "CLEAN")
     return {**result, "verdict": verdict}
