@@ -453,6 +453,7 @@ function boot() {
   wireAudit();
   wireMap();
   wireGraph();
+  wireFeed();
   expandNode('debug', 'package', true);
 
   $('#queryform').addEventListener('submit', e => {
@@ -831,6 +832,9 @@ function wireEvents() {
     sseSeen = true;
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     try { applyStats(JSON.parse(e.data)); } catch { /* keep the last good frame */ }
+  });
+  sse.addEventListener('publish', e => {
+    try { renderTicks(JSON.parse(e.data).events || []); } catch { /* next frame */ }
   });
   sse.addEventListener('error', () => {
     // EventSource reconnects on its own, so polling only takes over if the
@@ -1253,4 +1257,91 @@ function resetGraph() {
   G.alpha = 0;
   paint();
   graphStat();
+}
+
+/* ---------------------------------------------------------------- live feed */
+/* Publishes arrive on the same SSE stream as the system stats. Most of them are
+ * somebody's first version with nothing downstream, and the ticker says so
+ * rather than dressing every publish up as an event — the ones that matter are
+ * the packages the graph already knows thousands of things depend on. */
+
+const seenTicks = new Set();
+
+function ago(ts) {
+  const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  return `${Math.round(s / 3600)}h ago`;
+}
+
+function tickRow(e) {
+  const reach = e.advisories && e.advisories.length
+    ? esc(e.advisories[0].id)
+    : e.dependents
+      ? `${num(e.dependents)} depend on it`
+      : e.in_graph ? 'no dependents yet' : 'not in graph';
+  return `<div class="tick ${esc(e.level)}" data-at="${e.at}" data-name="${esc(e.name)}">
+      <span class="ago">${ago(e.at)}</span>
+      <span class="who">${esc(e.name)}<span style="color:var(--ink-3)">@${esc(e.version)}</span></span>
+      <span class="reach">${reach}</span>
+    </div>`;
+}
+
+function renderTicks(events) {
+  const box = $('#ticker');
+  const fresh = events.filter(e => !seenTicks.has(e.name + '@' + e.version + e.at));
+  if (!fresh.length) return;
+  fresh.forEach(e => seenTicks.add(e.name + '@' + e.version + e.at));
+  // Newest first, and never let the list grow without bound.
+  box.insertAdjacentHTML('afterbegin', fresh.map(tickRow).join(''));
+  [...box.children].slice(40).forEach(el => el.remove());
+  if (seenTicks.size > 400) seenTicks.clear();
+}
+
+function refreshAgo() {
+  $$('#ticker .tick').forEach(el => {
+    const at = +el.dataset.at;
+    if (at) el.querySelector('.ago').textContent = ago(at);
+  });
+}
+
+async function pollFeed() {
+  try {
+    const d = await api('/api/feed?limit=25');
+    const stat = $('#feedstat');
+    if (!d.running) {
+      stat.textContent = 'feed off';
+      if (!$('#ticker').children.length) {
+        $('#ticker').innerHTML =
+          '<div class="empty">the live feed is disabled in demo mode.</div>';
+      }
+      return;
+    }
+    stat.textContent =
+      `${num(d.publishes_seen)} publishes seen · ${num(d.polls)} polls`
+      + (d.npm_total ? ` · npm has ${num(d.npm_total)} packages` : '');
+    if (d.events.length) renderTicks(d.events);
+    else if (!$('#ticker').children.length) {
+      $('#ticker').innerHTML =
+        '<div class="empty">watching npm — nothing published in the last few seconds.</div>';
+    }
+  } catch (err) {
+    $('#feedstat').textContent = 'feed unavailable';
+  }
+}
+
+function wireFeed() {
+  pollFeed();
+  // The SSE stream pushes publishes as they land; this is the floor under it
+  // so the panel still fills if the stream never opened.
+  setInterval(pollFeed, 15000);
+  setInterval(refreshAgo, 5000);
+
+  $('#ticker').addEventListener('click', e => {
+    const row = e.target.closest('.tick');
+    if (!row) return;
+    $('#pkg').value = row.dataset.name;
+    $('#ver').value = '';
+    runQuery(row.dataset.name, '');
+  });
 }
