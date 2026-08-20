@@ -198,6 +198,69 @@ def check_sampled_packages(res, db, n):
               "; ".join(bad[:4]) if bad else f"{n}/{n} clean")
 
 
+def check_map(res):
+    """The drawable slice, for each preset — this is what the map renders."""
+    print(f"\n{YELLOW}blast map{OFF}")
+    for name, _ in PRESETS:
+        r, ms = get("/api/subgraph", name=name, depth=3)
+        res.time("GET /api/subgraph", ms)
+        if not res.check(f"subgraph {name}", r.status_code == 200,
+                         f"HTTP {r.status_code}"):
+            continue
+        d = r.json()
+        names = {n["name"] for n in d["nodes"]}
+        depth_of = {n["name"]: n["depth"] for n in d["nodes"]}
+        res.check(f"subgraph {name} is drawable",
+                  bool(names) and all(e["from"] in names and e["to"] in names
+                                      for e in d["edges"]),
+                  f"{len(d['nodes'])} nodes, {len(d['edges'])} edges "
+                  f"of {d['total_exposed']:,} exposed")
+        orphans = [n["name"] for n in d["nodes"] if n["depth"] > 0
+                   and not any(e["to"] == n["name"]
+                               and depth_of[e["from"]] == n["depth"] - 1
+                               for e in d["edges"])]
+        res.check(f"subgraph {name} has no floating nodes", not orphans,
+                  "; ".join(orphans[:3]))
+
+
+def check_events(res):
+    """Server-sent events: a real frame, not just a 200."""
+    print(f"\n{YELLOW}live event stream{OFF}")
+    try:
+        t0 = time.perf_counter()
+        with requests.get(f"{BASE}/api/events", stream=True, timeout=30) as r:
+            ok = r.status_code == 200 and "text/event-stream" in r.headers.get(
+                "content-type", "")
+            payload = None
+            for raw in r.iter_lines(decode_unicode=True):
+                if raw and raw.startswith("data: "):
+                    payload = json.loads(raw[6:])
+                    break
+                if time.perf_counter() - t0 > 20:
+                    break
+        res.time("GET /api/events (first frame)", (time.perf_counter() - t0) * 1000)
+        res.check("event stream opens", ok)
+        res.check("event stream pushes a real frame",
+                  bool(payload) and payload.get("packages", 0) > 0,
+                  f"{payload.get('packages', 0):,} packages, "
+                  f"warmup={payload.get('warmup')}" if payload else "no frame")
+    except Exception as e:
+        res.check("event stream opens", False, f"{e.__class__.__name__}: {e}"[:150])
+
+
+def check_typosquats(res):
+    print(f"\n{YELLOW}typosquat ring{OFF}")
+    for name, _ in PRESETS:
+        r, ms = get("/api/typosquats", name=name)
+        res.time("GET /api/typosquats", ms)
+        if not res.check(f"typosquats {name}", r.status_code == 200,
+                         f"HTTP {r.status_code}"):
+            continue
+        d = r.json()
+        res.check(f"typosquats {name} checked the registry", d["checked_live"],
+                  f"{len(d['existing'])} of {d['candidates']} variants are real")
+
+
 def check_search(res, db):
     print(f"\n{YELLOW}search{OFF}")
     for q in ("deb", "expr", "@types/", "react", "lodash"):
@@ -362,6 +425,35 @@ def check_browser(res):
                 res.check("lockfile drop renders a verdict",
                           pg.text_content("#verdict .word") == "EXPOSED",
                           pg.text_content("#verdict .word"))
+            pg.wait_for_selector("#map .node", timeout=120_000)
+            res.check("blast map drew nodes and edges",
+                      pg.eval_on_selector_all("#map .node", "e => e.length") > 1
+                      and pg.eval_on_selector_all("#map .edge", "e => e.length") > 0,
+                      f'{pg.eval_on_selector_all("#map .node", "e => e.length")} nodes')
+            box = pg.eval_on_selector(
+                "#map",
+                "el => { const b = el.getBBox();"
+                " return [b.x, b.y, b.x + b.width, b.y + b.height]; }")
+            res.check("map stays inside its viewBox",
+                      box[0] >= -2 and box[1] >= -2 and box[2] <= 762 and box[3] <= 762,
+                      str([round(v) for v in box]))
+            res.check("status cards are live",
+                      pg.eval_on_selector_all("#syscards .card", "e => e.length") >= 6)
+            before = pg.input_value("#pkg")
+            pg.eval_on_selector_all(
+                "#map .node",
+                "els => els.find(e => !e.classList.contains('root') &&"
+                " !e.classList.contains('label')).dispatchEvent("
+                "new MouseEvent('click', {bubbles: true}))")
+            try:
+                pg.wait_for_function(
+                    "v => document.querySelector('#pkg').value !== v",
+                    arg=before, timeout=60_000)
+                pivoted = pg.input_value("#pkg")
+            except Exception:
+                pivoted = before
+            res.check("clicking a node pivots the console", pivoted != before,
+                      f"{before} -> {pivoted}")
             res.check("zero console errors", not errors, str(errors[:2]))
             b.close()
     except Exception as e:
@@ -463,6 +555,9 @@ def main():
         check_consistency(res, db)
         check_presets(res)
         check_sampled_packages(res, db, args.sample)
+        check_map(res)
+        check_events(res)
+        check_typosquats(res)
         check_search(res, db)
         check_lockfiles(res)
         check_failure_modes(res)

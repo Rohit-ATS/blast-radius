@@ -29,6 +29,7 @@ import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
+from urllib.parse import quote
 
 from hydra import Hydra, RESULT_LIMIT, nid
 
@@ -141,6 +142,107 @@ def victim_set(h: Hydra, name: str, depth: int = 5, limit: int = RESULT_LIMIT):
     rows, ms = h.timed(REACH_NAMES % d, {"id": nid(name),
                                          "limit": min(limit, RESULT_LIMIT)})
     return {r["v.name"] for r in rows if r.get("v.name")}, ms
+
+
+def subgraph(h: Hydra, db: sqlite3.Connection, name: str, depth: int = 3,
+             per_level: int = 28, max_nodes: int = 160):
+    """A drawable slice of the blast radius: nodes tagged with the depth they
+    are first reached at, plus the edges between them.
+
+    Two layers again, each doing what it is good at. HydraDB supplies the
+    authoritative reachable set at every depth — that is the traversal, and the
+    `total` it reports is the real, untruncated number. The sidecar supplies
+    the concrete edge list, because HydraDB 0.1.0 cannot return a path or a
+    relationship binding, only endpoint properties.
+
+    A depth-3 radius around a popular package reaches thousands of packages,
+    which is not a picture. Each level is therefore capped at the most-depended
+    -upon `per_level` nodes, expanded only from nodes already kept, so what is
+    drawn is always a connected slice rather than scattered dots. The response
+    says how much it left out; the UI says so too.
+    """
+    d = _depth(depth)
+    target = nid(name)
+    t0 = time.perf_counter()
+
+    # Authoritative reach per depth, from the graph.
+    cumulative, reach = [], []
+    with ThreadPoolExecutor(max_workers=d) as pool:
+        jobs = [pool.submit(
+            lambda k: {r["v.name"] for r in
+                       h.query(REACH_NAMES % k, {"id": target,
+                                                 "limit": RESULT_LIMIT})
+                       if r.get("v.name")}, k) for k in range(1, d + 1)]
+        for j in jobs:
+            reach.append(j.result())
+            cumulative.append(len(reach[-1]))
+
+    # First-reached depth per package: in reach[k] but not reach[k-1].
+    depth_of: dict[str, int] = {}
+    seen: set[str] = set()
+    for k, names in enumerate(reach, start=1):
+        for n in names - seen:
+            depth_of[n] = k
+        seen |= names
+
+    degree = {r[0]: r[1] for r in db.execute(
+        "SELECT dst, count(*) FROM deps WHERE kind = 'prod' GROUP BY dst")}
+
+    # Grow level by level from the root, keeping the best-connected nodes that
+    # actually attach to something already drawn.
+    kept: dict[str, int] = {name: 0}
+    frontier = [name]
+    edges: list[tuple[str, str]] = []
+    for level in range(1, d + 1):
+        if not frontier or len(kept) >= max_nodes:
+            break
+        placeholders = ",".join("?" * len(frontier))
+        rows = db.execute(
+            f"SELECT src, dst FROM deps WHERE dst IN ({placeholders}) "
+            f"AND kind = 'prod'", frontier).fetchall()
+        candidates = {}
+        for src, dst in rows:
+            if src in kept or depth_of.get(src) != level:
+                continue
+            candidates.setdefault(src, []).append(dst)
+        ranked = sorted(candidates, key=lambda n: -degree.get(n, 0))
+        room = min(per_level, max_nodes - len(kept))
+        chosen = ranked[:max(room, 0)]
+        for n in chosen:
+            kept[n] = level
+            for parent in candidates[n]:
+                edges.append((parent, n))
+        frontier = chosen
+
+    # Edges among everything kept, not just the ones that introduced a node —
+    # the cross-links are what make it look like a graph instead of a tree.
+    if kept:
+        placeholders = ",".join("?" * len(kept))
+        names = list(kept)
+        extra = db.execute(
+            f"SELECT src, dst FROM deps WHERE kind = 'prod' "
+            f"AND src IN ({placeholders}) AND dst IN ({placeholders})",
+            names + names).fetchall()
+        seen_edges = set(edges)
+        for src, dst in extra:
+            if (dst, src) not in seen_edges and src != dst:
+                seen_edges.add((dst, src))
+                edges.append((dst, src))
+
+    ms = (time.perf_counter() - t0) * 1000.0
+    total = cumulative[-1] if cumulative else 0
+    return {
+        "root": name,
+        "depth": d,
+        "total_exposed": total,
+        "shown": len(kept) - 1,
+        "truncated": (len(kept) - 1) < total,
+        "nodes": [{"name": n, "depth": lvl, "dependents": degree.get(n, 0)}
+                  for n, lvl in sorted(kept.items(), key=lambda kv: (kv[1], kv[0]))],
+        "edges": [{"from": a, "to": b} for a, b in edges],
+        "histogram": [{"depth": k, "packages": max(c - (cumulative[k - 2] if k > 1 else 0), 0)}
+                      for k, c in enumerate(cumulative, start=1)],
+    }, ms
 
 
 def graph_stats(h: Hydra):
@@ -432,23 +534,69 @@ def edit1(name: str) -> set[str]:
     return {n for n in out if len(n) > 2}
 
 
-def typosquat_ring(db: sqlite3.Connection, name: str):
-    """Which one-edit neighbours of this name actually exist on npm."""
-    import time
+_REGISTRY = "https://registry.npmjs.org"
+_SLIM = {"Accept": "application/vnd.npm.install-v1+json",
+         "User-Agent": "blast-radius-hackhydra/0.1"}
+
+
+def _npm_exists(session, candidate: str, timeout: float):
+    """Does this name exist on npm at all? Returns (name, latest) or None."""
+    try:
+        r = session.get(f"{_REGISTRY}/{quote(candidate, safe='@')}",
+                        headers=_SLIM, timeout=timeout)
+        if r.status_code != 200:
+            return None
+        return candidate, (r.json().get("dist-tags", {}) or {}).get("latest", "")
+    except Exception:
+        return None
+
+
+def typosquat_ring(db: sqlite3.Connection, name: str, live: bool = True,
+                   timeout: float = 4.0):
+    """Which one-edit neighbours of this name are real packages.
+
+    The crawled corpus is popularity-weighted, and a typosquat is by definition
+    a package nobody depends on — so checking only the sidecar reliably returns
+    nothing, which is worse than useless: it reads as "you are safe". The
+    candidates are therefore checked against the npm registry itself, in
+    parallel, and each hit is marked with whether it is also in our graph.
+
+    If the registry is unreachable the corpus answer is still returned, with
+    `live` false, rather than silently downgrading to "nothing found".
+    """
     t0 = time.perf_counter()
     cands = sorted(edit1(name))
-    hits = []
+    in_corpus = {}
     if cands:
         placeholders = ",".join("?" * len(cands))
-        hits = [{"name": n, "latest": v,
-                 "direct_dependents": db.execute(
-                     "SELECT count(*) FROM deps WHERE dst = ?", (n,)).fetchone()[0]}
-                for n, v in db.execute(
-                    f"SELECT name, latest FROM packages WHERE name IN ({placeholders})",
-                    cands)]
+        in_corpus = {n: v for n, v in db.execute(
+            f"SELECT name, latest FROM packages WHERE name IN ({placeholders})",
+            cands)}
+
+    found: dict[str, str] = dict(in_corpus)
+    checked_live = False
+    if live and cands:
+        try:
+            import requests
+            session = requests.Session()
+            with ThreadPoolExecutor(max_workers=min(10, len(cands))) as pool:
+                for hit in pool.map(lambda c: _npm_exists(session, c, timeout), cands):
+                    if hit:
+                        found.setdefault(hit[0], hit[1])
+            checked_live = True
+        except Exception:
+            checked_live = False
+
+    hits = [{"name": n,
+             "latest": v or "",
+             "in_graph": n in in_corpus,
+             "direct_dependents": db.execute(
+                 "SELECT count(*) FROM deps WHERE dst = ?", (n,)).fetchone()[0]}
+            for n, v in found.items()]
     ms = (time.perf_counter() - t0) * 1000.0
-    return {"candidates": len(cands), "existing": sorted(
-        hits, key=lambda r: -r["direct_dependents"])}, ms
+    return {"candidates": len(cands),
+            "checked_live": checked_live,
+            "existing": sorted(hits, key=lambda r: (-r["direct_dependents"], r["name"]))}, ms
 
 
 def search(db: sqlite3.Connection, q: str, limit: int = 12):

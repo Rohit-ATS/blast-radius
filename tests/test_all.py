@@ -596,6 +596,83 @@ def test_api_lockfile_v1_fixture(requests_mod):
     assert d["resolved_count"] == 3
 
 
+def test_api_subgraph_structure(requests_mod, seeded):
+    """The drawable slice must be internally consistent: every edge endpoint is
+    a node, depths only ever increase along an edge, and the root is depth 0."""
+    d = requests_mod.get(f"{BASE}/api/subgraph",
+                         params={"name": seeded, "depth": 3}, timeout=180).json()
+    names = {n["name"] for n in d["nodes"]}
+    depth_of = {n["name"]: n["depth"] for n in d["nodes"]}
+    assert d["root"] == seeded
+    assert depth_of[seeded] == 0
+    assert names, "no nodes returned"
+    for e in d["edges"]:
+        assert e["from"] in names and e["to"] in names, e
+    # Depth is the *shortest* distance from the root, so a cross-link may point
+    # from a deeper node back to a shallower one — a package reached at depth 2
+    # by one route can also be depended on by something at depth 3. What must
+    # hold for the drawing to make sense is that every node has a parent one
+    # ring inward, so nothing floats unattached.
+    for n in d["nodes"]:
+        if n["depth"] == 0:
+            continue
+        parents = [e["from"] for e in d["edges"] if e["to"] == n["name"]]
+        assert any(depth_of[p] == n["depth"] - 1 for p in parents), \
+            f"{n['name']} at depth {n['depth']} has no parent at depth {n['depth'] - 1}"
+    # Every non-root node must be reachable from something already drawn.
+    reachable = {seeded}
+    for _ in range(d["depth"] + 1):
+        for e in d["edges"]:
+            if e["from"] in reachable:
+                reachable.add(e["to"])
+    assert names <= reachable, names - reachable
+
+
+def test_api_subgraph_honours_its_own_caps(requests_mod, seeded):
+    d = requests_mod.get(f"{BASE}/api/subgraph",
+                         params={"name": seeded, "depth": 2, "per_level": 5,
+                                 "max_nodes": 12}, timeout=180).json()
+    assert len(d["nodes"]) <= 12
+    for level in (1, 2):
+        assert sum(1 for n in d["nodes"] if n["depth"] == level) <= 5
+    # The headline number stays the true one even when the drawing is a sample.
+    assert d["total_exposed"] >= d["shown"]
+    if d["shown"] < d["total_exposed"]:
+        assert d["truncated"] is True
+
+
+def test_api_subgraph_unknown_package(requests_mod):
+    r = requests_mod.get(f"{BASE}/api/subgraph",
+                         params={"name": "no-such-package-zzz-9182"}, timeout=60)
+    assert r.status_code == 404
+
+
+def test_api_typosquats_checks_the_registry(requests_mod, seeded):
+    """The crawled corpus is popularity-weighted and typosquats are by
+    definition unpopular, so a corpus-only answer reads as 'you are safe'."""
+    d = requests_mod.get(f"{BASE}/api/typosquats",
+                         params={"name": seeded}, timeout=120).json()
+    assert d["candidates"] > 0
+    assert set(h["name"] for h in d["existing"]) <= set(blast.edit1(seeded))
+    for h in d["existing"]:
+        assert "in_graph" in h and "latest" in h
+
+
+def test_api_events_streams_real_frames(requests_mod):
+    """Server-sent events, read far enough to see one real stats frame."""
+    with requests_mod.get(f"{BASE}/api/events", stream=True, timeout=30) as r:
+        assert r.status_code == 200
+        assert "text/event-stream" in r.headers["content-type"]
+        payload = None
+        for raw in r.iter_lines(decode_unicode=True):
+            if raw and raw.startswith("data: "):
+                payload = json.loads(raw[6:])
+                break
+        assert payload is not None, "no data frame arrived"
+        assert payload["packages"] > 0 and payload["edges"] > 0
+        assert "warmup" in payload and "crawl" in payload
+
+
 def test_api_serves_the_console(requests_mod):
     for path, needle in (("/", b"blast radius"), ("/app.js", b"draggable"),
                          ("/style.css", b"--paper")):
@@ -685,6 +762,48 @@ def test_ui_lockfile_drop(page):
         "document.querySelector('#verdict .word')?.textContent?.match(/EXPOSED|SHIELDED|CLEAR/)",
         timeout=90_000)
     assert page.text_content("#verdict .word") in ("EXPOSED", "SHIELDED", "CLEAR")
+
+
+def test_ui_blast_map_draws(page):
+    page.wait_for_selector("#map .node", timeout=120_000)
+    nodes = page.eval_on_selector_all("#map .node", "e => e.length")
+    edges = page.eval_on_selector_all("#map .edge", "e => e.length")
+    assert nodes > 1 and edges > 0, f"{nodes} nodes, {edges} edges"
+    # Rim labels and leaders must stay inside the viewBox, or they are clipped.
+    box = page.eval_on_selector(
+        "#map", "el => { const b = el.getBBox(); return [b.x, b.y, b.x + b.width, b.y + b.height]; }")
+    assert box[0] >= -2 and box[1] >= -2, box
+    assert box[2] <= 762 and box[3] <= 762, box
+    assert page.eval_on_selector_all("#map .node.label", "e => e.length") > 0
+
+
+def test_ui_map_click_pivots_the_console(page):
+    page.wait_for_selector("#map .node", timeout=120_000)
+    before = page.input_value("#pkg")
+    page.eval_on_selector_all(
+        "#map .node",
+        "els => els.find(e => !e.classList.contains('root') && "
+        "!e.classList.contains('label')).dispatchEvent("
+        "new MouseEvent('click', {bubbles: true}))")
+    page.wait_for_function(
+        f"document.querySelector('#pkg').value !== {before!r}", timeout=60_000)
+    after = page.input_value("#pkg")
+    assert after and after != before
+    # The pivot must be shareable, not just visible.
+    assert "pkg=" in page.url
+
+
+def test_ui_status_cards_are_live(page):
+    page.wait_for_selector("#syscards .card", timeout=60_000)
+    assert page.eval_on_selector_all("#syscards .card", "e => e.length") >= 6
+    text = page.text_content("#syscards")
+    assert "hydradb" in text and "writable" in text
+    assert any(c.isdigit() for c in text)
+
+
+def test_ui_typosquat_panel(page):
+    page.wait_for_selector("#typos .r, #typos .empty", timeout=120_000)
+    assert (page.text_content("#typos") or "").strip()
 
 
 def test_ui_no_console_errors(page):
