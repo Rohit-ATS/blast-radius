@@ -1,0 +1,38 @@
+# Blast Radius scanning its own dependencies on every push.
+#
+# `cli.py audit` talks only to osv.dev and the npm registry, so it needs no
+# HydraDB and no crawl — it runs in a bare container. It exits 1 when anything
+# in the tree is confirmed malicious, which is what lets it fail a build.
+name: supply chain
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # A clean tree today can be compromised tomorrow without you changing a
+    # line, so this also runs on a timer rather than only on push.
+    - cron: "0 7 * * *"
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install requests pyyaml
+
+      - name: Audit the lockfile fixture
+        run: python cli.py audit tests/fixtures/lock-clean.json
+
+      - name: Prove the scanner actually fails on malware
+        run: |
+          if python cli.py audit tests/fixtures/lock-compromised.json; then
+            echo "::error::a tree containing debug@4.4.2 was reported clean"
+            exit 1
+          fi
+          echo "correctly exited non-zero on a compromised tree"

@@ -17,3 +17,4 @@ __pycache__/
 .venv/
 seeds_expanded.txt
 bench.log
+.claude/

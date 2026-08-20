@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(ls -la \"/c/Users/rohit/Videos/FinanceOS\" 2>&1 | head -30; echo \"=== find blast/hydra/ingest py ===\"; find /c/Users/rohit -maxdepth 4 \\\\\\( -name \"blast.py\" -o -name \"hydra.py\" -o -name \"ingest.py\" -o -name \"seeds.txt\" \\\\\\) 2>/dev/null | head -20)",
-      "Read(//c/Users/rohit/**)",
-      "PowerShell(py probe_constraints.py)"
-    ]
-  }
-}
