@@ -20,6 +20,8 @@ py server.py                  # http://127.0.0.1:8000
 py cli.py audit ./package-lock.json
 ```
 
+![The Blast Radius console](docs/images/hero.png)
+
 ---
 
 ## Why this is a graph problem
@@ -39,6 +41,8 @@ moves. That is a graph question, and it is the one that matters after a
 maintainer gets phished.
 
 ## Everything is a node
+
+![Architecture: topology in the graph, predicates in the sidecar, truth from live sources](docs/images/architecture.png)
 
 ```
 (:Package    {id, name, latest})
@@ -129,6 +133,14 @@ compromised package is the one thing you know for certain. The write path pays a
 trivial cost (swap two fields); the read path becomes one legal traversal
 instead of an illegal scan.
 
+### The radius, drawn
+
+Concentric rings by dependency depth, red attenuating outward. A node's ring is
+a real property of the graph — the depth HydraDB first reaches it at — not a
+layout convenience. Click any node and the whole console pivots onto it.
+
+![The blast radius of debug, drawn as concentric rings by depth](docs/images/blast-map.png)
+
 ## Two layers, on purpose
 
 | layer | store | holds |
@@ -162,6 +174,12 @@ The universal features need no crawl — your lockfile *is* your tree. The graph
 powers the differentiated layer on top. Every API response carries
 `graph_coverage`, so the caveat travels with the data instead of living in a
 footnote.
+
+Drop a real lockfile and every resolved package goes to OSV. Expanding a finding
+loads the fix inline — the safe version, the `overrides` block that forces every
+transitive copy, and a self-contained brief for a coding agent:
+
+![A compromised lockfile: debug@4.4.2 and ua-parser-js@0.7.29 flagged as malware, with the remediation expanded](docs/images/audit.png)
 
 ## HydraDB 0.1.0: constraints we hit and engineered around
 
@@ -385,6 +403,23 @@ it runs in a bare CI container.
 Every response carries `latency_ms` measured around the real query, plus `ok`,
 `source`, `graph_coverage`, `cached` and `request_id`. Interactive docs at
 `/api/docs`.
+
+## Walk the graph yourself
+
+Every circle is a HydraDB vertex. Clicking one asks the database what is
+adjacent to it, across all six edge types — the browser holds no model of the
+graph. Colour is by node kind, size by dependent count, red for malicious.
+
+![The graph explorer: packages, maintainers and advisories as a force-directed graph](docs/images/explorer.png)
+
+## npm, right now
+
+Every package published in the last few minutes, checked against the graph as it
+arrives. Most publishes are somebody's first version with nothing downstream —
+the ticker dims those and highlights the packages thousands of things already
+depend on, because that is the moment a supply-chain attack goes live.
+
+![The live npm publish ticker](docs/images/live-feed.png)
 
 ## Demo safety
 
