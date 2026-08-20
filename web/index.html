@@ -186,6 +186,37 @@
     </div>
   </section>
 
+  <!-- ------------------------------------------------------------ explorer -->
+  <section class="explorer" id="explorer">
+    <h2>walk the graph yourself</h2>
+    <p class="lede">every node here is a real vertex in hydradb. click one and the browser
+      asks the database what is adjacent to it — packages, the people who publish them,
+      and the advisories filed against them, all in one graph.</p>
+
+    <div class="win">
+      <div class="bar">
+        <i class="dot r"></i><i class="dot a"></i><i class="dot g"></i>
+        <span class="title">graph explorer</span>
+        <span class="barctl">
+          <button type="button" class="mini" data-seed="debug" data-kind="package">debug</button>
+          <button type="button" class="mini" data-seed="qix" data-kind="maintainer">qix</button>
+          <button type="button" class="mini" data-seed="getcookies" data-kind="package">getcookies</button>
+          <button type="button" class="mini" id="explorerreset">reset</button>
+        </span>
+      </div>
+      <div class="body nopad">
+        <div class="graphwrap">
+          <svg id="graph" viewBox="0 0 1000 620" role="img"
+               aria-label="interactive view of the hydradb graph"></svg>
+          <div class="maptip" id="graphtip" hidden></div>
+          <div class="graphlegend" id="graphlegend"></div>
+          <div class="graphstat" id="graphstat"></div>
+        </div>
+      </div>
+      <div class="cap">hydradb-explorer — click a node to expand it, drag to rearrange</div>
+    </div>
+  </section>
+
   <!-- --------------------------------------------------------------- audit -->
   <section class="audit" id="audit">
     <h2>is anything in my project <em>already</em> malicious?</h2>

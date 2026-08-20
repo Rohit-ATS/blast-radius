@@ -838,3 +838,59 @@ footer { border-top: 1px solid var(--line); padding: 26px; }
 }
 .copybtn:hover { border-color: var(--ink-3); }
 .copybtn.done { background: var(--green-bg); border-color: #d4e6d9; color: var(--green); }
+
+/* --------------------------------------------------------------- explorer */
+
+.explorer { padding: 50px 26px 20px; max-width: 1180px; margin: 0 auto; text-align: center; }
+.explorer h2 {
+  font-size: clamp(28px, 4.6vw, 44px);
+  letter-spacing: -.035em;
+  font-weight: 640;
+  margin: 0 0 10px;
+}
+.explorer .win { margin-top: 26px; text-align: left; }
+.graphwrap { position: relative; }
+#graph { display: block; width: 100%; height: auto; background: var(--card); border-radius: 0 0 11px 11px; }
+#graph .glink { stroke: #d9d9d2; stroke-width: 1; fill: none; }
+#graph .glink.MAINTAINED_BY, #graph .glink.MAINTAINS { stroke: #bcd3c3; }
+#graph .glink.HAS_ADVISORY, #graph .glink.AFFECTS { stroke: #e7c9a3; }
+#graph .glink.SIMILAR_TO { stroke: #c9c9e0; stroke-dasharray: 3 3; }
+#graph .glink.hot { stroke: var(--red); stroke-width: 1.8; }
+#graph .gnode { cursor: pointer; }
+#graph .gnode circle { stroke: var(--card); stroke-width: 1.5; }
+#graph .gnode.seed circle { stroke: var(--ink); stroke-width: 2.5; }
+#graph .gnode.done circle { stroke-dasharray: none; }
+#graph .gnode:hover circle { stroke: var(--ink); }
+#graph .gnode text {
+  font: 10px var(--mono);
+  fill: var(--ink-2);
+  text-transform: none;
+  pointer-events: none;
+}
+#graph .gnode.dim { opacity: .18; }
+
+.graphlegend {
+  position: absolute;
+  left: 14px; top: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-3);
+  text-transform: none;
+}
+.graphlegend i {
+  width: 9px; height: 9px; border-radius: 50%;
+  display: inline-block; margin-right: 5px; vertical-align: -1px;
+}
+.graphstat {
+  position: absolute;
+  right: 14px; bottom: 12px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-3);
+  text-transform: none;
+  text-align: right;
+}
+@media (max-width: 780px) { #graph { min-height: 420px; } }

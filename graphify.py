@@ -100,6 +100,20 @@ def do_maintainers(h, db, chunk):
     h.write_batch(CREATE_EDGE % "MAINTAINS",
                   [{"src": nid("maint:" + m), "dst": nid(p)} for m, p in fresh],
                   chunk=chunk)
+
+    # The reverse edge as well. A traversal needs a fixed source id, so without
+    # this there is no way to ask "who maintains this package" from the package
+    # — you would have to fall back to SQL, which is exactly what this migration
+    # exists to stop doing.
+    # Derive from every MAINTAINS edge ever written, not just this run's new
+    # ones — otherwise a re-run adds no reverse edges because `fresh` is empty.
+    all_maintains = db.execute(
+        "SELECT src, dst FROM graph_edges WHERE kind = 'MAINTAINS'").fetchall()
+    back = new_edges(db, "MAINTAINED_BY", [(p, m) for m, p in all_maintains])
+    print(f"[maintainers] {len(back):,} new reverse edges")
+    h.write_batch(CREATE_EDGE % "MAINTAINED_BY",
+                  [{"src": nid(p), "dst": nid("maint:" + m)} for p, m in back],
+                  chunk=chunk)
     return len(names), len(fresh)
 
 
@@ -117,6 +131,17 @@ def do_advisories(h, db, chunk, limit):
             flagged.update(batch["hits"])
         print(f"[advisories]   {min(i + 900, len(pkgs)):,}/{len(pkgs):,} "
               f"-> {len(flagged):,} flagged", flush=True)
+    # Backfill the reverse edges from everything ever written before the early
+    # return below, so a run that flags nothing new still repairs them.
+    prior = db.execute(
+        "SELECT src, dst FROM graph_edges WHERE kind = 'AFFECTS'").fetchall()
+    repair = new_edges(db, "HAS_ADVISORY", [(p, a) for a, p in prior])
+    if repair:
+        print(f"[advisories] {len(repair):,} reverse edges backfilled")
+        h.write_batch(CREATE_EDGE % "HAS_ADVISORY",
+                      [{"src": nid(p), "dst": nid("adv:" + a)} for p, a in repair],
+                      chunk=chunk)
+
     if not flagged:
         print("[advisories] nothing flagged")
         return 0, 0
@@ -160,6 +185,12 @@ def do_advisories(h, db, chunk, limit):
     fresh = new_edges(db, "AFFECTS", links)
     h.write_batch(CREATE_EDGE % "AFFECTS",
                   [{"src": nid("adv:" + a), "dst": nid(p)} for a, p in fresh],
+                  chunk=chunk)
+    all_affects = db.execute(
+        "SELECT src, dst FROM graph_edges WHERE kind = 'AFFECTS'").fetchall()
+    back = new_edges(db, "HAS_ADVISORY", [(p, a) for a, p in all_affects])
+    h.write_batch(CREATE_EDGE % "HAS_ADVISORY",
+                  [{"src": nid(p), "dst": nid("adv:" + a)} for p, a in back],
                   chunk=chunk)
     return len(records), len(fresh)
 
@@ -230,7 +261,9 @@ def main():
     for label, q in (("REQUIRED_BY", "MATCH ()-[r:REQUIRED_BY]->() RETURN count(*)"),
                      ("MAINTAINS", "MATCH ()-[r:MAINTAINS]->() RETURN count(*)"),
                      ("AFFECTS", "MATCH ()-[r:AFFECTS]->() RETURN count(*)"),
-                     ("SIMILAR_TO", "MATCH ()-[r:SIMILAR_TO]->() RETURN count(*)")):
+                     ("SIMILAR_TO", "MATCH ()-[r:SIMILAR_TO]->() RETURN count(*)"),
+                     ("MAINTAINED_BY", "MATCH ()-[r:MAINTAINED_BY]->() RETURN count(*)"),
+                     ("HAS_ADVISORY", "MATCH ()-[r:HAS_ADVISORY]->() RETURN count(*)")):
         try:
             print(f"  {label:<11}", f"{h.query(q)[0]['count(*)']:,}")
         except Exception as e:
