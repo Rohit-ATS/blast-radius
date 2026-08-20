@@ -1,0 +1,37 @@
+# HydraDB single-node dev server, backed by a local object store directory.
+# Start:  docker compose up -d   |   Logs: docker compose logs -f hydradb
+# Health: curl -s http://127.0.0.1:9090/readyz
+services:
+  hydradb:
+    image: ghcr.io/hydra-db/hydradb:latest
+    container_name: hydradb
+    ports:
+      - "7687:7687"   # Bolt (Neo4j drivers)
+      - "8443:8443"   # HTTP JSON / NDJSON query API
+      - "9090:9090"   # admin: /readyz /metrics
+    environment:
+      CLOUD_PROVIDER: local
+      LOCAL_PATH: /data/store
+      GRAPH_NAMESPACE: default
+      GRAPH_ID: default
+      GRAPH_CELL_ID: cell-0
+      GRAPH_CELLS: cell-0
+      GRAPH_NODE_ID: node-0
+      GRAPH_BOLT_NODE_ADDRESSES: node-0=0.0.0.0:7687
+      GRAPH_ADVERTISED_BOLT_ADDR: 127.0.0.1:7687
+      GRAPH_DATA_CACHE_DIR: /data/cache
+      GRAPH_AUTH_TOKEN_FILE: /data/auth-token
+      GRAPH_ALLOW_PLAINTEXT: "true"
+      # Without this the node serves /readyz then aborts on the first query.
+      RUST_MIN_STACK: "33554432"
+    volumes:
+      - ./.hydradb:/data
+    restart: unless-stopped
+
+# BEFORE `docker compose up`, run:
+#   mkdir -p .hydradb/store .hydradb/cache
+#   printf '%s\n' 'local-development-token-32-bytes' > .hydradb/auth-token
+#
+# If the image will not start within ~15 minutes, fall back to the native build
+# path in the HydraDB README (cargo run --features server-runtime --bin graph-node).
+# Do not spend more than 45 minutes total on getting the server up. See PLAN.md.
