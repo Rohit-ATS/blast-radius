@@ -45,6 +45,108 @@ def _count(h, name, depth):
 
 
 # --------------------------------------------------------------------------
+# 0. node expansion — what the explorer walks
+# --------------------------------------------------------------------------
+
+# Every relationship is stored in both directions, so any node can be expanded
+# from a fixed source id. Without the reverse edges there would be no way to ask
+# "who maintains this package" starting from the package, and the explorer would
+# have to fall back to SQL — which is exactly what putting these in the graph
+# was meant to stop.
+EXPANSIONS = {
+    "package": [
+        ("REQUIRED_BY", "dependents", "package"),
+        ("SIMILAR_TO", "similar name", "package"),
+        ("MAINTAINED_BY", "maintained by", "maintainer"),
+        ("HAS_ADVISORY", "advisory", "advisory"),
+    ],
+    "maintainer": [("MAINTAINS", "maintains", "package")],
+    "advisory": [("AFFECTS", "affects", "package")],
+}
+
+ID_PREFIX = {"package": "", "maintainer": "maint:", "advisory": "adv:"}
+NEIGHBOURS = "MATCH (t {id: $id})-[:%s]->(v) RETURN DISTINCT v.name LIMIT $limit"
+IDENTIFY = "MATCH (n {id: $id}) RETURN n.name, n.osv_id, n.is_malware, n.severity"
+
+
+def node_id(name: str, kind: str) -> int:
+    return nid(ID_PREFIX.get(kind, "") + name)
+
+
+def expand(h: Hydra, name: str, kind: str = "package", limit: int = 40,
+           degree_for: bool = True):
+    """One node and its neighbours across every edge type it participates in.
+
+    This is the whole explorer in one call: the front end holds no model of the
+    graph, it just asks HydraDB what is adjacent to whatever was clicked.
+    """
+    t0 = time.perf_counter()
+    kind = kind if kind in EXPANSIONS else "package"
+    root_id = node_id(name, kind)
+
+    ident = h.query(IDENTIFY, {"id": root_id})
+    if not ident or not ident[0].get("n.name"):
+        return {"found": False, "name": name, "kind": kind,
+                "message": f"no {kind} named '{name}' in the graph",
+                "latency_ms": round((time.perf_counter() - t0) * 1000, 1)}
+
+    specs = EXPANSIONS[kind]
+
+    def pull(spec):
+        rel, label, target_kind = spec
+        rows = h.query(NEIGHBOURS % rel, {"id": root_id, "limit": limit})
+        return rel, label, target_kind, [r["v.name"] for r in rows if r.get("v.name")]
+
+    with ThreadPoolExecutor(max_workers=len(specs)) as pool:
+        pulled = list(pool.map(pull, specs))
+
+    neighbours = []
+    for rel, label, target_kind, names in pulled:
+        for n in names:
+            neighbours.append({"name": n, "kind": target_kind,
+                               "edge": rel, "edge_label": label})
+
+    # Size packages by how much depends on them; that is the one number that
+    # makes a node worth looking at.
+    if degree_for:
+        pkgs = [n for n in neighbours if n["kind"] == "package"][:limit]
+        if pkgs:
+            with ThreadPoolExecutor(max_workers=min(10, len(pkgs))) as pool:
+                for n, c in zip(pkgs, pool.map(
+                        lambda x: _count(h, x["name"], 1), pkgs)):
+                    n["dependents"] = c
+
+    # An advisory neighbour has to carry its own is_malware, or the explorer
+    # cannot colour it — and "this one is malware" is the entire point of
+    # having advisories on the canvas at all.
+    advs = [n for n in neighbours if n["kind"] == "advisory"]
+    if advs:
+        def identify(n):
+            rows = h.query(IDENTIFY, {"id": node_id(n["name"], "advisory")})
+            return rows[0] if rows else {}
+        with ThreadPoolExecutor(max_workers=min(10, len(advs))) as pool:
+            for n, row in zip(advs, pool.map(identify, advs)):
+                n["is_malware"] = bool(row.get("n.is_malware"))
+                n["severity"] = row.get("n.severity") or ""
+
+    row = ident[0]
+    return {
+        "found": True,
+        "node": {
+            "name": row.get("n.name"), "kind": kind,
+            "osv_id": row.get("n.osv_id"),
+            "is_malware": bool(row.get("n.is_malware")),
+            "severity": row.get("n.severity") or "",
+            "dependents": _count(h, name, 1) if kind == "package" else None,
+        },
+        "neighbours": neighbours,
+        "counts": {label: len(names) for _, label, _, names in pulled},
+        "queries": 2 + len(specs),
+        "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+    }
+
+
+# --------------------------------------------------------------------------
 # 1. attack surface of a maintainer
 # --------------------------------------------------------------------------
 

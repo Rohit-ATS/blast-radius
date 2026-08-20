@@ -452,6 +452,8 @@ function boot() {
   wireLockfile();
   wireAudit();
   wireMap();
+  wireGraph();
+  expandNode('debug', 'package', true);
 
   $('#queryform').addEventListener('submit', e => {
     e.preventDefault();
@@ -985,4 +987,249 @@ function wireAudit() {
   });
   $('#auditpick').addEventListener('click', e => { e.stopPropagation(); file.click(); });
   file.addEventListener('change', () => { read(file.files[0]); file.value = ''; });
+}
+
+/* ------------------------------------------------------------- graph explorer */
+/* A force-directed view of the real graph. The simulation is hand-rolled rather
+ * than pulled from a CDN: this has to keep working while a video is being
+ * recorded on unreliable wifi, and a script tag pointing at someone else's
+ * server is the one dependency that can fail at exactly the wrong moment.
+ *
+ * The browser holds no model of the graph. Clicking a node asks HydraDB what is
+ * adjacent to it, and whatever comes back is merged in. */
+
+const GW = 1000, GH = 620;
+const KIND_FILL = { package: '#55554f', maintainer: '#2c7a45', advisory: '#a9761b' };
+const MALICIOUS_FILL = '#c0392b';
+const MAX_NODES = 300;
+
+const G = { nodes: new Map(), links: [], frame: null, alpha: 0, dragging: null };
+
+function gkey(name, kind) { return kind + ':' + name; }
+
+function gradius(n) {
+  if (n.kind !== 'package') return 9;
+  return Math.max(5, Math.min(17, 5 + Math.log10(1 + (n.dependents || 0)) * 5));
+}
+
+function addNode(name, kind, extra = {}) {
+  const key = gkey(name, kind);
+  if (G.nodes.has(key)) {
+    Object.assign(G.nodes.get(key), extra);
+    return G.nodes.get(key);
+  }
+  if (G.nodes.size >= MAX_NODES) return null;
+  // Seed near the middle with a little spread so the simulation has something
+  // to push apart; starting everything at one point makes forces explode.
+  const a = Math.random() * Math.PI * 2, r = 40 + Math.random() * 140;
+  const node = {
+    key, name, kind,
+    x: GW / 2 + Math.cos(a) * r, y: GH / 2 + Math.sin(a) * r,
+    vx: 0, vy: 0, expanded: false, ...extra,
+  };
+  G.nodes.set(key, node);
+  return node;
+}
+
+function addLink(a, b, edge) {
+  if (!a || !b) return;
+  if (G.links.some(l => l.a === a.key && l.b === b.key && l.edge === edge)) return;
+  G.links.push({ a: a.key, b: b.key, edge });
+}
+
+/* --------------------------------------------------------------- simulation */
+
+function step() {
+  const nodes = [...G.nodes.values()];
+  const n = nodes.length;
+
+  // Repulsion. O(n^2), which is fine at a few hundred nodes and avoids needing
+  // a quadtree that would be more code than the rest of this put together.
+  for (let i = 0; i < n; i++) {
+    const a = nodes[i];
+    for (let j = i + 1; j < n; j++) {
+      const b = nodes[j];
+      let dx = b.x - a.x, dy = b.y - a.y;
+      let d2 = dx * dx + dy * dy;
+      if (d2 < 1) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; d2 = 1; }
+      if (d2 > 90000) continue;                 // ignore distant pairs
+      const f = 2600 / d2;
+      const d = Math.sqrt(d2);
+      a.vx -= (dx / d) * f; a.vy -= (dy / d) * f;
+      b.vx += (dx / d) * f; b.vy += (dy / d) * f;
+    }
+  }
+
+  // Springs along edges.
+  for (const l of G.links) {
+    const a = G.nodes.get(l.a), b = G.nodes.get(l.b);
+    if (!a || !b) continue;
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const d = Math.max(1, Math.hypot(dx, dy));
+    const f = (d - 90) * 0.0055;
+    a.vx += (dx / d) * f; a.vy += (dy / d) * f;
+    b.vx -= (dx / d) * f; b.vy -= (dy / d) * f;
+  }
+
+  for (const nd of nodes) {
+    if (nd === G.dragging) { nd.vx = nd.vy = 0; continue; }
+    nd.vx += (GW / 2 - nd.x) * 0.0016;          // gentle centring
+    nd.vy += (GH / 2 - nd.y) * 0.0016;
+    nd.vx *= 0.86; nd.vy *= 0.86;               // damping
+    nd.x = Math.max(24, Math.min(GW - 24, nd.x + nd.vx));
+    nd.y = Math.max(24, Math.min(GH - 24, nd.y + nd.vy));
+  }
+}
+
+function paint() {
+  const svg = $('#graph');
+  const parts = [];
+  for (const l of G.links) {
+    const a = G.nodes.get(l.a), b = G.nodes.get(l.b);
+    if (!a || !b) continue;
+    parts.push(`<line class="glink ${l.edge}" data-a="${esc(l.a)}" data-b="${esc(l.b)}"
+      x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}"/>`);
+  }
+  for (const nd of G.nodes.values()) {
+    const r = gradius(nd);
+    const fill = nd.is_malware ? MALICIOUS_FILL : (KIND_FILL[nd.kind] || '#55554f');
+    const label = (r >= 8 || nd.kind !== 'package')
+      ? `<text x="${(nd.x + r + 4).toFixed(1)}" y="${(nd.y + 3).toFixed(1)}">${esc(
+          nd.name.length > 22 ? nd.name.slice(0, 21) + '…' : nd.name)}</text>` : '';
+    parts.push(`<g class="gnode${nd.seed ? ' seed' : ''}${nd.expanded ? ' done' : ''}"
+        data-key="${esc(nd.key)}" data-name="${esc(nd.name)}" data-kind="${esc(nd.kind)}">
+        <circle cx="${nd.x.toFixed(1)}" cy="${nd.y.toFixed(1)}" r="${r.toFixed(1)}"
+                fill="${fill}" opacity="${nd.expanded ? 1 : 0.82}"/>${label}</g>`);
+  }
+  svg.innerHTML = parts.join('');
+}
+
+function tick() {
+  step();
+  paint();
+  G.alpha -= 1;
+  if (G.alpha > 0) {
+    G.frame = requestAnimationFrame(tick);
+  } else {
+    G.frame = null;
+  }
+}
+
+function kick(frames = 220) {
+  G.alpha = Math.max(G.alpha, frames);
+  if (!G.frame) G.frame = requestAnimationFrame(tick);
+}
+
+/* ------------------------------------------------------------- interaction */
+
+function graphStat() {
+  const kinds = { package: 0, maintainer: 0, advisory: 0 };
+  for (const n of G.nodes.values()) kinds[n.kind] = (kinds[n.kind] || 0) + 1;
+  $('#graphstat').innerHTML =
+    `${num(G.nodes.size)} nodes · ${num(G.links.length)} edges`
+    + (G.nodes.size >= MAX_NODES ? ` · capped at ${MAX_NODES}` : '');
+  $('#graphlegend').innerHTML =
+    `<span><i style="background:${KIND_FILL.package}"></i>package ${num(kinds.package)}</span>`
+    + `<span><i style="background:${KIND_FILL.maintainer}"></i>maintainer ${num(kinds.maintainer)}</span>`
+    + `<span><i style="background:${KIND_FILL.advisory}"></i>advisory ${num(kinds.advisory)}</span>`
+    + `<span><i style="background:${MALICIOUS_FILL}"></i>malicious</span>`;
+}
+
+async function expandNode(name, kind, seed = false) {
+  const key = gkey(name, kind);
+  const existing = G.nodes.get(key);
+  if (existing && existing.expanded) return;
+  $('#graphstat').textContent = `asking hydradb about ${name}…`;
+  try {
+    const d = await api(`/api/expand?name=${encodeURIComponent(name)}&kind=${kind}&limit=24`);
+    const root = addNode(d.node.name, d.node.kind, {
+      dependents: d.node.dependents, is_malware: d.node.is_malware,
+      expanded: true, seed,
+    });
+    for (const nb of d.neighbours) {
+      const child = addNode(nb.name, nb.kind, {
+        dependents: nb.dependents, is_malware: nb.is_malware,
+      });
+      if (child) addLink(root, child, nb.edge);
+    }
+    graphStat();
+    kick();
+  } catch (err) {
+    $('#graphstat').textContent = err.message;
+  }
+}
+
+function wireGraph() {
+  const svg = $('#graph'), tip = $('#graphtip');
+
+  const toSvg = e => {
+    const box = svg.getBoundingClientRect();
+    return {
+      x: (e.clientX - box.left) * (GW / box.width),
+      y: (e.clientY - box.top) * (GH / box.height),
+    };
+  };
+
+  svg.addEventListener('pointerdown', e => {
+    const g = e.target.closest('.gnode');
+    if (!g) return;
+    G.dragging = G.nodes.get(g.dataset.key) || null;
+    G.moved = false;
+    svg.setPointerCapture(e.pointerId);
+  });
+
+  svg.addEventListener('pointermove', e => {
+    const g = e.target.closest('.gnode');
+    if (G.dragging) {
+      const p = toSvg(e);
+      G.dragging.x = p.x; G.dragging.y = p.y;
+      G.moved = true;
+      kick(60);
+      return;
+    }
+    if (!g) { tip.hidden = true; return; }
+    const nd = G.nodes.get(g.dataset.key);
+    if (!nd) return;
+    tip.hidden = false;
+    tip.innerHTML = `<b>${esc(nd.name)}</b> <span>· ${esc(nd.kind)}`
+      + (nd.kind === 'package' && nd.dependents != null
+          ? ` · ${num(nd.dependents)} direct dependents` : '')
+      + (nd.is_malware ? ' · malicious' : '')
+      + (nd.expanded ? '' : ' · click to expand') + '</span>';
+    const box = svg.getBoundingClientRect();
+    tip.style.left = (e.clientX - box.left) + 'px';
+    tip.style.top = (e.clientY - box.top) + 'px';
+  });
+
+  const release = e => {
+    if (G.dragging) { try { svg.releasePointerCapture(e.pointerId); } catch {} }
+    G.dragging = null;
+  };
+  svg.addEventListener('pointerup', e => {
+    const g = e.target.closest('.gnode');
+    const wasDrag = G.moved;
+    release(e);
+    if (g && !wasDrag) expandNode(g.dataset.name, g.dataset.kind);
+  });
+  svg.addEventListener('pointercancel', release);
+  svg.addEventListener('mouseleave', () => { tip.hidden = true; });
+
+  $$('.mini[data-seed]').forEach(b => b.addEventListener('click', () => {
+    resetGraph();
+    expandNode(b.dataset.seed, b.dataset.kind, true);
+  }));
+  $('#explorerreset').addEventListener('click', () => {
+    resetGraph();
+    expandNode('debug', 'package', true);
+  });
+}
+
+function resetGraph() {
+  G.nodes.clear();
+  G.links.length = 0;
+  if (G.frame) cancelAnimationFrame(G.frame);
+  G.frame = null;
+  G.alpha = 0;
+  paint();
+  graphStat();
 }

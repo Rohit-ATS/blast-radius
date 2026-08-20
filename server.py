@@ -416,6 +416,21 @@ def api_maintainers(name: str = Query(..., min_length=1, max_length=214),
     return {**result, "name": name, "latency_ms": round(ms, 1)}
 
 
+@app.get("/api/expand")
+def api_expand(name: str = Query(..., min_length=1, max_length=214),
+               kind: str = Query("package", pattern="^(package|maintainer|advisory)$"),
+               limit: int = Query(40, ge=1, le=200)):
+    """One node and everything adjacent to it, across every edge type.
+
+    The whole graph explorer runs on this: the browser holds no model of the
+    graph, it just asks HydraDB what is next to whatever was clicked. Every
+    relationship is stored in both directions so any node can be the fixed
+    source a variable-length MATCH requires.
+    """
+    result = chains.expand(hydra, name, kind, limit)
+    return JSONResponse(result, status_code=200 if result.get("found") else 404)
+
+
 @app.get("/api/attack-surface")
 def api_attack_surface(maintainer: str = Query(..., min_length=1, max_length=214),
                        depth: int = Query(4, ge=1, le=blast.MAX_DEPTH)):
