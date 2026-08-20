@@ -1,1 +1,0 @@
-{"cell_id":"cell-0","query":"UNWIND $rows AS row MERGE (p:Package {name: row.name}) SET p.latest = row.latest RETURN p.name AS name, p.latest AS latest","parameters":{"rows":[{"name":"debug","latest":"4.4.3"},{"name":"chalk","latest":"6.0.0"}]}}

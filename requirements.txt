@@ -1,0 +1,19 @@
+# Blast Radius — runtime and development dependencies.
+#
+#   py -m pip install -r requirements.txt
+#
+# Python 3.11+ (uses X | None type syntax). Tested on 3.14.
+
+# --- runtime -------------------------------------------------------------
+requests>=2.31           # HydraDB HTTP client + npm registry crawler
+fastapi>=0.110           # the API
+uvicorn[standard]>=0.29  # ASGI server for it
+
+# --- development ---------------------------------------------------------
+pytest>=8.0              # py -m pytest tests
+playwright>=1.44         # browser layer of the suite; needs a local Chrome
+#   Chrome is used via channel="chrome", so no browser download is required.
+#   If you have no Chrome, `py -m playwright install chromium` also works.
+
+# sqlite3 is in the standard library. There is no frontend build step and no
+# JavaScript dependencies at all — web/ is plain HTML, CSS and JS.
