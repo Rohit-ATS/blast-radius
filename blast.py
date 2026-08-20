@@ -34,6 +34,9 @@ from hydra import Hydra, RESULT_LIMIT, nid
 
 MAX_DEPTH = 8
 
+# The depth the console asks for, and the depth the server warms up to.
+MAX_DEPTH_DEFAULT = 5
+
 # A crawl whose last sidecar write is older than this is treated as stopped.
 CRAWL_HEARTBEAT = 90.0
 
