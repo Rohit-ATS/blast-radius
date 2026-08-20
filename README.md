@@ -264,9 +264,18 @@ progress, rather than an empty result that looks like safety.
 py -m pytest tests -q            # 108 tests
 py verify.py                     # drives the live stack end to end
 py verify.py --soak 300          # sustained load, reports the measured rate
+py web_audit.py                  # clicks every control and proves it did something
 py chaos.py                      # kills HydraDB and checks the recovery
 py rebuild.py --verify           # is the graph still writable?
 ```
+
+`web_audit.py` walks the console the way a person does — every nav link, the
+autocomplete, all three incident chips, the submit button, each map depth
+control, hover, click-to-pivot, both lockfile outcomes, every draggable window
+and a pasted deep link — and asserts on the *observable consequence* of each,
+not on the element existing. It found a real one: the autocomplete dropdown was
+painting underneath the preset chips, so a click in the overlap hit a chip
+instead of the suggestion.
 
 `verify.py` is not a unit test: it exercises the actually-running system with
 real package names read out of the live graph, and reports a per-endpoint
@@ -321,6 +330,7 @@ probe_constraints.py   the constraint table above, as a runnable PASS/FAIL check
 probe_counts.py        proves count(*) counts vertices, not paths
 rebuild.py             replay the graph from deps.db when the store goes read-only
 verify.py              end-to-end verification of the running system
+web_audit.py           clicks every control in a real browser and checks it worked
 chaos.py               fault injection: kill HydraDB, prove the recovery
 tests/test_all.py      108 tests
 ```

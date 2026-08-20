@@ -8,6 +8,7 @@ crawl_state.json
 crawl.log
 verify.log
 verify_full.log
+audit.log
 server.log
 seeds.log
 __pycache__/
