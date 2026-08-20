@@ -14,8 +14,9 @@
 <header class="topbar">
   <a class="brand" href="#top">blast radius</a>
   <nav class="nav">
-    <a href="#how">how it works</a>
     <a href="#lockfile">lockfile check</a>
+    <a href="#status">status</a>
+    <a href="#how">how it works</a>
     <a href="/api/docs">api</a>
   </nav>
   <div class="livestats" id="livestats" aria-live="polite">
@@ -127,6 +128,34 @@
         <div class="body nopad"><div class="scroll" id="maint"></div></div>
         <div class="cap">maintainer-pivot.json</div>
       </div>
+
+      <div class="win">
+        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">names one typo away</span></div>
+        <div class="body nopad"><div class="scroll" id="typos"></div></div>
+        <div class="cap">typosquat-ring.json</div>
+      </div>
+
+      <div class="win span2">
+        <div class="bar">
+          <i class="dot r"></i><i class="dot a"></i><i class="dot g"></i>
+          <span class="title">the blast radius, drawn</span>
+          <span class="barctl">
+            <button type="button" class="mini" data-mapdepth="1">1</button>
+            <button type="button" class="mini" data-mapdepth="2">2</button>
+            <button type="button" class="mini on" data-mapdepth="3">3</button>
+            <button type="button" class="mini" data-mapdepth="4">4</button>
+          </span>
+        </div>
+        <div class="body nopad">
+          <div class="mapwrap">
+            <svg id="map" viewBox="0 0 760 760" role="img"
+                 aria-label="radial map of the packages exposed by this compromise"></svg>
+            <div class="maptip" id="maptip" hidden></div>
+            <div class="maplegend" id="maplegend"></div>
+          </div>
+        </div>
+        <div class="cap">blast-map.svg — click any package to pivot the whole console onto it</div>
+      </div>
     </div>
   </section>
 
@@ -155,6 +184,15 @@
         <div class="cap">lockfile-scan.txt</div>
       </div>
     </div>
+  </section>
+
+  <!-- -------------------------------------------------------------- status -->
+  <section class="sys" id="status">
+    <h2>the system, right now</h2>
+    <p class="lede">pushed over server-sent events, not polled. this is the same
+      health check <code>verify.py</code> and <code>chaos.py</code> assert against.</p>
+    <div class="syscards" id="syscards"></div>
+    <p class="sysnote" id="sysnote"></p>
   </section>
 
   <!-- ---------------------------------------------------------- how it works -->
@@ -212,13 +250,13 @@
 
 <footer>
   <div class="footinner">
-    <span>built on <b>hydradb</b> in one day for hack hydra</span>
-    <span class="dotsep">·</span>
-    <a href="https://github.com/">github</a>
+    <span>built on <a href="https://github.com/hydra-db/hydradb">hydradb</a> in one day for hack hydra</span>
     <span class="dotsep">·</span>
     <span>mit licensed</span>
     <span class="dotsep">·</span>
     <span>package data from the <a href="https://registry.npmjs.org">npm registry</a></span>
+    <span class="dotsep">·</span>
+    <a href="/api/health">live health</a>
   </div>
 </footer>
 

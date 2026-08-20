@@ -9,6 +9,7 @@ Run:  py server.py            (http://127.0.0.1:8000)
 """
 
 import argparse
+import asyncio
 import json
 import os
 import sqlite3
@@ -16,7 +17,7 @@ import threading
 import time
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import blast
@@ -378,6 +379,60 @@ def api_maintainers(name: str = Query(..., min_length=1, max_length=214),
         result["message"] = (f"'{name}' is in the graph, but the crawl has not "
                              f"recorded its maintainers yet.")
     return {**result, "name": name, "latency_ms": round(ms, 1)}
+
+
+@app.get("/api/subgraph")
+def api_subgraph(name: str = Query(..., min_length=1, max_length=214),
+                 depth: int = Query(3, ge=1, le=blast.MAX_DEPTH),
+                 per_level: int = Query(28, ge=1, le=120),
+                 max_nodes: int = Query(160, ge=2, le=600)):
+    """A drawable slice of the radius: nodes by depth, plus the edges."""
+    ok, ms_lookup = known(name)
+    if not ok:
+        return not_yet(name, ms_lookup)
+    with db() as conn:
+        result, ms = blast.subgraph(hydra, conn, name, depth, per_level, max_nodes)
+    return {**result, "latency_ms": round(ms, 1)}
+
+
+@app.get("/api/events")
+async def api_events(request: Request):
+    """Server-sent events: the live state of the system, pushed.
+
+    The header used to poll /api/stats every four seconds, which is both
+    laggier and more work. This pushes a frame whenever something changes and a
+    keepalive otherwise, and the console falls back to polling if the stream
+    cannot be established.
+    """
+    async def stream():
+        last = None
+        while True:
+            if await request.is_disconnected():
+                return
+            try:
+                with db() as conn:
+                    payload = blast.quick_stats(conn)
+                payload["warmup"] = _warm["state"]
+                payload["hydradb"] = _warm["state"] == "warm"
+                payload["writable"] = _writable["ok"]
+                measured = _graph_cache.get("value")
+                if measured:
+                    payload["graph"] = measured
+                frame = json.dumps(payload, sort_keys=True)
+                if frame != last:
+                    last = frame
+                    yield f"event: stats\ndata: {frame}\n\n"
+                else:
+                    yield ": keepalive\n\n"
+            except Exception as e:
+                yield f"event: error\ndata: {json.dumps({'error': str(e)[:200]})}\n\n"
+            await asyncio.sleep(2)
+
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    })
 
 
 @app.get("/api/typosquats")

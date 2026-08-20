@@ -603,3 +603,129 @@ footer { border-top: 1px solid var(--line); padding: 26px; }
   * { animation-duration: .001ms !important; transition-duration: .001ms !important; }
   html { scroll-behavior: auto; }
 }
+
+/* ------------------------------------------------------------- blast map */
+/* A literal blast radius: the compromised package at the centre, concentric
+   rings by dependency depth, red fading outward as the damage attenuates. */
+
+.barctl { margin-left: auto; display: flex; gap: 3px; }
+.mini {
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--ink-3);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.mini:hover { color: var(--ink); border-color: var(--ink-3); }
+.mini.on { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+
+.mapwrap { position: relative; }
+#map { display: block; width: 100%; height: auto; background: var(--card); border-radius: 0 0 11px 11px; }
+#map .ring { fill: none; stroke: var(--line-2); stroke-dasharray: 2 5; }
+#map .ringlabel { fill: #bdbdb6; font: 10px var(--mono); text-transform: none; }
+#map .edge { fill: none; stroke: #d6d6cf; stroke-width: 1; }
+#map .edge.hot { stroke: var(--red); stroke-width: 1.6; opacity: .75; }
+#map .node { cursor: pointer; }
+#map .node circle { stroke: var(--card); stroke-width: 1.5; transition: r .12s ease; }
+#map .node:hover circle { stroke: var(--ink); }
+#map .node text {
+  font: 9.5px var(--mono);
+  fill: var(--ink-2);
+  text-transform: none;
+  pointer-events: none;
+}
+#map .node.dim { opacity: .22; }
+#map .root text { font-size: 13px; fill: var(--ink); font-weight: 600; }
+
+.maptip {
+  position: absolute;
+  pointer-events: none;
+  background: var(--ink);
+  color: var(--paper);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  text-transform: none;
+  padding: 6px 9px;
+  border-radius: 7px;
+  white-space: nowrap;
+  z-index: 5;
+  transform: translate(-50%, -140%);
+}
+.maptip b { color: #fff; }
+.maptip span { opacity: .7; }
+
+.maplegend {
+  position: absolute;
+  left: 14px; bottom: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-3);
+  text-transform: none;
+}
+.maplegend i {
+  width: 9px; height: 9px; border-radius: 50%;
+  display: inline-block; margin-right: 5px; vertical-align: -1px;
+}
+
+/* --------------------------------------------------------------- status */
+
+.sys { padding: 46px 26px 20px; max-width: 1180px; margin: 0 auto; text-align: center; }
+.sys h2 {
+  font-size: clamp(28px, 4.6vw, 44px);
+  letter-spacing: -.035em;
+  font-weight: 640;
+  margin: 0 0 10px;
+}
+.syscards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 14px;
+  margin-top: 26px;
+  text-align: left;
+}
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  padding: 14px 15px;
+  box-shadow: var(--shadow);
+}
+.card .k {
+  font-size: 10px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.card .v {
+  font-family: var(--mono);
+  font-size: 21px;
+  margin-top: 5px;
+  text-transform: none;
+  font-variant-numeric: tabular-nums;
+}
+.card .d { font-family: var(--mono); font-size: 11px; color: var(--ink-3); margin-top: 3px; text-transform: none; }
+.card.good .v { color: var(--green); }
+.card.warn .v { color: var(--amber); }
+.card.bad  .v { color: var(--red); }
+.sysnote {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink-3);
+  text-transform: none;
+  margin-top: 16px;
+}
+
+@media (max-width: 780px) {
+  #map { min-height: 420px; }
+  .maplegend { position: static; margin: 10px 14px 14px; }
+}
+#map .leader { fill: none; stroke: #dcdcd5; stroke-width: .8; }
+#map .node.label text { fill: var(--ink-2); }
+#map .node.label:hover text { fill: var(--ink); }

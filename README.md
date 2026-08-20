@@ -314,6 +314,7 @@ ingest.py              npm crawler -> HydraDB + deps.db sidecar
 blast.py               the five incident queries + npm semver range logic
 server.py              FastAPI: six endpoints, serves the console on the same port
 web/                   the console — vanilla HTML/CSS/JS, no build step
+                       (radial blast map is hand-rolled SVG; no chart library)
 bench.py               HydraDB vs SQLite recursive CTE -> BENCHMARKS.md
 expand_seeds.py        widens the crawl frontier from the npm search API
 probe_constraints.py   the constraint table above, as a runnable PASS/FAIL check
@@ -330,10 +331,13 @@ tests/test_all.py      108 tests
 |---|---|
 | `GET /api/health` | per-component liveness: hydradb, sidecar, warm-up, writability |
 | `GET /api/stats` | graph size, crawl progress |
+| `GET /api/events` | server-sent stream of the live system state |
 | `GET /api/blast?name=&depth=` | victims + depth histogram + latency |
+| `GET /api/subgraph?name=&depth=` | drawable slice: nodes by depth + edges |
 | `GET /api/resolve?name=&bad_version=` | exposed vs shielded by pin |
 | `POST /api/lockfile?name=&bad_version=` | EXPOSED / SHIELDED / CLEAR + path |
 | `GET /api/maintainers?name=` | what else those maintainers publish |
+| `GET /api/typosquats?name=` | one-edit neighbours, checked live against npm |
 | `GET /api/search?q=` | package name autocomplete |
 
 Every response carries `latency_ms` measured around the real query. Interactive
@@ -351,6 +355,40 @@ account takeover in September 2025, `event-stream` in November 2018,
 `ua-parser-js` in October 2021) are real, publicly documented supply-chain
 attacks. The blast radius numbers shown for them are computed live from the
 crawled graph, not from any published incident report.
+
+## The console
+
+One page. Scroll from the wordmark straight into the working tool — there is no
+second thing to click through to.
+
+**The blast map** draws the radius as what it actually is: the compromised
+package at the centre, concentric rings for dependency depth, red attenuating
+outward. A node's ring is a real property of the graph — the depth HydraDB
+first reaches it at — not a layout convenience. Hover to isolate a package and
+its edges; **click any node and the entire console pivots onto it**, which is
+the point of having the graph on screen instead of a list.
+
+A depth-3 radius around a popular package reaches thousands of nodes, which is
+not a picture, so the map draws the best-connected slice and says exactly how
+much it left out: *"showing the 84 best-connected of 3,041 exposed"*. The
+headline number stays the true one.
+
+**Every query is a URL.** `/?pkg=debug&v=4.4.2` restores the full result, so a
+finding can be pasted to a colleague at 2am. No localStorage, no client state
+to lose.
+
+**The typosquat panel checks npm, not just our corpus.** The crawl is
+popularity-weighted and a typosquat is by definition unpopular, so a
+corpus-only answer returns nothing — which reads as *you are safe*. The
+one-edit neighbours are checked against the registry itself, in parallel, and
+npm's `0.0.1-security` tombstone is surfaced as **taken down by npm**: proof
+somebody already squatted that name. For `lodash`, all 13 one-edit variants are
+real packages.
+
+**The status section is the reliability work, visible.** It is pushed over
+server-sent events rather than polled, and shows the same components
+`verify.py` and `chaos.py` assert against — including whether the graph is
+still writable, which nothing but a real write can detect.
 
 ## Reliability, measured
 

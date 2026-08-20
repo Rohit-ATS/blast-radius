@@ -336,6 +336,9 @@ async function runQuery(name, version) {
     renderVictims(b);
     renderSemver(name, version);
     renderMaintainers(name);
+    renderTyposquats(name);
+    loadMap(name);
+    syncUrl(name, version);
     results.scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (err) {
     $('#latency').textContent = '—';
@@ -447,6 +450,7 @@ function boot() {
   wireDragging();
   wireSuggest();
   wireLockfile();
+  wireMap();
 
   $('#queryform').addEventListener('submit', e => {
     e.preventDefault();
@@ -464,13 +468,359 @@ function boot() {
     runQuery(chip.dataset.pkg, chip.dataset.ver || '');
   });
 
-  pollStats();
-  setInterval(pollStats, 4000);
+  wireEvents();
   loadPeeks();
+
+  // A result is a thing you send to a colleague at 2am, so every query is
+  // reflected in the URL and every URL restores the query.
+  const params = new URLSearchParams(location.search);
+  const pkg = (params.get('pkg') || '').trim();
+  if (pkg) {
+    $('#pkg').value = pkg;
+    $('#ver').value = (params.get('v') || '').trim();
+    runQuery(pkg, $('#ver').value);
+  }
 }
 
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', boot);
 } else {
   boot();
+}
+
+/* ------------------------------------------------------------- blast map */
+/* A literal blast radius. The compromised package sits at the centre and every
+ * exposed package is placed on the ring for the depth it is *first* reached at
+ * — which is a real property of the graph, taken from HydraDB's reachable set
+ * at each bound, not a layout convenience. Red attenuates outward.
+ *
+ * Nodes on a ring are ordered by the circular mean of their parents' angles,
+ * which keeps edges short and roughly radial without any force simulation. */
+
+const MAP_SIZE = 760;
+const DEPTH_FILL = ['#8f2318', '#c0392b', '#d4695c', '#e0958c', '#ebbdb7', '#f0cfca'];
+let mapDepth = 3;
+let mapAbort = null;
+
+function circularMean(angles) {
+  if (!angles.length) return null;
+  const s = angles.reduce((a, x) => a + Math.sin(x), 0);
+  const c = angles.reduce((a, x) => a + Math.cos(x), 0);
+  return Math.atan2(s, c);
+}
+
+function layoutRadial(data) {
+  const cx = MAP_SIZE / 2, cy = MAP_SIZE / 2;
+  const maxDepth = Math.max(1, ...data.nodes.map(n => n.depth));
+  const ring = (MAP_SIZE / 2 - 148) / maxDepth;
+
+  const parentsOf = new Map();
+  for (const e of data.edges) {
+    if (!parentsOf.has(e.to)) parentsOf.set(e.to, []);
+    parentsOf.get(e.to).push(e.from);
+  }
+
+  const angle = new Map([[data.root, 0]]);
+  const pos = new Map([[data.root, { x: cx, y: cy, depth: 0 }]]);
+
+  for (let d = 1; d <= maxDepth; d++) {
+    const level = data.nodes.filter(n => n.depth === d);
+    if (!level.length) continue;
+    const sortKey = new Map();
+    level.forEach((n, i) => {
+      const known = (parentsOf.get(n.name) || [])
+        .map(p => angle.get(p)).filter(a => a !== undefined);
+      const m = circularMean(known);
+      // No placed parent (a cross-link only): keep a stable spot rather than a
+      // random one, so the picture does not reshuffle between renders.
+      sortKey.set(n.name, m === null ? (i / level.length) * Math.PI * 2 : m);
+    });
+    level.sort((a, b) => sortKey.get(a.name) - sortKey.get(b.name));
+    level.forEach((n, i) => {
+      const a = (i / level.length) * Math.PI * 2 - Math.PI / 2;
+      angle.set(n.name, a);
+      pos.set(n.name, {
+        x: cx + Math.cos(a) * ring * d,
+        y: cy + Math.sin(a) * ring * d,
+        depth: d,
+      });
+    });
+  }
+  return { pos, maxDepth, ring, cx, cy };
+}
+
+function nodeRadius(n) {
+  if (n.depth === 0) return 13;
+  return Math.max(3.2, Math.min(9, 3.2 + Math.log10(1 + (n.dependents || 0)) * 3.4));
+}
+
+function renderMap(data) {
+  const svg = $('#map');
+  const { pos, maxDepth, ring, cx, cy } = layoutRadial(data);
+  const parts = [];
+
+  for (let d = 1; d <= maxDepth; d++) {
+    parts.push(`<circle class="ring" cx="${cx}" cy="${cy}" r="${ring * d}"/>`);
+    parts.push(`<text class="ringlabel" x="${cx + 4}" y="${cy - ring * d - 5}">depth ${d}</text>`);
+  }
+
+  for (const e of data.edges) {
+    const a = pos.get(e.from), b = pos.get(e.to);
+    if (!a || !b) continue;
+    // Bow each edge toward the centre so parallel spokes stay legible.
+    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+    const qx = mx + (cx - mx) * 0.18, qy = my + (cy - my) * 0.18;
+    parts.push(`<path class="edge" data-from="${esc(e.from)}" data-to="${esc(e.to)}" d="M${a.x.toFixed(1)} ${a.y.toFixed(1)} Q${qx.toFixed(1)} ${qy.toFixed(1)} ${b.x.toFixed(1)} ${b.y.toFixed(1)}"/>`);
+  }
+
+  // Plain nodes first, so labels and leaders always draw on top of them.
+  for (const n of data.nodes) {
+    const p = pos.get(n.name);
+    if (!p) continue;
+    const r = nodeRadius(n);
+    const fill = DEPTH_FILL[Math.min(n.depth, DEPTH_FILL.length - 1)];
+    const isRoot = n.depth === 0;
+    const rootLabel = isRoot
+      ? `<text x="${p.x.toFixed(1)}" y="${(p.y + r + 16).toFixed(1)}" text-anchor="middle">${esc(n.name)}</text>`
+      : '';
+    parts.push(`<g class="node${isRoot ? ' root' : ''}" data-name="${esc(n.name)}" data-depth="${n.depth}" data-dependents="${n.dependents || 0}"><circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="${r.toFixed(1)}" fill="${fill}"/>${rootLabel}</g>`);
+  }
+
+  // Labels live on the rim, not next to their node. Labels placed at the node
+  // itself either collide (inner rings are crowded) or shoot off the canvas
+  // (rotated ones run outward past the viewBox). Anchoring every label at one
+  // radius outside the outermost ring, with a leader line back to its node,
+  // gives each one its own angular lane and keeps them all inside the frame.
+  const rim = ring * maxDepth + 12;
+  const labels = data.nodes
+    .filter(n => n.depth > 0)
+    .sort((a, b) => (b.dependents || 0) - (a.dependents || 0))
+    .slice(0, 16)
+    .map(n => {
+      const p = pos.get(n.name);
+      return p ? { n, p, a: Math.atan2(p.y - cy, p.x - cx) } : null;
+    })
+    .filter(Boolean)
+    .sort((x, y) => x.a - y.a);
+
+  // Push apart anything closer together than one line of text.
+  const minGap = 13 / rim;
+  for (let i = 1; i < labels.length; i++) {
+    if (labels[i].a - labels[i - 1].a < minGap) labels[i].a = labels[i - 1].a + minGap;
+  }
+
+  for (const { n, p, a } of labels) {
+    const lx = cx + Math.cos(a) * rim;
+    const ly = cy + Math.sin(a) * rim;
+    const deg = a * 180 / Math.PI;
+    const flip = deg > 90 || deg < -90;      // keep left-hand labels readable
+    const text = n.name.length > 21 ? n.name.slice(0, 20) + '…' : n.name;
+    parts.push(`<path class="leader" d="M${p.x.toFixed(1)} ${p.y.toFixed(1)} L${lx.toFixed(1)} ${ly.toFixed(1)}"/>`);
+    parts.push(`<g class="node label" data-name="${esc(n.name)}" data-depth="${n.depth}" data-dependents="${n.dependents || 0}">`
+      + `<text x="${lx.toFixed(1)}" y="${ly.toFixed(1)}" dy="3" text-anchor="${flip ? 'end' : 'start'}"`
+      + ` transform="rotate(${(flip ? deg + 180 : deg).toFixed(1)} ${lx.toFixed(1)} ${ly.toFixed(1)})">${esc(text)}</text></g>`);
+  }
+
+  svg.innerHTML = parts.join('');
+
+  const legend = [];
+  for (let d = 1; d <= maxDepth; d++) {
+    const h = data.histogram.find(x => x.depth === d);
+    legend.push(`<span><i style="background:${DEPTH_FILL[Math.min(d, DEPTH_FILL.length - 1)]}"></i>depth ${d} · ${num(h ? h.packages : 0)}</span>`);
+  }
+  legend.push(`<span>${data.truncated
+    ? `showing the ${num(data.shown)} best-connected of ${num(data.total_exposed)} exposed`
+    : `all ${num(data.total_exposed)} exposed shown`} · ${Math.round(data.latency_ms)}ms</span>`);
+  $('#maplegend').innerHTML = legend.join('');
+}
+
+function wireMap() {
+  const svg = $('#map'), tip = $('#maptip');
+
+  svg.addEventListener('mousemove', e => {
+    const g = e.target.closest('.node');
+    if (!g) return;
+    const d = +g.dataset.depth;
+    tip.hidden = false;
+    tip.innerHTML = `<b>${esc(g.dataset.name)}</b> <span>· ${d === 0
+      ? 'the compromised package'
+      : `depth ${d} · ${num(+g.dataset.dependents)} direct dependents`}</span>`;
+    const box = svg.getBoundingClientRect();
+    tip.style.left = (e.clientX - box.left) + 'px';
+    tip.style.top = (e.clientY - box.top) + 'px';
+  });
+
+  svg.addEventListener('mouseover', e => {
+    const g = e.target.closest('.node');
+    if (!g) return;
+    const name = g.dataset.name;
+    const touching = new Set([name]);
+    $$('#map .edge').forEach(p => {
+      const hit = p.dataset.from === name || p.dataset.to === name;
+      p.classList.toggle('hot', hit);
+      if (hit) { touching.add(p.dataset.from); touching.add(p.dataset.to); }
+    });
+    $$('#map .node').forEach(n => n.classList.toggle('dim', !touching.has(n.dataset.name)));
+  });
+
+  const clear = () => {
+    tip.hidden = true;
+    $$('#map .edge').forEach(p => p.classList.remove('hot'));
+    $$('#map .node').forEach(n => n.classList.remove('dim'));
+  };
+  svg.addEventListener('mouseleave', clear);
+
+  // Clicking a package pivots the whole console onto it — the point of having
+  // the graph on screen rather than a list.
+  svg.addEventListener('click', e => {
+    const g = e.target.closest('.node');
+    if (!g || g.classList.contains('root')) return;
+    clear();
+    $('#pkg').value = g.dataset.name;
+    $('#ver').value = '';
+    runQuery(g.dataset.name, '');
+  });
+
+  $$('.mini[data-mapdepth]').forEach(b => b.addEventListener('click', () => {
+    $$('.mini[data-mapdepth]').forEach(x => x.classList.toggle('on', x === b));
+    mapDepth = +b.dataset.mapdepth;
+    const name = $('#pkg').value.trim();
+    if (name) loadMap(name);
+  }));
+}
+
+function mapMessage(text, colour) {
+  $('#map').innerHTML = `<text x="${MAP_SIZE / 2}" y="${MAP_SIZE / 2}" text-anchor="middle" fill="${colour}" font-family="ui-monospace, monospace" font-size="13">${esc(text)}</text>`;
+}
+
+async function loadMap(name) {
+  const token = {};
+  mapAbort = token;
+  $('#maplegend').innerHTML = `<span>drawing depth ${mapDepth}…</span>`;
+  mapMessage('traversing…', '#bdbdb6');
+  try {
+    const d = await api(`/api/subgraph?name=${encodeURIComponent(name)}&depth=${mapDepth}`);
+    if (mapAbort !== token) return;            // a newer query superseded this one
+    if (!d.nodes.length || d.nodes.length === 1) {
+      mapMessage(`nothing depends on ${name} within depth ${mapDepth}`, '#bdbdb6');
+      $('#maplegend').innerHTML = '';
+      return;
+    }
+    renderMap(d);
+  } catch (err) {
+    if (mapAbort !== token) return;
+    mapMessage(err.message, '#c0392b');
+    $('#maplegend').innerHTML = '';
+  }
+}
+
+/* --------------------------------------------------------- typosquat ring */
+
+async function renderTyposquats(name) {
+  const box = $('#typos');
+  box.innerHTML = '<div class="empty">checking one-edit neighbours…</div>';
+  try {
+    const t = await api(`/api/typosquats?name=${encodeURIComponent(name)}`);
+    const where = t.checked_live ? 'checked live against the npm registry'
+                                 : 'registry unreachable — crawled corpus only';
+    if (!t.existing.length) {
+      box.innerHTML = `<div class="empty">none of the ${num(t.candidates)} one-edit
+        variants of ${esc(name)} are real packages. ${where}, in ${Math.round(t.latency_ms)}ms.</div>`;
+      return;
+    }
+    // npm republishes a name it has taken down as 0.0.1-security. That version
+    // string is not a version, it is a tombstone: somebody squatted this name
+    // and npm removed it.
+    const rows = t.existing.map(h => {
+      const dead = h.latest === '0.0.1-security';
+      const tag = dead ? '<span class="tagpill bad">taken down by npm</span>'
+        : h.in_graph ? '<span class="tagpill">in the graph</span>'
+        : '<span class="tagpill pin">live on npm</span>';
+      return `<div class="r"><span>${esc(h.name)}</span>
+        <span class="g">${h.latest && !dead ? esc(h.latest) + ' · ' : ''}${tag}</span></div>`;
+    }).join('');
+    box.innerHTML =
+      `<div class="r"><span class="g" style="margin:0">${num(t.existing.length)} of
+        ${num(t.candidates)} one-edit variants of ${esc(name)} are real packages —
+        ${where}</span></div>` + rows;
+  } catch (err) { errorBox(box, err); }
+}
+
+/* ------------------------------------------------------ live system state */
+
+let sse = null, sseSeen = false, pollTimer = null;
+
+function applyStats(s) {
+  lastStats = s;
+  const pulse = $('#pulse'), line = $('#statline');
+  const warming = s.warmup && s.warmup !== 'warm';
+  pulse.className = 'pulse ' + (s.hydradb === false || warming ? 'dead' : 'live');
+  const bits = [`${num(s.packages)} packages`, `${num(s.edges)} edges`];
+  if (warming) bits.push('warming');
+  if (s.crawl && s.crawl.running) bits.push(`crawling · ${num(s.crawl.crawled)} done`);
+  line.textContent = bits.join(' · ');
+  renderStatusCards(s);
+}
+
+function card(k, v, d, cls) {
+  return `<div class="card ${cls || ''}"><div class="k">${k}</div><div class="v">${v}</div><div class="d">${d || ''}</div></div>`;
+}
+
+function renderStatusCards(s) {
+  const warming = s.warmup && s.warmup !== 'warm';
+  const crawl = s.crawl || {};
+  const cards = [
+    card('hydradb',
+         s.hydradb === false ? 'unreachable' : warming ? 'warming' : 'answering',
+         warming ? 'cold store — deep traversals time out' : 'traversals served from cache',
+         s.hydradb === false ? 'bad' : warming ? 'warn' : 'good'),
+    card('graph', num(s.packages), `${num(s.edges)} REQUIRED_BY edges`, 'good'),
+    card('sidecar', `${s.latency_ms}ms`, 'deps.db read latency', 'good'),
+    card('writable',
+         (s.writable === null || s.writable === undefined) ? 'probing…' : s.writable ? 'yes' : 'read-only',
+         s.writable === false ? 'restarted store — run py rebuild.py' : 'writes round-trip',
+         s.writable === false ? 'warn' : 'good'),
+    card('crawl', crawl.running ? 'running' : 'idle',
+         `${num(crawl.crawled || 0)} of ${num(crawl.known || 0)} crawled`, 'good'),
+    card('nid collisions', num(crawl.collisions || 0),
+         'name → integer id map', (crawl.collisions || 0) ? 'bad' : 'good'),
+  ];
+  $('#syscards').innerHTML = cards.join('');
+  const g = s.graph;
+  $('#sysnote').textContent = g
+    ? `hydradb's own count(*) last measured ${num(g.packages)} vertices and ${num(g.edges)} edges, taking ${Math.round(g.measured_ms)}ms — a full scan, which is why the live figures above come from the sidecar.`
+    : `hydradb's own count(*) is a full scan and runs on a background timer; no measurement has been taken yet this session.`;
+}
+
+function startPolling() {
+  if (pollTimer) return;
+  pollStats();
+  pollTimer = setInterval(pollStats, 4000);
+}
+
+function wireEvents() {
+  if (!window.EventSource) return startPolling();
+  try {
+    sse = new EventSource('/api/events');
+  } catch { return startPolling(); }
+  sse.addEventListener('stats', e => {
+    sseSeen = true;
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    try { applyStats(JSON.parse(e.data)); } catch { /* keep the last good frame */ }
+  });
+  sse.addEventListener('error', () => {
+    // EventSource reconnects on its own, so polling only takes over if the
+    // stream never worked at all — a brief blip must not leave the page stale.
+    if (!sseSeen) { try { sse.close(); } catch {} startPolling(); }
+  });
+  setTimeout(() => { if (!sseSeen) startPolling(); }, 6000);
+}
+
+/* ---------------------------------------------------------- shareable url */
+
+function syncUrl(name, version) {
+  const q = new URLSearchParams();
+  if (name) q.set('pkg', name);
+  if (version) q.set('v', version);
+  history.replaceState(null, '', q.toString() ? `?${q}` : location.pathname);
 }
