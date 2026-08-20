@@ -73,8 +73,15 @@ WRITE_PROBE_INTERVAL = 300.0
 _WRITE_PROBE_ID = 999999999999998
 
 # Requests per minute per IP. The server makes OSV and registry calls on the
-# caller's behalf, so an unbounded client is an unbounded bill for someone.
-RATE_LIMIT = int(os.environ.get("RATE_LIMIT", "120"))
+# caller's behalf, so an unbounded remote client is an unbounded bill for
+# someone. 120/min turned out to be far too tight: one preset click fans out to
+# six requests, and running the verification harnesses back to back tripped it
+# — which is exactly how it would have tripped mid-demo.
+RATE_LIMIT = int(os.environ.get("RATE_LIMIT", "600"))
+
+# Loopback is the operator's own machine: the console, the CLI, the test
+# harnesses. Throttling yourself protects nobody.
+LOOPBACK = {"127.0.0.1", "::1", "localhost", "testclient"}
 
 # npm's published package count, used only to state coverage honestly. The
 # live feed replaces this with the registry's own doc_count once it anchors.
@@ -261,8 +268,10 @@ async def envelope(request: Request, call_next):
     started = time.perf_counter()
     path = request.url.path
 
-    if path.startswith("/api/") and path not in ("/api/health", "/api/events"):
-        ok, retry = _limiter.check(request.client.host if request.client else "?")
+    client_ip = request.client.host if request.client else "?"
+    if (path.startswith("/api/") and client_ip not in LOOPBACK
+            and path not in ("/api/health", "/api/events")):
+        ok, retry = _limiter.check(client_ip)
         if not ok:
             return JSONResponse(
                 {"ok": False, "error": "rate_limited",
