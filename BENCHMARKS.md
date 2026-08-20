@@ -6,8 +6,8 @@ Numbers are medians of 5 runs, measured by `bench.py` on the graph as it stood a
 
 ## What was measured
 
-- **When**: 2026-08-20 03:43:50 Pacific Daylight Time
-- **Commit**: `ea0f4c5`
+- **When**: 2026-08-20 15:02:18 Pacific Daylight Time
+- **Commit**: `6252762`
 - **Machine**: Windows 11, Python 3.14.2
 - **HydraDB**: 0.1.0, single node in Docker, HTTP query API on `127.0.0.1:8443`
 - **Graph**: 27,076 vertices, 91,544 `REQUIRED_BY` edges
@@ -17,29 +17,29 @@ Both stores hold the same edge set. The crawler writes a graph edge and a sideca
 
 ## Headline: at this graph size, SQLite wins
 
-The recursive CTE beat HydraDB on **every row measured**, by between 3× and 13×. That is the opposite of the result this project was built expecting, so it leads the report rather than hiding under it.
+The recursive CTE beat HydraDB on **every row measured**, by between 2× and 12×. That is the opposite of the result this project was built expecting, so it leads the report rather than hiding under it.
 
 | package | depth | packages reached | HydraDB | SQLite CTE | faster | agree |
 |---|---|---|---|---|---|---|
-| `tslib` | 1 | 892 | 19 ms | 4 ms | SQLite 5.3× | yes |
-| `tslib` | 2 | 1,613 | 141 ms | 20 ms | SQLite 7.0× | yes |
-| `tslib` | 3 | 2,228 | 311 ms | 47 ms | SQLite 6.6× | yes |
-| `tslib` | 4 | 2,389 | 502 ms | 53 ms | SQLite 9.5× | yes |
-| `tslib` | 5 | 2,438 | 694 ms | 70 ms | SQLite 9.8× | yes |
-| `chalk` | 1 | 827 | 20 ms | 5 ms | SQLite 4.0× | yes |
-| `chalk` | 2 | 1,505 | 123 ms | 18 ms | SQLite 7.0× | yes |
-| `chalk` | 3 | 1,765 | 260 ms | 30 ms | SQLite 8.7× | yes |
-| `chalk` | 4 | 1,871 | 361 ms | 49 ms | SQLite 7.3× | yes |
-| `chalk` | 5 | 1,956 | 432 ms | 46 ms | SQLite 9.5× | yes |
-| `lodash` | 1 | 783 | 20 ms | 6 ms | SQLite 3.2× | yes |
-| `lodash` | 2 | 1,441 | 132 ms | 23 ms | SQLite 5.7× | yes |
-| `lodash` | 3 | 1,611 | 241 ms | 23 ms | SQLite 10.6× | yes |
-| `lodash` | 4 | 1,637 | 334 ms | 29 ms | SQLite 11.4× | yes |
-| `lodash` | 5 | 1,643 | 406 ms | 32 ms | SQLite 12.8× | yes |
+| `tslib` | 1 | 892 | 21 ms | 2 ms | SQLite 9.5× | yes |
+| `tslib` | 2 | 1,613 | 142 ms | 17 ms | SQLite 8.2× | yes |
+| `tslib` | 3 | 2,228 | 327 ms | 33 ms | SQLite 9.8× | yes |
+| `tslib` | 4 | 2,389 | 592 ms | 50 ms | SQLite 11.8× | yes |
+| `tslib` | 5 | 2,438 | 623 ms | 64 ms | SQLite 9.7× | yes |
+| `chalk` | 1 | 827 | 8 ms | 5 ms | SQLite 1.7× | yes |
+| `chalk` | 2 | 1,505 | 131 ms | 17 ms | SQLite 7.6× | yes |
+| `chalk` | 3 | 1,765 | 243 ms | 28 ms | SQLite 8.8× | yes |
+| `chalk` | 4 | 1,871 | 336 ms | 50 ms | SQLite 6.8× | yes |
+| `chalk` | 5 | 1,956 | 393 ms | 40 ms | SQLite 9.9× | yes |
+| `lodash` | 1 | 783 | 19 ms | 4 ms | SQLite 4.8× | yes |
+| `lodash` | 2 | 1,441 | 113 ms | 15 ms | SQLite 7.4× | yes |
+| `lodash` | 3 | 1,611 | 226 ms | 22 ms | SQLite 10.4× | yes |
+| `lodash` | 4 | 1,637 | 348 ms | 35 ms | SQLite 9.9× | yes |
+| `lodash` | 5 | 1,643 | 399 ms | 45 ms | SQLite 8.9× | yes |
 
 `agree` is the column that makes the rest of the table mean anything: both engines return the identical count on every row, so this is two answers to one question rather than two different questions. That agreement is also the strongest correctness check the project has — the reversed-edge graph model and a plain recursive join over the same data reach the same closure.
 
-Transport is not the explanation. The cheapest possible HydraDB round trip — a single-vertex lookup by id — measured **2.5 ms**, so subtracting HTTP and JSON from the traversal numbers leaves the ranking unchanged.
+Transport is not the explanation. The cheapest possible HydraDB round trip — a single-vertex lookup by id — measured **2.9 ms**, so subtracting HTTP and JSON from the traversal numbers leaves the ranking unchanged.
 
 ### Why, honestly
 
@@ -68,9 +68,9 @@ A fair summary: **on a 27k-vertex npm graph, this workload does not need a graph
 
 | package | depth | packages exposed | wall clock, all queries |
 |---|---|---|---|
-| `tslib` | 5 | 2,438 | **853 ms** |
-| `chalk` | 5 | 1,956 | **554 ms** |
-| `lodash` | 5 | 1,643 | **540 ms** |
+| `tslib` | 5 | 2,438 | **876 ms** |
+| `chalk` | 5 | 1,956 | **536 ms** |
+| `lodash` | 5 | 1,643 | **496 ms** |
 
 ## Counting the whole graph
 
@@ -78,8 +78,8 @@ Worth recording because it is the one thing HydraDB 0.1.0 does badly, and it sha
 
 | operation | engine | time |
 |---|---|---|
-| `MATCH (p:Package) RETURN count(*)` + edge count | HydraDB | **10,706 ms** |
-| same two counts | SQLite sidecar | 30.4 ms |
+| `MATCH (p:Package) RETURN count(*)` + edge count | HydraDB | **11,957 ms** |
+| same two counts | SQLite sidecar | 17.4 ms |
 
 There is no `CREATE INDEX` in HydraDB 0.1.0, so a whole-graph count is a full scan — the server says so itself in its logs (`query plan warrants attention … access_path AllVertexScan`). This is why the live header polls the sidecar and a background thread re-measures the graph on a slow timer: the number is real, but it cannot sit on a request path.
 
@@ -92,11 +92,11 @@ Note the shape of the result: HydraDB is dramatically slower at counting *everyt
   "graph": {
     "packages": 27076,
     "edges": 91544,
-    "measured_ms": 10706.4
+    "measured_ms": 11956.8
   },
   "sidecar_packages": 27076,
   "sidecar_edges": 91544,
-  "graph_scan_ms": 10706.4,
+  "graph_scan_ms": 11956.8,
   "runs": 5,
   "depths": [
     1,
@@ -112,13 +112,13 @@ Note the shape of the result: HydraDB is dramatically slower at counting *everyt
       "reached": 892,
       "sqlite_reached": 892,
       "agree": true,
-      "hydra_ms": 19.41360003547743,
-      "hydra_min": 18.59990000957623,
-      "hydra_max": 22.126900032162666,
-      "sqlite_ms": 3.6974999820813537,
-      "sqlite_min": 3.5182000137865543,
-      "sqlite_max": 9.80820000404492,
-      "speedup": 0.19045926439837788
+      "hydra_ms": 21.225799981039017,
+      "hydra_min": 17.25929998792708,
+      "hydra_max": 32.83669997472316,
+      "sqlite_ms": 2.2396999993361533,
+      "sqlite_min": 2.0146999740973115,
+      "sqlite_max": 6.807700032368302,
+      "speedup": 0.10551781329028233
     },
     {
       "target": "tslib",
@@ -126,13 +126,13 @@ Note the shape of the result: HydraDB is dramatically slower at counting *everyt
       "reached": 1613,
       "sqlite_reached": 1613,
       "agree": true,
-      "hydra_ms": 140.84549999097362,
-      "hydra_min": 133.3161999937147,
-      "hydra_max": 189.74770000204444,
-      "sqlite_ms": 20.06690000416711,
-      "sqlite_min": 17.215599946212023,
-      "sqlite_max": 30.864199972711504,
-      "speedup": 0.14247455549132304
+      "hydra_ms": 142.41089997813106,
+      "hydra_min": 134.99619998037815,
+      "hydra_max": 149.11240001674742,
+      "sqlite_ms": 17.39280001493171,
+      "sqlite_min": 15.484999981708825,
+      "sqlite_max": 18.98950000759214,
+      "speedup": 0.12213110104354784
     },
     {
       "target": "tslib",
@@ -140,13 +140,13 @@ Note the shape of the result: HydraDB is dramatically slower at counting *everyt
       "reached": 2228,
       "sqlite_reached": 2228,
       "agree": true,
-      "hydra_ms": 310.55860000196844,
-      "hydra_min": 298.5206000157632,
-      "hydra_max": 362.64040000969544,
-      "sqlite_ms": 46.76280001876876,
-      "sqlite_min": 41.25419998308644,
-      "sqlite_max": 60.12459995690733,
-      "speedup": 0.15057641301342922
+      "hydra_ms": 327.0873000146821,
+      "hydra_min": 313.52830003015697,
+      "hydra_max": 339.79790000012144,
+      "sqlite_ms": 33.20750000420958,
+      "sqlite_min": 32.22619998268783,
+      "sqlite_max": 34.883800020907074,
+      "speedup": 0.10152488342628704
     },
     {
       "target": "tslib",
@@ -154,13 +154,13 @@ Note the shape of the result: HydraDB is dramatically slower at counting *everyt
       "reached": 2389,
       "sqlite_reached": 2389,
       "agree": true,
-      "hydra_ms": 502.2190000163391,
-      "hydra_min": 479.4760999502614,
-      "hydra_max": 534.5239999587648,
-      "sqlite_ms": 52.714899997226894,
-      "sqlite_min": 51.16689996793866,
-      "sqlite_max": 54.51019998872653,
-      "speedup": 0.10496396989264022
+      "hydra_ms": 592.2309000161476,
+      "hydra_min": 532.2144000092521,
+      "hydra_max": 598.4445000067353,
+      "sqlite_ms": 50.07980001391843,
+      "sqlite_min": 45.41530000278726,
+      "sqlite_max": 69.89009998505935,
+      "speedup": 0.08456127502390194
     },
     {
       "target": "tslib",
@@ -168,13 +168,13 @@ Note the shape of the result: HydraDB is dramatically slower at counting *everyt
       "reached": 2438,
       "sqlite_reached": 2438,
       "agree": true,
-      "hydra_ms": 693.8907000003383,
-      "hydra_min": 668.9116000197828,
-      "hydra_max": 712.7755000256002,
-      "sqlite_ms": 70.45270001981407,
-      "sqlite_min": 68.42219998361543,
-      "sqlite_max": 102.71840001223609,
-      "speedup": 0.10153284951041962
+      "hydra_ms": 623.3366999658756,
+      "hydra_min": 591.2938000401482,
+      "hydra_max": 668.0270999786444,
+      "sqlite_ms": 64.30399999953806,
+      "sqlite_min": 63.333300000522286,
+      "sqlite_max": 65.73640002170578,
+      "speedup": 0.10316094015170031
     },
     {
       "target": "chalk",
@@ -182,13 +182,13 @@ Note the shape of the result: HydraDB is dramatically slower at counting *everyt
       "reached": 827,
       "sqlite_reached": 827,
       "agree": true,
-      "hydra_ms": 19.85370001057163,
-      "hydra_min": 7.052700035274029,
-      "hydra_max": 24.124099989421666,
-      "sqlite_ms": 4.996800038497895,
-      "sqlite_min": 4.5405999990180135,
-      "sqlite_max": 7.886400038842112,
-      "speedup": 0.2516810486628294
+      "hydra_ms": 8.232499996665865,
+      "hydra_min": 6.375099997967482,
+      "hydra_max": 14.82639997266233,
+      "sqlite_ms": 4.860999993979931,
+      "sqlite_min": 4.632099997252226,
+      "sqlite_max": 5.150799988768995,
+      "speedup": 0.5904646214331758
     },
     {
       "target": "chalk",
@@ -196,13 +196,13 @@ Note the shape of the result: HydraDB is dramatically slower at counting *everyt
       "reached": 1505,
       "sqlite_reached": 1505,
       "agree": true,
-      "hydra_ms": 123.04330000188202,
-      "hydra_min": 115.02070003189147,
-      "hydra_max": 132.34229997033253,
-      "sqlite_ms": 17.6801000488922,
-      "sqlite_min": 16.024100012145936,
-      "sqlite_max": 27.57400000700727,
-      "speedup": 0.143690067225292
+      "hydra_ms": 130.93589997151867,
+      "hydra_min": 112.65309998998418,
+      "hydra_max": 137.21000001532957,
+      "sqlite_ms": 17.157799971755594,
+      "sqlite_min": 15.831400000024587,
+      "sqlite_max": 19.939999969210476,
+      "speedup": 0.13103969175365793
     },
     {
       "target": "chalk",
@@ -210,13 +210,13 @@ Note the shape of the result: HydraDB is dramatically slower at counting *everyt
       "reached": 1765,
       "sqlite_reached": 1765,
       "agree": true,
-      "hydra_ms": 260.19679999444634,
-      "hydra_min": 245.83929998334497,
-      "hydra_max": 296.4293000404723,
-      "sqlite_ms": 29.980599996633828,
-      "sqlite_min": 27.673000004142523,
-      "sqlite_max": 35.179799946490675,
-      "speedup": 0.1152227852044058
+      "hydra_ms": 242.8889000439085,
+      "hydra_min": 223.17039995687082,
+      "hydra_max": 293.82830002577975,
+      "sqlite_ms": 27.52800000598654,
+      "sqlite_min": 26.351400010753423,
+      "sqlite_max": 28.920200013089925,
+      "speedup": 0.11333576792109536
     },
     {
       "target": "chalk",
@@ -224,13 +224,13 @@ Note the shape of the result: HydraDB is dramatically slower at counting *everyt
       "reached": 1871,
       "sqlite_reached": 1871,
       "agree": true,
-      "hydra_ms": 361.27219995250925,
-      "hydra_min": 352.0118999877013,
-      "hydra_max": 370.42759999167174,
-      "sqlite_ms": 49.372400040738285,
-      "sqlite_min": 37.04220004146919,
-      "sqlite_max": 54.568200022913516,
-      "speedup": 0.13666260522461593
+      "hydra_ms": 336.2999999662861,
+      "hydra_min": 316.28060003276914,
+      "hydra_max": 380.5813000071794,
+      "sqlite_ms": 49.70390000380576,
+      "sqlite_min": 41.65570001350716,
+      "sqlite_max": 60.13960001291707,
+      "speedup": 0.1477963128420712
     },
     {
       "target": "chalk",
@@ -238,13 +238,13 @@ Note the shape of the result: HydraDB is dramatically slower at counting *everyt
       "reached": 1956,
       "sqlite_reached": 1956,
       "agree": true,
-      "hydra_ms": 431.6465999581851,
-      "hydra_min": 426.40039999969304,
-      "hydra_max": 465.1292000198737,
-      "sqlite_ms": 45.59640004299581,
-      "sqlite_min": 44.83869997784495,
-      "sqlite_max": 62.648999970406294,
-      "speedup": 0.10563363651517901
+      "hydra_ms": 393.27300002332777,
+      "hydra_min": 378.9250999689102,
+      "hydra_max": 421.2093999958597,
+      "sqlite_ms": 39.74610002478585,
+      "sqlite_min": 36.76409996114671,
+      "sqlite_max": 45.460599998477846,
+      "speedup": 0.10106490916596926
     },
     {
       "target": "lodash",
@@ -252,13 +252,13 @@ Note the shape of the result: HydraDB is dramatically slower at counting *everyt
       "reached": 783,
       "sqlite_reached": 783,
       "agree": true,
-      "hydra_ms": 19.676099997013807,
-      "hydra_min": 17.734499997459352,
-      "hydra_max": 21.71010000165552,
-      "sqlite_ms": 6.056599959265441,
-      "sqlite_min": 4.285999981220812,
-      "sqlite_max": 7.6425999868661165,
-      "speedup": 0.30781506295376804
+      "hydra_ms": 18.748700036667287,
+      "hydra_min": 14.078299980610609,
+      "hydra_max": 22.644200013019145,
+      "sqlite_ms": 3.929500002413988,
+      "sqlite_min": 3.8446999969892204,
+      "sqlite_max": 4.577299987431616,
+      "speedup": 0.20958786447748215
     },
     {
       "target": "lodash",
@@ -266,13 +266,13 @@ Note the shape of the result: HydraDB is dramatically slower at counting *everyt
       "reached": 1441,
       "sqlite_reached": 1441,
       "agree": true,
-      "hydra_ms": 132.42579996585846,
-      "hydra_min": 117.00379999820143,
-      "hydra_max": 137.41640001535416,
-      "sqlite_ms": 23.361100000329316,
-      "sqlite_min": 20.369600038975477,
-      "sqlite_max": 28.41119997901842,
-      "speedup": 0.176408977754729
+      "hydra_ms": 112.54329996882007,
+      "hydra_min": 96.77619999274611,
+      "hydra_max": 153.46130001125857,
+      "sqlite_ms": 15.172599989455193,
+      "sqlite_min": 12.799100019037724,
+      "sqlite_max": 19.88159999018535,
+      "speedup": 0.13481566644712512
     },
     {
       "target": "lodash",
@@ -280,13 +280,13 @@ Note the shape of the result: HydraDB is dramatically slower at counting *everyt
       "reached": 1611,
       "sqlite_reached": 1611,
       "agree": true,
-      "hydra_ms": 240.56230002315715,
-      "hydra_min": 221.39019996393472,
-      "hydra_max": 251.86229997780174,
-      "sqlite_ms": 22.730500029865652,
-      "sqlite_min": 22.502400039229542,
-      "sqlite_max": 24.82249995227903,
-      "speedup": 0.09448903684275364
+      "hydra_ms": 226.04310000315309,
+      "hydra_min": 214.68120004283264,
+      "hydra_max": 262.11230002809316,
+      "sqlite_ms": 21.761499985586852,
+      "sqlite_min": 20.786300010513514,
+      "sqlite_max": 24.873999995179474,
+      "speedup": 0.09627146320893361
     },
     {
       "target": "lodash",
@@ -294,13 +294,13 @@ Note the shape of the result: HydraDB is dramatically slower at counting *everyt
       "reached": 1637,
       "sqlite_reached": 1637,
       "agree": true,
-      "hydra_ms": 334.19189997948706,
-      "hydra_min": 328.4535999991931,
-      "hydra_max": 346.30830003879964,
-      "sqlite_ms": 29.367199982516468,
-      "sqlite_min": 28.423500014469028,
-      "sqlite_max": 39.66730000684038,
-      "speedup": 0.08787525964668517
+      "hydra_ms": 347.76610002154484,
+      "hydra_min": 321.5591000043787,
+      "hydra_max": 370.8228999748826,
+      "sqlite_ms": 35.225800005719066,
+      "sqlite_min": 29.51790002407506,
+      "sqlite_max": 52.95590002788231,
+      "speedup": 0.10129164402032502
     },
     {
       "target": "lodash",
@@ -308,13 +308,13 @@ Note the shape of the result: HydraDB is dramatically slower at counting *everyt
       "reached": 1643,
       "sqlite_reached": 1643,
       "agree": true,
-      "hydra_ms": 406.18450002511963,
-      "hydra_min": 391.6274000075646,
-      "hydra_max": 452.0542999962345,
-      "sqlite_ms": 31.771200010553002,
-      "sqlite_min": 30.330300040077418,
-      "sqlite_max": 34.279200015589595,
-      "speedup": 0.07821864204219556
+      "hydra_ms": 399.3060000357218,
+      "hydra_min": 363.9640000183135,
+      "hydra_max": 446.4939999743365,
+      "sqlite_ms": 44.8649000027217,
+      "sqlite_min": 41.560999990906566,
+      "sqlite_max": 64.79540001600981,
+      "speedup": 0.11235718972093606
     }
   ],
   "endpoint": [
@@ -322,25 +322,25 @@ Note the shape of the result: HydraDB is dramatically slower at counting *everyt
       "target": "tslib",
       "depth": 5,
       "total": 2438,
-      "ms": 853.2471000216901,
-      "min": 816.2538000033237,
-      "max": 904.5830999966711
+      "ms": 876.3413999695331,
+      "min": 777.6388999773189,
+      "max": 883.2931999932043
     },
     {
       "target": "chalk",
       "depth": 5,
       "total": 1956,
-      "ms": 554.1301000048406,
-      "min": 531.2455999664962,
-      "max": 557.0402999874204
+      "ms": 536.1123000038788,
+      "min": 514.1388000338338,
+      "max": 592.8070000372827
     },
     {
       "target": "lodash",
       "depth": 5,
       "total": 1643,
-      "ms": 540.1422999566421,
-      "min": 531.5632999991067,
-      "max": 611.1485000001267
+      "ms": 495.6176000414416,
+      "min": 491.93639995064586,
+      "max": 519.0688000293449
     }
   ]
 }

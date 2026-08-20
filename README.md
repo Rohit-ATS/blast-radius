@@ -1,409 +1,327 @@
 # Blast Radius
 
-**npm supply-chain incident response over a graph database.**
-Built in one day for Hack Hydra, on HydraDB 0.1.0.
+**npm supply-chain incident response, built on a graph.**
+Hack Hydra submission — HydraDB 0.1.0.
 
-When a package is compromised, three questions matter and none of them is
+When a package is compromised, four questions matter, and none of them is
 "which packages are similar to this one":
 
-1. **Who is transitively exposed?** Not just direct dependents — everything that
-   pulls it five levels down, with a breakdown of how deep the damage goes.
+1. **Who is transitively exposed?** Everything that pulls it, five levels down.
 2. **Whose semver range would *actually* have pulled the poison?** Listing a
-   dependency is not the same as resolving to the bad version. The difference
-   between those two numbers is the difference between a scary headline and a
-   true one.
-3. **Is *my* app affected?** Drop in a real `package-lock.json` and get one
-   word — EXPOSED, SHIELDED, or CLEAR — plus the exact dependency path.
+   dependency is not the same as resolving to the bad version.
+3. **Is anything in my project already malicious?** Checked live against the
+   advisory database, for any project — no crawl coverage required.
+4. **How do I fix it?** The safe version, the `overrides` block, and a brief a
+   coding agent can act on.
 
-Everything on the page is a real query against a real crawl of the npm
-registry. There is no seeded data, no fixture, and no placeholder anywhere in
-the UI, including in loading and empty states.
-
-```
-py server.py     →     http://127.0.0.1:8000
+```bash
+docker compose up -d          # HydraDB
+py server.py                  # http://127.0.0.1:8000
+py cli.py audit ./package-lock.json
 ```
 
 ---
 
 ## Why this is a graph problem
 
-The question in an incident is **reachability**: who depends on the
-compromised package, and who depends on them, and so on. That is a transitive
-closure over a directed graph.
+The question in an incident is **reachability**: who depends on the compromised
+package, who depends on them, and so on. That is a transitive closure over a
+directed graph.
 
-A vector index cannot express it at all — "similar to `event-stream`" is not a
-question anyone asks while their build is shipping a crypto miner. A relational
-database can express it, as a recursive CTE, and we measured exactly that. See
-[BENCHMARKS.md](BENCHMARKS.md), which reports that **SQLite beat HydraDB by
-3–13× at this graph size** and explains why. That result is in this repo
-because it is true, not because it flatters the submission.
+A vector index cannot express it at all. "Packages similar to `event-stream`" is
+not a question anyone asks while their build is shipping a crypto miner.
 
-What the graph model buys is not raw speed at 27k vertices. It is that the
-query is one clause — `-[:REQUIRED_BY*1..5]->` — that stays one clause as the
-depth bound changes, against a hand-written fixpoint whose correctness depends
-on getting `UNION` vs `UNION ALL`, depth accounting, and cycle termination
-right. Both implementations are in this repo. Compare them.
+But the argument is not really about one traversal. It is about **chaining
+across relationship types**. "Which packages does `qix` maintain" is a join.
+"How many packages transitively depend on anything `qix` maintains" crosses two
+relationship types and changes answer the moment any edge anywhere in the graph
+moves. That is a graph question, and it is the one that matters after a
+maintainer gets phished.
 
-## The reversed-edge design decision
+## Everything is a node
 
-Edges are stored **backwards**:
+```
+(:Package    {id, name, latest})
+(:Maintainer {id, name})
+(:Advisory   {id, osv_id, severity, is_malware, summary})
 
-```cypher
-(dependency)-[:REQUIRED_BY]->(dependent)
+(dependency)-[:REQUIRED_BY]->(dependent)      91,544
+(:Maintainer)-[:MAINTAINS]->(:Package)         5,184
+(:Package)-[:MAINTAINED_BY]->(:Maintainer)     5,184
+(:Advisory)-[:AFFECTS]->(:Package)               138
+(:Package)-[:HAS_ADVISORY]->(:Advisory)          138
+(:Package)-[:SIMILAR_TO]->(:Package)             270
 ```
 
-That reads wrong. `express` depends on `debug`, so the natural edge is
-`express -> debug`. We store `debug -> express`.
+27,076 packages · 1,617 maintainers · 136 advisories · ~102,000 edges.
 
-The reason is a hard constraint in HydraDB 0.1.0: **a variable-length `MATCH`
-only executes when the source id is fixed.**
+Ids are namespaced through `nid()` — `nid("maint:qix")`,
+`nid("adv:MAL-2025-46974")` — so three entity kinds share one integer id space
+without colliding.
+
+Every relationship is stored **in both directions**. That is not redundancy: a
+variable-length `MATCH` requires a fixed source id, so without the reverse edge
+there is no way to ask "who maintains this package" starting from the package.
+
+## The chained traversals
+
+Each stage is anchored at a known vertex because the engine requires it, and the
+stages run concurrently.
+
+### 1. What one compromised account can reach
+
+```cypher
+MATCH (m {id: $maintainer_id})-[:MAINTAINS]->(p) RETURN p.name
+-- then, per package, concurrently:
+MATCH (t {id: $package_id})-[:REQUIRED_BY*1..4]->(v) RETURN count(*)
+```
+
+> **qix controls 2 packages. 3,484 packages depend on them.** — 803 ms
+
+The union is counted, not the sum: packages by one author share most of their
+downstream, and adding the counts double-counts it. The September 2025
+chalk/debug attack began with exactly one account.
+
+### 2. Why am I exposed — the actual chain
+
+`GET /api/why-exposed?from=debug&to=express`
+
+The depth at which the target becomes reachable is computed in the graph and is
+authoritative. The concrete path cannot be — HydraDB 0.1.0 returns no path
+binding — so it is rebuilt from the sidecar edge table and then **every hop is
+re-confirmed against the graph**, with `graph_verified` reported honestly.
+
+### 3. Blast radius of a CVE, not a package
+
+```cypher
+MATCH (a {id: $advisory_id})-[:AFFECTS]->(p) RETURN p.name
+-- then REQUIRED_BY outward from each affected package
+```
+
+An advisory usually names several packages. "How far does GHSA-xxxx reach" is a
+different question from asking about any one of them.
+
+### 4. Typosquats that already have victims
+
+```cypher
+MATCH (p {id: $package_id})-[:SIMILAR_TO]->(q) RETURN q.name
+-- then, per neighbour: how many packages already depend on it
+```
+
+A near-miss name nobody uses is trivia. One with real dependents means somebody
+has already installed the wrong thing.
+
+## The reversed-edge decision
+
+Edges are stored **backwards**: `(dependency)-[:REQUIRED_BY]->(dependent)`.
+
+`express` depends on `debug`, so the natural edge is `express -> debug`. We
+store `debug -> express`. The reason is a hard constraint:
 
 ```
 "variable-length MATCH requires a fixed source id"
 ```
 
 With natural edges, "who transitively depends on `debug`" means starting from
-every possible dependent and walking *towards* `debug` — an unbounded set of
-sources, which the engine refuses. With reversed edges, the traversal starts at
-`debug` itself, and in an incident the compromised package is the one thing you
-know for certain.
+every possible dependent — an unbounded set of sources, which the engine
+refuses. Reversed, the traversal starts at `debug`, and in an incident the
+compromised package is the one thing you know for certain. The write path pays a
+trivial cost (swap two fields); the read path becomes one legal traversal
+instead of an illegal scan.
 
-So the direction is chosen to put the known quantity where the engine requires
-a constant. The write path pays a trivial cost (swap two fields) and the read
-path becomes a single legal traversal instead of an illegal scan.
+## Two layers, on purpose
 
-## The two-layer design
+| layer | store | holds |
+|---|---|---|
+| topology | HydraDB | packages, maintainers, advisories, every edge between them |
+| predicates | SQLite (`deps.db`) | declared semver ranges |
 
-| layer | store | holds | why |
-|---|---|---|---|
-| topology | HydraDB | `(:Package {id, name, latest})`, `REQUIRED_BY` edges | reachability is the graph's job |
-| predicates | SQLite (`deps.db`) | declared semver ranges, per-release deps, maintainers | HydraDB 0.1.0 cannot filter on edge properties mid-traversal |
-
-The second row is not a design preference, it is a constraint. Attempting to
-filter an edge property during a variable-length traversal returns:
+Only semver ranges stay out of the graph, and that is forced — HydraDB 0.1.0
+cannot filter on edge properties during a traversal:
 
 ```
 "variable-length relationship bindings are not executable in Query engine"
 ```
 
-A declared range like `^4.1.0` would therefore be unreachable at exactly the
-moment it matters. So ranges live in SQLite, where "whose range admits 4.4.2"
-is an indexed scan, and the graph holds only what it is good at.
+A range stored on an edge would be unreadable at exactly the moment it matters.
 
-Both stores are written from the same batch in the same crawler pass, so their
-counts track each other — which is also how the live header stays fast while
-HydraDB's own `count(*)` takes twelve seconds (see below).
+## What is live, and what is crawled
 
-## HydraDB 0.1.0 constraints we hit and engineered around
+Being precise about this matters more than sounding impressive.
 
-The organizers asked people to surface what does not work. Every line here was
-found empirically and is reproducible by running
-[`probe_constraints.py`](probe_constraints.py), which prints a PASS/FAIL table
-and flags any row where the constraint no longer holds.
+| capability | coverage | source |
+|---|---|---|
+| **Lockfile audit** — is anything in my tree malicious | **all of npm** | osv.dev, live |
+| **Package intel** — real, current, compromised | **all of npm** | registry + osv.dev, live |
+| **Remediation** — safe version, overrides, agent brief | **all of npm** | osv.dev, live |
+| **Typosquat existence check** | **all of npm** | registry, live |
+| **Live publish feed** | **all of npm** | replicate.npmjs.com, polled |
+| **Blast radius / chained traversals** | 27,076 packages (0.63%) | HydraDB graph |
+
+The universal features need no crawl — your lockfile *is* your tree. The graph
+powers the differentiated layer on top. Every API response carries
+`graph_coverage`, so the caveat travels with the data instead of living in a
+footnote.
+
+## HydraDB 0.1.0: constraints we hit and engineered around
+
+The organizers asked people to surface what does not work. Everything here was
+found empirically; [`probe_constraints.py`](probe_constraints.py) prints a
+PASS/FAIL table and flags any row where a constraint no longer holds.
 
 ### Rejected outright
 
 | what we tried | what HydraDB said | what we did instead |
 |---|---|---|
-| string vertex ids | `UNWIND row 0 field id must be a non-negative integer` | `nid()` derives a 51-bit integer id from the package name (`hydra.py`) |
-| `CREATE INDEX ON :Package(name)` | `expected query, got CREATE INDEX` | no index needed — ids are derived, so lookup is a pure function |
-| `MATCH … MERGE` inside `UNWIND` | `UNWIND MATCH must end in RETURN or DELETE` | `CREATE` with explicit ids, which binds to the existing vertex |
-| bare `MERGE … SET` outside `UNWIND` | `MERGE with following clauses is not executable` | every write goes through `UNWIND $rows AS row MERGE …` |
-| `length(path)` in `RETURN` | `RETURN currently supports <binding>.<property> or count(*)` | difference `count(*)` at each depth bound to build the histogram |
-| variable-length `MATCH` with no fixed source | `variable-length MATCH requires a fixed source id` | reversed edges (above) |
-| filtering edge properties while traversing | `variable-length relationship bindings are not executable` | ranges live in the SQLite sidecar |
-| bare `MATCH (n)` with no predicate | `node-only MATCH requires an id, label, or property predicate` | always scope by label or id |
-| `count(DISTINCT x)` | `DISTINCT aggregate arguments are not executable` | `RETURN DISTINCT x` and count client-side |
-| `*1..$depth` as a parameter | `unbounded variable-length MATCH requires an explicit max hop` | interpolate a clamped integer into the query string |
-| result limit above 100,000 | `query_result_limit rejected by admission control` | clamp to `RESULT_LIMIT` in `hydra.py` |
+| string vertex ids | `field id must be a non-negative integer` | `nid()` derives a 51-bit int from the name |
+| `CREATE INDEX` | `expected query, got CREATE INDEX` | no index needed — ids are derived |
+| `MATCH … MERGE` in `UNWIND` | `UNWIND MATCH must end in RETURN or DELETE` | `CREATE` with explicit ids |
+| bare `MERGE … SET` | `MERGE with following clauses is not executable` | every write goes through `UNWIND` |
+| `length(path)` | `RETURN supports <binding>.<property> or count(*)` | difference `count(*)` per depth |
+| var-length `MATCH`, no fixed source | `requires a fixed source id` | reversed edges |
+| edge property filters mid-traversal | `relationship bindings are not executable` | ranges live in SQLite |
+| bare `MATCH (n)` | `requires an id, label, or property predicate` | always scope by label or id |
+| `count(DISTINCT x)` | `DISTINCT aggregate arguments are not executable` | `RETURN DISTINCT` + count client-side |
+| `*1..$depth` as a parameter | `requires an explicit max hop` | interpolate a clamped integer |
+| result limit > 100,000 | `query_result_limit rejected by admission control` | clamp to `RESULT_LIMIT` |
+| `feed=continuous` (npm, not HydraDB) | `400 Bad Request` | poll `_changes?since=<seq>` |
 
-### Traps that fail silently — the expensive ones
-
-These cost the most time, because nothing errors. They just quietly return a
-wrong answer.
+### The ones that fail silently — far more expensive
 
 **1. An id-only `MATCH` can never say "no".**
+`MATCH (p {id: $id}) RETURN p.name` returns a row of nulls for an id never
+written. Scoping to `:Package` makes it an existence test. Until we found this,
+every unknown package reported an empty blast radius — which reads as *safe*,
+the worst possible way to be wrong.
 
-```cypher
-MATCH (p {id: $id}) RETURN p.name     -- returns a row of nulls for an id
-                                      -- that was never written
-```
-
-Addressing a vertex by id materialises the slot whether or not anything is
-there, so this is not an existence test. Scoping to `:Package` makes it one.
-Until we found this, every unknown package reported an empty blast radius —
-which reads as *safe*, the worst possible way to be wrong.
-
-**2. `{"type": "null"}` is not the same shape as other typed values.**
-
-HydraDB returns typed values as `{"type": "string", "value": "debug"}`, but a
-null comes back as `{"type": "null"}` with **no `value` key**. A client that
-unwraps only two-key dicts leaves it as a truthy dict, so an absent property
+**2. `{"type": "null"}` has no `value` key.**
+Other typed values are `{"type": "string", "value": "debug"}`. A client that
+unwraps only two-key dicts leaves a null as a truthy dict, so an absent property
 reads as present. This compounded trap 1 exactly.
 
-**3. Results are paged at 1024 rows.**
+**3. Results page at 1024 rows.**
+Every response carries `next_cursor`; ignoring it silently truncates every large
+answer. Continuing a page needs **both** the cursor and the originating
+`query_id`.
 
-Every response carries `next_cursor`. Ignoring it silently truncates every
-large answer — our victim lists were capped at 1024 while `count(*)` correctly
-reported thousands. Continuing a page needs **both** the cursor and the
-originating `query_id`; the cursor alone is rejected with `result cursor does
-not belong to this query request`.
+**4. `count(*)` on a variable-length match counts reachable vertices, not paths.**
+Good news, and load-bearing: it makes the depth histogram exact and cheap.
+Verified against a deliberately diamond-shaped graph in
+[`probe_counts.py`](probe_counts.py).
 
-**4. `count(*)` on a variable-length match counts *reachable vertices*, not paths.**
+**5. A restarted store is permanently read-only.**
+SlateDB cannot update an existing manifest on the local filesystem backend:
+`Operation put_opts with mode PutMode::Update not yet implemented`. Reads stay
+perfect; every write returns 500 forever. Only a write reveals it, so
+`/api/health` round-trips one on a timer and [`rebuild.py`](rebuild.py) replays
+the whole graph from the sidecar in about a minute.
 
-This one is good news, and worth knowing. Verified against a deliberately
-diamond-shaped graph in [`probe_counts.py`](probe_counts.py): a vertex
-reachable by two distinct paths is counted once. That is what makes the depth
-histogram cheap — ask for the cumulative reach at each bound and difference the
-series — and it is why the histogram is exact rather than an estimate.
+**6. `/readyz` is not a readiness signal for queries.**
+It returns 200 within a second of a restart while deep traversals still fail the
+engine's own 30-second query ceiling. The server warms itself, walking depths
+1→5 in order because each depth caches the pages the next needs.
 
-**5. Whole-graph counts are full scans, and there is no index to fix it.**
+**7. Traversal cost scales with *total store size*, not the edges walked.**
+This one nearly sank the project. Loading all 77,232 maintainer links (plus the
+reverse) tripled the store to ~246,000 edges, and depth-4 and depth-5
+`REQUIRED_BY` traversals — which never touch a maintainer edge — stopped
+completing at all. After capping maintainer edges to packages with ≥10
+dependents (~102,000 edges total), depth 5 completes in **860 ms on a cold
+store, first attempt**. There is a practical ceiling here, and it is a property
+of the store, not of the query.
 
-`MATCH (p:Package) RETURN count(*)` plus the edge count took **12.7 seconds**
-on an idle 27k-vertex graph, and **97 seconds** on the same graph while the
-crawler was still writing to it. HydraDB says so itself in its logs:
+## Two accuracy bugs, both erring toward alarm
 
-```json
-{"level":"WARN","message":"query plan warrants attention",
- "reason":"full_scan","hydradb.query.access_path":"AllVertexScan"}
-```
+The alarming direction is the dangerous one for a security tool.
 
-The live header polls every four seconds, so this cannot sit on a request path.
-The server now serves graph size from the sidecar and re-measures the real
-graph on a background thread, reporting the measurement's age. The number stays
-real; it just stops blocking.
+**Classifying malware from advisory prose.** Scanning summaries and details for
+words like "malicious" labelled **`express` as malware**, because ordinary
+vulnerability write-ups describe attacker behaviour in exactly those words.
+Classification now reads structured fields only: a `MAL-` id, a
+`malicious-packages-origins` record, or **CWE-506 (Embedded Malicious Code)** —
+which both the 2018 event-stream backdoor and the 2025 debug takeover carry.
 
-**6. A restarted store is permanently read-only — and only a write reveals it.**
+**Querying OSV without a version.** A version-less query returns every advisory
+ever filed against a package across its whole history, so every popular package
+looked compromised. `assess()` now resolves `latest` first and asks about that.
+**`debug@4.4.2` is malicious; `debug@4.4.3` is clean.**
 
-This is the most operationally severe one, and it is completely silent from the
-read path:
+The same lesson hit the tarball scanner, which rated **`esbuild`** as
+`malicious_pattern` — a compiler legitimately runs a postinstall and spawns
+processes. Capability and intent are now separate: the scan reports what a
+package *can do*, and only the diff against the previous release reports what
+this version *added*.
 
-```
-object store error: Operation `put_opts` with mode `PutMode::Update`
-not yet implemented by LocalFileSystem(file:///data/store)
-```
+## The advisory outlives the artifact
 
-HydraDB's SlateDB backend creates its manifest on first boot (`PutMode::Create`,
-fine) and must *update* it on every boot after that (`PutMode::Update`, not
-implemented for the local filesystem). The result: after the first container
-restart, every write returns `500 internal query execution error`, forever,
-while reads keep answering perfectly and at full speed.
+`debug@4.4.2` and `ua-parser-js@0.7.29` have both been **unpublished from npm**.
+The publish timestamp survives in `time` while the release is gone from
+`versions` — itself a strong signal, and detected and reported as such.
 
-Serving is read-only, so the console is unaffected — but the crawler cannot
-write another row, and you find out 20 minutes into a re-crawl. So:
+- OSV is the **durable** layer; the bytes are not.
+- Tarball analysis is a **pre-disclosure** tool, not a forensic one.
+- A lockfile still pinning that version will now *fail to install*, which is
+  often how a team first notices.
 
-- `/api/health` round-trips a real write on a timer and reports `writable`.
-  Nothing else can detect this.
-- `ingest.py` refuses to start against a read-only store and says what to do.
-- [`rebuild.py`](rebuild.py) replays the whole graph out of the sidecar in
-  about a minute, with no network access, because `deps.db` already holds every
-  vertex and edge that was written. Recovering does not require re-crawling npm.
+## Benchmarks
 
-**7. `/readyz` is not a readiness signal for queries.**
+Full numbers in [BENCHMARKS.md](BENCHMARKS.md). The short version: the identical
+transitive closure is computed in HydraDB and in a SQLite recursive CTE, the
+counts are **cross-checked before the times are compared**, and both engines
+agree on every row. **SQLite is 7–10× faster at this graph size**, and that
+result leads the document rather than hiding in it.
 
-Measured after a container restart: `/readyz` returns 200 at **t+0.6s**, but a
-depth-5 traversal does not complete until **t+93s**, failing HydraDB's own
-30-second query timeout (`408 query_timeout`, `client_query_runtime exceeded`)
-on every attempt in between. There is a server-side 30s ceiling on any single
-query, and a cold store cannot beat it on a deep traversal.
-
-The server therefore warms the cache itself — walking depths 1→5 in order,
-because each depth caches the pages the next one needs — and a supervisor
-re-warms whenever a probe fails, so a restart heals without anyone noticing.
-While it is warming, requests get a `graph_warming` 503 that says so, and the
-console retries rather than flashing an error.
-
-### Also worth knowing
-
-- `consistency` accepts only `causal` and `strong`. `strong` measured ~30×
-  slower on the same traversal; `causal` is the right default.
-- `algo.SSpaths` exists and requires `sourceNode` plus a non-empty `relTypes`,
-  but returns a single path regardless of `resultLimit` — it is not a
-  reachability primitive.
-- `DISTINCT`, `LIMIT`, `ORDER BY`, `WHERE` on node properties, and
-  `DETACH DELETE` by id all work fine.
-- `RUST_MIN_STACK: 33554432` is required in the container environment, or the
-  node serves `/readyz` and then aborts on the first real query.
-- `408` is a *retryable* status here, unlike most 4xx: it is HydraDB's own query
-  timeout, and the identical query succeeds in about a second once the working
-  set is cached. Treating it as a client error (as a naive `< 500` check does)
-  turns a warm-up into a hard failure.
+A rigged table would be worthless in a pitch. What the graph model buys here is
+not raw speed at 27k vertices — it is that `-[:REQUIRED_BY*1..5]->` stays one
+clause as the depth bound changes, against a hand-written fixpoint whose
+correctness depends on getting `UNION` vs `UNION ALL`, depth accounting and
+cycle termination right. Both implementations are in this repo; compare them.
 
 ## Setup (Windows)
 
-Tested on Windows 11 with Python 3.14 and Docker Desktop. Use `py`, not
-`python3`.
+Tested on Windows 11, Python 3.14, Docker Desktop. Use `py`, not `python3`.
 
 ```powershell
-# 1. HydraDB
 mkdir .hydradb\store, .hydradb\cache
 "local-development-token-32-bytes" | Out-File -Encoding ascii .hydradb\auth-token
 docker compose up -d
+py -m pip install -r requirements.txt
 py hydra.py                       # waits for readiness, round-trips a write
 
-# 2. Dependencies
-py -m pip install -r requirements.txt
-
-# 3. Crawl the registry (runs for ~20 min, resumable, safe to re-run)
+# Build the graph: crawl npm (~20 min), or replay a deps.db you already have
 py expand_seeds.py --out seeds_expanded.txt --target 80000
 py ingest.py --seeds seeds_expanded.txt --max-packages 40000 --max-versions 5
+py graphify.py                    # maintainers, advisories, similarity
+#   ...or, with deps.db in hand:  py rebuild.py --yes
 
-# 4. Serve the API and the console on one port
 py server.py                      # http://127.0.0.1:8000
 ```
 
-The crawl is resumable: progress is checkpointed to `.crawl_state.json` every
-batch, and re-running merges any new seeds into the queue without losing work.
-**The console works while the crawl is still running** — a package that has not
-been reached yet returns an explicit `not_in_graph` with the current crawl
-progress, rather than an empty result that looks like safety.
+The console works while the crawl is still running: a package not yet reached
+returns an explicit `not_in_graph` with current progress, never an empty result
+that looks like safety.
 
-### Verifying a running system
+## Verifying it
 
 ```powershell
-py -m pytest tests -q            # 108 tests
-py verify.py                     # drives the live stack end to end
-py verify.py --soak 300          # sustained load, reports the measured rate
-py web_audit.py                  # clicks every control and proves it did something
-py chaos.py                      # kills HydraDB and checks the recovery
-py rebuild.py --verify           # is the graph still writable?
+py -m pytest tests -q      # 117 tests
+py verify.py               # drives the live stack, per-endpoint success + latency
+py verify.py --soak 300    # sustained load, measured success rate
+py web_audit.py            # clicks all 39 controls, asserts each did something
+py chaos.py                # stops HydraDB, proves the recovery
+py demo_check.py           # pre-recording gate: 21 checks
 ```
 
-`web_audit.py` walks the console the way a person does — every nav link, the
-autocomplete, all three incident chips, the submit button, each map depth
-control, hover, click-to-pivot, both lockfile outcomes, every draggable window
-and a pasted deep link — and asserts on the *observable consequence* of each,
-not on the element existing. It found a real one: the autocomplete dropdown was
-painting underneath the preset chips, so a click in the overlap hit a chip
-instead of the suggestion.
-
-`verify.py` is not a unit test: it exercises the actually-running system with
-real package names read out of the live graph, and reports a per-endpoint
-success rate and latency distribution. `chaos.py` stops the database underneath
-the server and asserts that the outage is clean, that sidecar-backed endpoints
-keep serving, and that the API recovers on its own without a restart.
-
-Layered so a partial environment still reports usefully: pure semver and
-lockfile tests always run; graph, API, and browser layers skip with a reason if
-HydraDB, the server, or Chrome is unavailable. The browser layer drives the
-real page with Playwright and asserts zero console errors.
-
-### Benchmarks
-
-```powershell
-py bench.py --runs 5             # writes BENCHMARKS.md
-```
-
-Computes the identical closure in both engines and **cross-checks the counts
-before comparing times** — a speed comparison between two systems computing
-different numbers would be worthless. They agree on every row.
-
-## What HydraDB is actually doing here
-
-Strip out the sidecar and the console and the load-bearing query is this:
-
-```cypher
-MATCH (t {id: $id})-[:REQUIRED_BY*1..5]->(v) RETURN DISTINCT v.name
-```
-
-One bounded traversal from one known vertex, returning every package that
-transitively depends on the compromised one. `/api/blast` runs that plus one
-`count(*)` per depth level, concurrently, to build the histogram.
-
-**Without HydraDB** the topology layer is gone: no reachability query, no depth
-histogram, and the lockfile check loses the graph-side verdict it intersects
-against. The sidecar alone can answer "who declares a dependency on X" but the
-transitive closure is precisely the part that is not a single indexed lookup.
-
-## Layout
-
-```
-hydra.py               HydraDB client: nid(), cursor paging, retry policy, budgets
-ingest.py              npm crawler -> HydraDB + deps.db sidecar
-blast.py               the five incident queries + npm semver range logic
-server.py              FastAPI: six endpoints, serves the console on the same port
-web/                   the console — vanilla HTML/CSS/JS, no build step
-                       (radial blast map is hand-rolled SVG; no chart library)
-bench.py               HydraDB vs SQLite recursive CTE -> BENCHMARKS.md
-expand_seeds.py        widens the crawl frontier from the npm search API
-probe_constraints.py   the constraint table above, as a runnable PASS/FAIL check
-probe_counts.py        proves count(*) counts vertices, not paths
-rebuild.py             replay the graph from deps.db when the store goes read-only
-verify.py              end-to-end verification of the running system
-web_audit.py           clicks every control in a real browser and checks it worked
-chaos.py               fault injection: kill HydraDB, prove the recovery
-tests/test_all.py      108 tests
-```
-
-## API
-
-| endpoint | answers |
-|---|---|
-| `GET /api/health` | per-component liveness: hydradb, sidecar, warm-up, writability |
-| `GET /api/stats` | graph size, crawl progress |
-| `GET /api/events` | server-sent stream of the live system state |
-| `GET /api/blast?name=&depth=` | victims + depth histogram + latency |
-| `GET /api/subgraph?name=&depth=` | drawable slice: nodes by depth + edges |
-| `GET /api/resolve?name=&bad_version=` | exposed vs shielded by pin |
-| `POST /api/lockfile?name=&bad_version=` | EXPOSED / SHIELDED / CLEAR + path |
-| `GET /api/maintainers?name=` | what else those maintainers publish |
-| `GET /api/typosquats?name=` | one-edit neighbours, checked live against npm |
-| `GET /api/search?q=` | package name autocomplete |
-
-Every response carries `latency_ms` measured around the real query. Interactive
-docs at `/api/docs`.
-
-## Data
-
-Package metadata comes from the [npm registry](https://registry.npmjs.org)
-(`registry.npmjs.org` and its search API), fetched live at crawl time. npm
-registry data is provided by npm, Inc. This project stores only package names,
-versions, declared dependency ranges, and maintainer handles.
-
-The incidents referenced on the landing page (`debug`/`chalk` via the qix
-account takeover in September 2025, `event-stream` in November 2018,
-`ua-parser-js` in October 2021) are real, publicly documented supply-chain
-attacks. The blast radius numbers shown for them are computed live from the
-crawled graph, not from any published incident report.
-
-## The console
-
-One page. Scroll from the wordmark straight into the working tool — there is no
-second thing to click through to.
-
-**The blast map** draws the radius as what it actually is: the compromised
-package at the centre, concentric rings for dependency depth, red attenuating
-outward. A node's ring is a real property of the graph — the depth HydraDB
-first reaches it at — not a layout convenience. Hover to isolate a package and
-its edges; **click any node and the entire console pivots onto it**, which is
-the point of having the graph on screen instead of a list.
-
-A depth-3 radius around a popular package reaches thousands of nodes, which is
-not a picture, so the map draws the best-connected slice and says exactly how
-much it left out: *"showing the 84 best-connected of 3,041 exposed"*. The
-headline number stays the true one.
-
-**Every query is a URL.** `/?pkg=debug&v=4.4.2` restores the full result, so a
-finding can be pasted to a colleague at 2am. No localStorage, no client state
-to lose.
-
-**The typosquat panel checks npm, not just our corpus.** The crawl is
-popularity-weighted and a typosquat is by definition unpopular, so a
-corpus-only answer returns nothing — which reads as *you are safe*. The
-one-edit neighbours are checked against the registry itself, in parallel, and
-npm's `0.0.1-security` tombstone is surfaced as **taken down by npm**: proof
-somebody already squatted that name. For `lodash`, all 13 one-edit variants are
-real packages.
-
-**The status section is the reliability work, visible.** It is pushed over
-server-sent events rather than polled, and shows the same components
-`verify.py` and `chaos.py` assert against — including whether the graph is
-still writable, which nothing but a real write can detect.
+`web_audit.py` earned its place by finding a real defect: the autocomplete
+dropdown was painting *underneath* the preset chips, so a click in the overlap
+selected a chip instead of the suggestion. It now asserts against
+`elementFromPoint`, so "visible to a selector but unclickable to a person"
+cannot pass again.
 
 ## Use it in CI
 
 The CLI exits non-zero when your tree contains malware, which is what makes it
-able to fail a build. A scanner that always exits 0 gets ignored.
+able to fail a build.
 
 ```bash
 py cli.py audit ./package-lock.json     # also yarn.lock and pnpm-lock.yaml
@@ -417,18 +335,16 @@ py cli.py fix debug 4.4.2
 |---|---|
 | `0` | clean |
 | `1` | something in the tree is **confirmed malicious** |
-| `2` | known vulnerabilities, no malware (only with `--fail-on vuln`) |
+| `2` | known vulnerabilities (only with `--fail-on vuln`) |
 | `3` | the scan could not be completed |
 
-Malware and vulnerabilities are separate exit codes on purpose. Malware means
-somebody attacked you and the build must stop; a ReDoS advisory in a dev
-dependency should not wake anyone at 2am, so it is non-fatal by default.
+Malware and vulnerabilities are separate codes on purpose: one means somebody
+attacked you, the other should not wake anyone at 2am.
 
 ```yaml
 # .github/workflows/supply-chain.yml
 name: supply chain
 on: [push, pull_request]
-
 jobs:
   blast-radius:
     runs-on: ubuntu-latest
@@ -437,84 +353,102 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install -r requirements.txt
-      - name: Fail the build if anything in the tree is malicious
-        run: python cli.py audit ./package-lock.json
+      - run: python cli.py audit ./package-lock.json
 ```
 
-`audit` talks only to osv.dev and the npm registry, so it needs no HydraDB and
-no crawl — it works in a bare CI container.
+`audit` talks only to osv.dev and the npm registry — no HydraDB, no crawl — so
+it runs in a bare CI container.
 
-## Reliability, measured
+## API
 
-Uptime is not a claim worth making about the future, so what is claimed here is
-what was measured. `verify.py` and `chaos.py` reproduce all of it.
-
-**Under sustained load**, on a warm graph of 27,076 packages and 91,544 edges:
-
-| measurement | result |
+| endpoint | answers |
 |---|---|
-| full verification pass | **61/61 checks**, including the browser flow |
-| 180-second soak, mixed endpoints | **100.00% — 5,571/5,571 requests** |
-| soak latency | p50 **28 ms**, p95 **57 ms**, max 488 ms |
-| `/api/blast` depth 5 (3,650 exposed) | p50 45 ms, p95 83 ms |
-| 32 concurrent mixed requests | 32/32, 1.7 s wall |
+| `GET /api/health` | per-component liveness, uptime, cache, OSV reachability |
+| `GET /api/stats` | graph size, crawl progress |
+| `GET /api/events` | SSE: live system state **and** npm publishes |
+| `GET /api/feed` | recent npm publishes, enriched with reach |
+| `GET /api/blast` | victims + depth histogram |
+| `GET /api/subgraph` | drawable slice: nodes by depth + edges |
+| `GET /api/expand` | one node and its neighbours, every edge type |
+| `GET /api/attack-surface` | Maintainer → Package → blast radius |
+| `GET /api/why-exposed` | the verified chain between two packages |
+| `GET /api/blast-advisory` | Advisory → Package → blast radius |
+| `GET /api/typosquat-risk` | similar names ranked by dependents |
+| `GET /api/intel` | is a package real, current, compromised |
+| `POST /api/audit` | scan a lockfile against osv.dev (4 formats) |
+| `GET /api/fix` | safe version, overrides, agent brief |
+| `GET /api/scan` | read the published tarball, diff releases |
+| `GET /api/resolve` | exposed vs shielded by pin |
+| `GET /api/maintainers` | what else those maintainers publish |
+| `GET /api/search` | package name autocomplete |
 
-One honest caveat on that 100%: an earlier soak run, taken minutes after
-`rebuild.py` had just rewritten all 91,544 edges, measured **90.21%
-(4,246/4,707)** — a burst of fast failures at the start that stopped entirely
-and never recurred. That run's detail was not captured, so it is recorded here
-as unexplained rather than diagnosed; `verify.py` now aggregates failure
-reasons, endpoints and timing so a repeat would be. Two subsequent runs against
-a warm store, one of them 5,571 requests, were clean.
+Every response carries `latency_ms` measured around the real query, plus `ok`,
+`source`, `graph_coverage`, `cached` and `request_id`. Interactive docs at
+`/api/docs`.
 
-**When HydraDB is stopped mid-flight** (`chaos.py`, which really does stop the
-container), the system degrades honestly rather than breaking:
+## Demo safety
 
-| behaviour | result |
-|---|---|
-| graph endpoints during the outage | `503` with an explanation and a hint, in ~18s — never a 500 or a hang |
-| `/api/stats`, `/api/search`, `/api/maintainers`, the console | keep serving from the sidecar throughout |
-| after the database returns | recovers on its own, no server restart, no intervention |
-| during the ~93s cold window | `503 graph_warming`, and the console retries instead of showing an error |
+`DEMO_MODE=1` serves responses captured from real runs. Independently of that
+flag, a capture is used as a **fallback** whenever a live call fails, so a
+dropped connection shows the real answer from ten minutes ago instead of a stack
+trace. Anything served that way is flagged `demo: true` — a fixture presented as
+a live query would be a lie. Verified by stopping HydraDB entirely: the console
+kept answering.
 
-Three fixes came out of running that test rather than reasoning about it:
+## Layout
 
-- **Retry classification.** Retrying a rejected query wasted seconds on every
-  syntax error, while a genuinely transient failure — a dropped connection, a
-  `408` query timeout — was not retried patiently enough to survive a restart.
-  Both directions were wrong; both are now classified.
-- **Dead pooled connections.** A keep-alive socket pointing at a process that no
-  longer exists produced errors after the database was back. The session is
-  dropped on a transport failure so the retry dials fresh.
-- **A wall-clock budget.** Five patient retries against a 30-second server-side
-  query timeout meant a single request could take over two minutes to admit
-  defeat — long after the browser gave up. Request paths now get 20 seconds
-  total; the crawler and the warm-up keep the patient behaviour.
+```
+hydra.py               HydraDB client: nid(), cursor paging, retry policy, budgets
+ingest.py              npm crawler -> HydraDB + deps.db sidecar
+graphify.py            maintainers, advisories, similarity -> graph nodes
+blast.py               blast radius, lockfiles, npm semver
+chains.py              the traversals that cross edge types
+intel.py               live registry + OSV: real, current, compromised
+scan.py                tarball static analysis + version diffing
+lockfiles.py           npm / yarn v1 / yarn berry / pnpm
+feed.py                live npm publish poller
+server.py              FastAPI: 18 endpoints, serves the console on one port
+cli.py                 CI-usable CLI with meaningful exit codes
+web/                   the console — vanilla HTML/CSS/JS, no build step
+bench.py               HydraDB vs SQLite recursive CTE -> BENCHMARKS.md
+rebuild.py             replay the graph from deps.db
+verify.py / web_audit.py / chaos.py / demo_check.py
+probe_constraints.py / probe_counts.py
+tests/test_all.py      117 tests
+```
+
+The console has **no build step and no JavaScript dependencies** — the radial
+map, the force-directed explorer and the live ticker are all hand-rolled. Partly
+taste, partly demo safety: a CDN script tag is the one dependency that can fail
+while you are recording.
+
+## Data
+
+Package metadata from the [npm registry](https://registry.npmjs.org), fetched
+live. Advisories from [OSV.dev](https://osv.dev). Publish feed from
+`replicate.npmjs.com`. npm registry data is provided by npm, Inc.
+
+The incidents referenced (`debug`/`chalk` via the qix account takeover,
+September 2025; `event-stream`, November 2018; `ua-parser-js`, October 2021) are
+real, publicly documented attacks. The blast radius figures shown for them are
+computed live from the crawled graph.
 
 ## Known limitations
 
-- The crawl reaches ~27k packages, not all 4.3M on npm. BFS from a seed set
-  converges quickly; `expand_seeds.py` widens the frontier but the corpus is
-  still a popularity-weighted sample.
+- The graph holds 27,076 packages, not all 4.3M. Traversal features are limited
+  to that corpus; audit/intel/fix are not.
+- There is a practical store-size ceiling around ~100k edges before depth-5
+  traversals stop completing (constraint 7 above).
 - Graph edges come from each package's **latest** version's `dependencies`.
-  Older releases are kept in the sidecar (`release_deps`) and drive the semver
-  check, but the topology is a snapshot of current npm, not history.
-- `peerDependencies` are recorded but are **not** edges — npm does not install
-  them transitively, so counting them would overstate exposure.
-- Semver support covers `^ ~ >= > <= < = * x ||` and hyphen ranges. Git URLs,
-  `file:`, `npm:` aliases, and workspace protocols return `False` rather than
-  guessing; under-reporting exposure is the safer error.
-- **A restarted HydraDB store cannot be written to again** (see constraint 6).
-  Serving is unaffected, but re-crawling requires `py rebuild.py` first. This is
-  a HydraDB 0.1.0 limitation on the local-filesystem object store, not something
-  this project can work around in code.
-- After a container restart the graph needs ~93 seconds before deep traversals
-  succeed. The server warms itself and reports `graph_warming` meanwhile, but
-  the first ~1.5 minutes after a cold start are genuinely degraded.
-- `nid()` collisions are theoretically possible (~2e-6 over 100k names). The
-  crawler records the name→id map and logs a collision rather than silently
-  merging two packages; the test suite asserts zero collisions across the
-  entire crawled corpus.
+  `peerDependencies` are recorded but are not edges — npm does not install them
+  transitively, so counting them would overstate exposure.
+- Semver covers `^ ~ >= > <= < = * x ||` and hyphen ranges. Git URLs, `file:`,
+  `npm:` aliases and workspace protocols return `False` rather than guessing.
+- The live feed polls; npm rejects `feed=continuous`. It runs seconds behind.
+- Maintainer edges exist only for packages with ≥10 dependents.
+- `nid()` collisions are theoretically possible (~2e-6 over 100k names); the
+  crawler records the name→id map and the suite asserts zero collisions across
+  the entire corpus.
 
 ## License
 
