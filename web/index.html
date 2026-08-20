@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>blast radius — npm supply-chain incident response</title>
+<meta name="description" content="When an npm package is compromised, find out who is transitively exposed, whose semver ranges would actually have pulled it, and whether your lockfile is hit.">
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='5' fill='%23c0392b'/><circle cx='16' cy='16' r='11' fill='none' stroke='%23c0392b' stroke-width='1.5' opacity='.5'/><circle cx='16' cy='16' r='15' fill='none' stroke='%23c0392b' stroke-width='1' opacity='.25'/></svg>">
+</head>
+<body>
+<div class="dots" aria-hidden="true"></div>
+
+<header class="topbar">
+  <a class="brand" href="#top">blast radius</a>
+  <nav class="nav">
+    <a href="#how">how it works</a>
+    <a href="#lockfile">lockfile check</a>
+    <a href="/api/docs">api</a>
+  </nav>
+  <div class="livestats" id="livestats" aria-live="polite">
+    <span class="pulse" id="pulse" aria-hidden="true"></span>
+    <span id="statline">connecting to hydradb…</span>
+  </div>
+</header>
+
+<main id="top">
+
+  <!-- ---------------------------------------------------------------- hero -->
+  <section class="hero">
+    <!-- Pinned to the viewport edges, not to the centre, so the wordmark and
+         the input keep a clear column at every width the scatter is shown at. -->
+    <div class="scatter" id="scatter" aria-hidden="true">
+
+      <div class="win" style="left:26px; top:322px; width:296px" data-rot="-2.2">
+        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">depth histogram</span></div>
+        <div class="body" id="peek-hist"><div class="skel">querying graph…</div></div>
+        <div class="cap">depth-histogram.log</div>
+      </div>
+
+      <div class="win r" style="right:26px; top:266px; width:300px" data-rot="1.8">
+        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">maintainer pivot</span></div>
+        <div class="body" id="peek-maint"><div class="skel">querying sidecar…</div></div>
+        <div class="cap">maintainer-pivot.json</div>
+      </div>
+
+      <div class="win r" style="right:104px; top:520px; width:252px" data-rot="-1.4">
+        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">graph</span></div>
+        <div class="body" id="peek-graph"><div class="skel">counting…</div></div>
+        <div class="cap">graph-stats.txt</div>
+      </div>
+
+      <div class="sticker face" style="left:352px; top:606px" data-rot="-9">^ω^</div>
+      <div class="sticker face r" style="right:36px; top:456px" data-rot="7">(¬_¬)</div>
+      <div class="sticker face wide" style="left:44px; top:556px" data-rot="5">¯\_(ツ)_/¯</div>
+
+      <div class="sticker nametag" style="left:30px; top:104px" data-rot="-4">
+        <span class="hello">HELLO<small>my name is</small></span>
+        <span class="mine">blast radius</span>
+      </div>
+
+      <div class="sticker icon r" style="right:66px; top:126px" data-rot="-6" title="folder">
+        <svg viewBox="0 0 48 36" width="44" height="33"><path d="M2 6a4 4 0 0 1 4-4h11l5 5h20a4 4 0 0 1 4 4v21a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4Z" fill="#e8e8e4" stroke="#b9b9b2" stroke-width="1.5"/><path d="M2 13h44" stroke="#b9b9b2" stroke-width="1.5"/></svg>
+      </div>
+      <div class="sticker icon" style="left:232px; top:212px" data-rot="8" title="trash">
+        <svg viewBox="0 0 32 40" width="30" height="38"><path d="M4 9h24l-2 27a3 3 0 0 1-3 3H9a3 3 0 0 1-3-3Z" fill="#e8e8e4" stroke="#b9b9b2" stroke-width="1.5"/><path d="M2 8h28M12 8V4h8v4M12 16v18M20 16v18" stroke="#b9b9b2" stroke-width="1.5" fill="none"/></svg>
+      </div>
+    </div>
+
+    <h1 class="wordmark">blast radius</h1>
+    <p class="tagline">find out who's poisoned before they do</p>
+
+    <form class="query" id="queryform" autocomplete="off">
+      <div class="pill">
+        <label class="f grow">
+          <span>package</span>
+          <input id="pkg" name="pkg" placeholder="debug" spellcheck="false" required>
+        </label>
+        <span class="sep" aria-hidden="true"></span>
+        <label class="f ver">
+          <span>bad version</span>
+          <input id="ver" name="ver" placeholder="4.4.2" spellcheck="false">
+        </label>
+        <button type="submit" id="go">check blast radius</button>
+      </div>
+      <div class="suggest" id="suggest" hidden></div>
+    </form>
+
+    <div class="chips" id="chips">
+      <span class="chiplabel">real incidents:</span>
+      <button class="chip" data-pkg="debug" data-ver="4.4.2">debug@4.4.2 <small>qix account takeover · sep 2025</small></button>
+      <button class="chip" data-pkg="event-stream" data-ver="3.3.6">event-stream@3.3.6 <small>flatmap-stream backdoor · nov 2018</small></button>
+      <button class="chip" data-pkg="ua-parser-js" data-ver="0.7.29">ua-parser-js@0.7.29 <small>cryptominer · oct 2021</small></button>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------------------- results -->
+  <section class="results" id="results" hidden>
+    <div class="verdictline" id="verdictline"></div>
+
+    <div class="latencyblock">
+      <div class="latency" id="latency">—</div>
+      <div class="latencysub" id="latencysub"></div>
+    </div>
+
+    <div class="resultgrid">
+      <div class="win span2" style="--w:100%">
+        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">blast radius by depth</span></div>
+        <div class="body"><div class="hist" id="hist"></div></div>
+        <div class="cap">depth-histogram.log</div>
+      </div>
+
+      <div class="win">
+        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">would this range have pulled it?</span></div>
+        <div class="body" id="semver"></div>
+        <div class="cap">semver-resolution.txt</div>
+      </div>
+
+      <div class="win">
+        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">exposed packages</span></div>
+        <div class="body nopad"><div class="scroll" id="victims"></div></div>
+        <div class="cap">victims.list</div>
+      </div>
+
+      <div class="win">
+        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">what the attacker owns next</span></div>
+        <div class="body nopad"><div class="scroll" id="maint"></div></div>
+        <div class="cap">maintainer-pivot.json</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------------------ lockfile -->
+  <section class="lockfile" id="lockfile">
+    <h2>is <em>my</em> app affected?</h2>
+    <p class="lede">drop a real package-lock.json. it is read in your browser, posted once,
+      and never stored. the check runs against the package in the box above.</p>
+
+    <div class="drop" id="drop" tabindex="0" role="button" aria-label="drop your package-lock.json here">
+      <div class="dropinner">
+        <div class="dropicon" aria-hidden="true">
+          <svg viewBox="0 0 40 48" width="40" height="48"><path d="M6 2h20l10 10v34H6Z" fill="#efefec" stroke="#b9b9b2" stroke-width="1.6"/><path d="M26 2v10h10" fill="none" stroke="#b9b9b2" stroke-width="1.6"/><path d="M20 20v16M13 29l7 7 7-7" fill="none" stroke="#8d8d86" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+        <div class="droptext">drop your <b>package-lock.json</b></div>
+        <div class="dropsub">or <button type="button" class="linkbtn" id="pick">choose a file</button> · v1, v2 and v3 all work</div>
+      </div>
+      <input type="file" id="file" accept=".json,application/json" hidden>
+    </div>
+
+    <div class="lockresult" id="lockresult" hidden>
+      <div class="verdict" id="verdict"></div>
+      <div class="win">
+        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">how it reaches you</span></div>
+        <div class="body" id="lockdetail"></div>
+        <div class="cap">lockfile-scan.txt</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------------------- how it works -->
+  <section class="how" id="how">
+    <h2>how it works</h2>
+    <div class="howgrid">
+      <div class="win">
+        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">why a graph, not a vector</span></div>
+        <div class="body prose">
+          <p>"which packages are similar to <code>event-stream</code>" is a vector question.
+             nobody asks it during an incident.</p>
+          <p>the real question is <b>reachability</b>: who pulls this, and who pulls them,
+             five levels down. that is a transitive closure over a directed graph — the one
+             shape an embedding index cannot answer at all, and a relational database
+             answers only with a recursive join that gets slower every hop.</p>
+          <p>hydradb answers it in one traversal from one known vertex.</p>
+        </div>
+        <div class="cap">why-a-graph.md</div>
+      </div>
+
+      <div class="win">
+        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">the reversed edge</span></div>
+        <div class="body prose">
+          <p>edges are stored backwards on purpose:</p>
+          <pre>(dependency)-[:REQUIRED_BY]->(dependent)</pre>
+          <p>hydradb 0.1.0 will only run a variable-length <code>MATCH</code> when the
+             <b>source id is fixed</b>. in an incident, the one thing you know for certain is
+             which package was compromised.</p>
+          <p>reversing the edge at write time makes that package the source, so the blast
+             radius is one traversal from a known id instead of a scan of the graph.</p>
+        </div>
+        <div class="cap">reversed-edges.md</div>
+      </div>
+
+      <div class="win">
+        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">two stores, two shapes</span></div>
+        <div class="body prose">
+          <p>hydradb 0.1.0 cannot filter on edge properties mid-traversal, so a declared
+             semver range cannot live on the edge and still be usable.</p>
+          <p><b>topology</b> — who depends on whom — lives in the graph.
+             <b>predicates</b> — does <code>^4.1.0</code> admit <code>4.4.2</code>, who else does
+             this maintainer publish — live in a sqlite sidecar.</p>
+          <p>that split is why "340 would have pulled it, 160 were shielded by a pin" is a
+             number this thing can actually produce.</p>
+        </div>
+        <div class="cap">two-layer-design.md</div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="footinner">
+    <span>built on <b>hydradb</b> in one day for hack hydra</span>
+    <span class="dotsep">·</span>
+    <a href="https://github.com/">github</a>
+    <span class="dotsep">·</span>
+    <span>mit licensed</span>
+    <span class="dotsep">·</span>
+    <span>package data from the <a href="https://registry.npmjs.org">npm registry</a></span>
+  </div>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

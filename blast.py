@@ -26,9 +26,11 @@ HydraDB 0.1.0 cannot filter on edge properties mid-traversal. See ingest.py.
 import json
 import re
 import sqlite3
+import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 
-from hydra import Hydra, nid
+from hydra import Hydra, RESULT_LIMIT, nid
 
 MAX_DEPTH = 8
 
@@ -83,16 +85,32 @@ REACH_NAMES = "MATCH (t {id: $id})-[:REQUIRED_BY*1..%d]->(v) RETURN DISTINCT v.n
 
 def blast_radius(h: Hydra, name: str, depth: int = 5, limit: int = 5000):
     """Everything that transitively depends on `name`, with a per-depth
-    breakdown. Returns ({total, histogram, victims, truncated}, latency_ms)."""
+    breakdown. Returns ({total, histogram, victims, truncated}, latency_ms).
+
+    The d+1 queries are independent — each is its own bounded traversal from
+    the same fixed source — so they are fired concurrently and the reported
+    latency is wall-clock for the whole set, not the sum. Serially this is
+    dominated by the deepest traversal repeated d times.
+    """
     d = _depth(depth)
     target = nid(name)
-    ms_total = 0.0
+    limit = min(limit, RESULT_LIMIT)
 
-    cumulative = []
-    for k in range(1, d + 1):
-        rows, ms = h.timed(REACH_COUNT % k, {"id": target})
-        ms_total += ms
-        cumulative.append(rows[0]["count(*)"] if rows else 0)
+    def count_at(k: int) -> int:
+        rows = h.query(REACH_COUNT % k, {"id": target})
+        return rows[0]["count(*)"] if rows else 0
+
+    def names() -> list[str]:
+        rows = h.query(REACH_NAMES % d, {"id": target, "limit": limit})
+        return sorted(r["v.name"] for r in rows if r.get("v.name"))
+
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=d + 1) as pool:
+        count_jobs = [pool.submit(count_at, k) for k in range(1, d + 1)]
+        names_job = pool.submit(names)
+        cumulative = [j.result() for j in count_jobs]
+        victims = names_job.result()
+    ms_total = (time.perf_counter() - t0) * 1000.0
 
     # Differencing the cumulative reach gives packages *first* reached at k.
     histogram = []
@@ -101,30 +119,31 @@ def blast_radius(h: Hydra, name: str, depth: int = 5, limit: int = 5000):
         histogram.append({"depth": k, "packages": max(total - prev, 0)})
         prev = total
 
-    rows, ms = h.timed(REACH_NAMES % d, {"id": target, "limit": limit})
-    ms_total += ms
-    victims = sorted(r["v.name"] for r in rows if r.get("v.name"))
-
     return {
         "total": cumulative[-1] if cumulative else 0,
         "histogram": histogram,
         "victims": victims,
         "truncated": len(victims) >= limit,
         "depth": d,
+        "queries": d + 1,
     }, ms_total
 
 
-def victim_set(h: Hydra, name: str, depth: int = 5, limit: int = 200_000):
+def victim_set(h: Hydra, name: str, depth: int = 5, limit: int = RESULT_LIMIT):
     """Just the reachable names, as a set. Used by the lockfile check."""
     d = _depth(depth)
-    rows, ms = h.timed(REACH_NAMES % d, {"id": nid(name), "limit": limit})
+    rows, ms = h.timed(REACH_NAMES % d, {"id": nid(name),
+                                         "limit": min(limit, RESULT_LIMIT)})
     return {r["v.name"] for r in rows if r.get("v.name")}, ms
 
 
-def stats(h: Hydra, db: sqlite3.Connection | None = None):
-    """Graph size + crawl progress. Both counts are real queries; HydraDB plans
-    them as full scans (it warns as much in its own logs), which is why the
-    server caches the result for a few seconds rather than asking per request."""
+def graph_stats(h: Hydra):
+    """Graph size straight from HydraDB. Both counts are real, and both are
+    full scans — HydraDB says so in its own logs ("query plan warrants
+    attention: full_scan, access_path AllVertexScan") and there is no
+    CREATE INDEX to fix it with. At ~23k packages the pair takes well over a
+    minute, so this must never sit on a request path: server.py refreshes it on
+    a background timer and serves the last measurement with its age."""
     ms_total = 0.0
     rows, ms = h.timed("MATCH (p:Package) RETURN count(*)")
     ms_total += ms
@@ -132,18 +151,41 @@ def stats(h: Hydra, db: sqlite3.Connection | None = None):
     rows, ms = h.timed("MATCH ()-[r:REQUIRED_BY]->() RETURN count(*)")
     ms_total += ms
     edges = rows[0]["count(*)"] if rows else 0
+    return {"packages": packages, "edges": edges, "measured_ms": round(ms_total, 1)}
 
-    out = {"packages": packages, "edges": edges, "latency_ms": round(ms_total, 1)}
-    if db is not None:
-        meta = dict(db.execute("SELECT key, value FROM meta"))
-        crawled = db.execute("SELECT count(*) FROM packages WHERE crawled = 1").fetchone()[0]
-        out["crawl"] = {
+
+def quick_stats(db: sqlite3.Connection):
+    """The same two numbers, from the sidecar, in microseconds.
+
+    This is not a second opinion: the crawler writes a sidecar row and a graph
+    vertex from the same batch, and only `prod` dependencies become edges, so
+    these counts track what was written to HydraDB exactly. graph_stats()
+    verifies that on a slow timer; this is what the live header polls."""
+    t0 = time.perf_counter()
+    meta = dict(db.execute("SELECT key, value FROM meta"))
+    packages = db.execute("SELECT count(*) FROM packages").fetchone()[0]
+    edges = db.execute("SELECT count(*) FROM deps WHERE kind = 'prod'").fetchone()[0]
+    crawled = db.execute("SELECT count(*) FROM packages WHERE crawled = 1").fetchone()[0]
+    return {
+        "packages": packages,
+        "edges": edges,
+        "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+        "crawl": {
             "crawled": crawled,
-            "known": db.execute("SELECT count(*) FROM packages").fetchone()[0],
+            "known": packages,
             "queued": int(meta.get("queued", 0)),
-            "running": "finished_at" not in meta,
+            "running": meta.get("running") == "1",
             "collisions": db.execute("SELECT count(*) FROM collisions").fetchone()[0],
-        }
+        },
+    }
+
+
+def stats(h: Hydra, db: sqlite3.Connection | None = None):
+    """Kept for check.py and the benchmark: the authoritative, slow version."""
+    out = graph_stats(h)
+    out["latency_ms"] = out["measured_ms"]
+    if db is not None:
+        out["crawl"] = quick_stats(db)["crawl"]
     return out
 
 

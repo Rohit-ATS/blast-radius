@@ -8,6 +8,7 @@ no routing table negotiation, and gives clearer errors while iterating fast.
 import hashlib
 import json
 import os
+import threading
 import time
 from typing import Any, Iterable
 
@@ -26,18 +27,35 @@ class HydraError(RuntimeError):
 # Reserved id for the readiness round-trip. Deleted immediately after use.
 _PROBE_ID = 999999999999999
 
+# Admission control rejects any single query asking for more than this
+# ("query_result_limit rejected by admission control: actual 200000 exceeds
+# limit 100000"), so an oversized limit is a 429, not a silent truncation.
+RESULT_LIMIT = 100_000
+
 
 class Hydra:
     def __init__(self, url: str = HYDRA_URL, token: str = HYDRA_TOKEN,
                  graph: str = HYDRA_GRAPH, cell: str = HYDRA_CELL):
         self.endpoint = f"{url}/v1/graphs/{graph}/query"
-        self.session = requests.Session()
-        self.session.headers.update({
+        self.cell = cell
+        self._headers = {
             "Authorization": f"Bearer {token}",
             "X-Graph-Namespace": graph,
             "Content-Type": "application/json",
-        })
-        self.cell = cell
+        }
+        # One session per thread. The depth histogram fires its queries
+        # concurrently and a requests.Session is not safe to share across
+        # threads.
+        self._local = threading.local()
+
+    @property
+    def session(self) -> requests.Session:
+        s = getattr(self._local, "session", None)
+        if s is None:
+            s = requests.Session()
+            s.headers.update(self._headers)
+            self._local.session = s
+        return s
 
     def query(self, cypher: str, params: dict[str, Any] | None = None,
               consistency: str = "causal", retries: int = 3) -> list[dict]:
@@ -45,13 +63,38 @@ class Hydra:
                                 "consistency": consistency}
         if params:
             body["parameters"] = params
+
+        # HydraDB pages results at 1024 rows and returns a `next_cursor`. A
+        # client that ignores it silently truncates every large answer — which
+        # is precisely the sort of quietly-wrong number this tool exists to
+        # prevent. Continuing a page needs BOTH the cursor and the originating
+        # query_id; the cursor alone is rejected with "result cursor does not
+        # belong to this query request".
+        out: list[dict] = []
+        cursor = None
+        query_id = None
+        while True:
+            page = dict(body)
+            if cursor is not None:
+                page["cursor"] = cursor
+                page["query_id"] = query_id
+            payload = self._post(page, cypher, retries)
+            out.extend(_rows(payload))
+            if not isinstance(payload, dict):
+                return out
+            query_id = payload.get("query_id") or query_id
+            cursor = payload.get("next_cursor")
+            if cursor is None:
+                return out
+
+    def _post(self, body: dict, cypher: str, retries: int):
         last = None
         for attempt in range(retries):
             try:
                 r = self.session.post(self.endpoint, data=json.dumps(body), timeout=180)
                 if r.status_code >= 400:
                     raise HydraError(f"{r.status_code}: {r.text[:600]}")
-                return _rows(r.json())
+                return r.json()
             except (requests.RequestException, HydraError) as e:
                 last = e
                 if attempt == retries - 1:

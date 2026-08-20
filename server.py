@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import sqlite3
+import threading
 import time
 
 from fastapi import FastAPI, Query, Request
@@ -29,10 +30,13 @@ DB_PATH = os.environ.get("DEPS_DB", os.path.join(HERE, DEPS_DB))
 app = FastAPI(title="Blast Radius", docs_url="/api/docs", redoc_url=None)
 hydra = Hydra()
 
-# Two full scans (HydraDB plans both as such and says so in its logs), so the
-# top bar polls a cached copy instead of re-scanning the graph every second.
-_stats_cache: dict = {"at": 0.0, "value": None}
-STATS_TTL = 4.0
+# HydraDB's own count(*) over the whole graph is a full scan with no index to
+# lean on — at ~23k packages the package and edge counts together take over a
+# minute. That number is worth showing, but it cannot sit on a request path, so
+# a background thread re-measures it on a slow timer and every response carries
+# how old the measurement is.
+_graph_cache: dict = {"at": 0.0, "value": None, "error": None}
+GRAPH_REFRESH = 180.0
 
 
 def db() -> sqlite3.Connection:
@@ -79,7 +83,7 @@ def not_yet(name: str, ms: float):
             "SELECT count(*) FROM packages WHERE crawled = 1").fetchone()[0]
         meta = dict(conn.execute("SELECT key, value FROM meta"))
     seen = row is not None
-    running = "finished_at" not in meta
+    running = meta.get("running") == "1"
     if seen:
         message = f"'{name}' is a known dependency but has not been crawled yet."
     elif running:
@@ -103,15 +107,41 @@ def not_yet(name: str, ms: float):
 # api
 # --------------------------------------------------------------------------
 
+def _refresh_graph_counts() -> None:
+    """Re-measure the graph with HydraDB's own count(*), forever, slowly."""
+    while True:
+        try:
+            _graph_cache.update(value=blast.graph_stats(hydra), at=time.time(),
+                                error=None)
+        except Exception as e:                       # a down server must not kill the thread
+            _graph_cache.update(error=str(e)[:200], at=time.time())
+        time.sleep(GRAPH_REFRESH)
+
+
+@app.on_event("startup")
+def _start_refresher():
+    threading.Thread(target=_refresh_graph_counts, daemon=True,
+                     name="graph-counts").start()
+
+
 @app.get("/api/stats")
 def api_stats():
-    now = time.time()
-    if _stats_cache["value"] and now - _stats_cache["at"] < STATS_TTL:
-        return {**_stats_cache["value"], "cached": True}
+    """Live counts from the sidecar, plus the last full HydraDB measurement.
+
+    The sidecar counts are what the header polls: the crawler writes the graph
+    vertex and the sidecar row from the same batch, so they track each other.
+    `graph` is the slower, authoritative check, with the age of the reading —
+    never a fabricated stand-in when it has not been taken yet.
+    """
     with db() as conn:
-        value = blast.stats(hydra, conn)
-    _stats_cache.update(at=now, value=value)
-    return {**value, "cached": False}
+        value = blast.quick_stats(conn)
+    measured = _graph_cache.get("value")
+    if measured:
+        value["graph"] = {**measured,
+                          "age_s": round(time.time() - _graph_cache["at"], 1)}
+    elif _graph_cache.get("error"):
+        value["graph"] = {"error": _graph_cache["error"]}
+    return value
 
 
 @app.get("/api/blast")

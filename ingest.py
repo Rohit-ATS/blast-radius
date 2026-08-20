@@ -228,6 +228,12 @@ def crawl(args) -> None:
     # Vertices already MERGEd this process; avoids re-sending stubs every wave.
     written: set[int] = set(known)
 
+    # A previous run's finished_at would make this crawl look already-done to
+    # the API, so the flag is set explicitly for the lifetime of the process.
+    db.execute("DELETE FROM meta WHERE key = 'finished_at'")
+    db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('running', '1')")
+    db.commit()
+
     visited, queue = load_state(args.seeds)
     session = requests.Session()
     session.headers.update({"User-Agent": "blast-radius-hackhydra/0.1"})
@@ -357,6 +363,7 @@ def crawl(args) -> None:
     flush(force=True)
     db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?,?)",
                ("finished_at", str(time.time())))
+    db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('running', '0')")
     db.commit()
     print(f"[crawl] finished: {done} packages, {edges_written} edges "
           f"in {time.time() - started:.0f}s")

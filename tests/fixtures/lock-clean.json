@@ -1,0 +1,14 @@
+{
+  "name": "clean-app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {
+      "name": "clean-app",
+      "version": "1.0.0"
+    },
+    "node_modules/leftpad-totally-unrelated-xyz": {
+      "version": "1.0.0"
+    }
+  }
+}
