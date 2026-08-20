@@ -83,7 +83,8 @@ def not_yet(name: str, ms: float):
             "SELECT count(*) FROM packages WHERE crawled = 1").fetchone()[0]
         meta = dict(conn.execute("SELECT key, value FROM meta"))
     seen = row is not None
-    running = meta.get("running") == "1"
+    with db() as conn2:
+        running = blast.quick_stats(conn2)["crawl"]["running"]
     if seen:
         message = f"'{name}' is a known dependency but has not been crawled yet."
     elif running:
