@@ -168,9 +168,12 @@
              nobody asks it during an incident.</p>
           <p>the real question is <b>reachability</b>: who pulls this, and who pulls them,
              five levels down. that is a transitive closure over a directed graph — the one
-             shape an embedding index cannot answer at all, and a relational database
-             answers only with a recursive join that gets slower every hop.</p>
-          <p>hydradb answers it in one traversal from one known vertex.</p>
+             shape an embedding index cannot answer at all.</p>
+          <p>hydradb answers it as one traversal from one known vertex. we also built the
+             same closure as a recursive CTE over the sqlite sidecar and timed both. at this
+             graph size <b>sqlite is 3–13× faster</b>, and both engines return the identical
+             count on every row. <code>BENCHMARKS.md</code> has the table, including the
+             row that says a 27k-vertex graph does not need a graph database.</p>
         </div>
         <div class="cap">why-a-graph.md</div>
       </div>
@@ -197,8 +200,9 @@
           <p><b>topology</b> — who depends on whom — lives in the graph.
              <b>predicates</b> — does <code>^4.1.0</code> admit <code>4.4.2</code>, who else does
              this maintainer publish — live in a sqlite sidecar.</p>
-          <p>that split is why "340 would have pulled it, 160 were shielded by a pin" is a
-             number this thing can actually produce.</p>
+          <p>that split is why "would have pulled it" vs "shielded by a pin" is a number
+             this thing can actually produce, instead of the much scarier and much less
+             true count of everyone who merely lists the package.</p>
         </div>
         <div class="cap">two-layer-design.md</div>
       </div>
