@@ -30,6 +30,10 @@
 
 html { scroll-behavior: smooth; }
 
+/* The header is sticky, so an anchor jump would otherwise tuck the top of the
+   target section underneath it. */
+section[id], main[id] { scroll-margin-top: 68px; }
+
 body {
   margin: 0;
   background: var(--paper);
@@ -260,7 +264,7 @@ code, pre, .mono { font-family: var(--mono); text-transform: none; }
 
 /* ------------------------------------------------------------------- query */
 
-.query { position: relative; margin: 34px auto 0; max-width: 680px; z-index: 5; }
+.query { position: relative; margin: 34px auto 0; max-width: 680px; z-index: 30; }
 .pill {
   display: flex;
   align-items: stretch;
@@ -345,7 +349,7 @@ code, pre, .mono { font-family: var(--mono); text-transform: none; }
   margin: 22px auto 0;
   max-width: 860px;
   position: relative;
-  z-index: 5;
+  z-index: 4;
 }
 .chiplabel { font-size: 12.5px; color: var(--ink-3); }
 .chip {
@@ -685,7 +689,7 @@ footer { border-top: 1px solid var(--line); padding: 26px; }
 }
 .syscards {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
   gap: 14px;
   margin-top: 26px;
   text-align: left;

@@ -36,6 +36,13 @@ FIXTURES = os.path.join(ROOT, "tests", "fixtures")
 # judge clicks is broken, so they are checked explicitly rather than sampled.
 PRESETS = [("debug", "4.4.2"), ("event-stream", "3.3.6"), ("ua-parser-js", "0.7.29")]
 
+# The Windows console is cp1252 and package data is full of characters it
+# cannot encode; without this a stray arrow in a page string aborts the run.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 GREEN, RED, YELLOW, DIM, OFF = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
 
 
