@@ -400,6 +400,50 @@ server-sent events rather than polled, and shows the same components
 `verify.py` and `chaos.py` assert against — including whether the graph is
 still writable, which nothing but a real write can detect.
 
+## Use it in CI
+
+The CLI exits non-zero when your tree contains malware, which is what makes it
+able to fail a build. A scanner that always exits 0 gets ignored.
+
+```bash
+py cli.py audit ./package-lock.json     # also yarn.lock and pnpm-lock.yaml
+py cli.py audit ./pnpm-lock.yaml --json
+py cli.py blast debug --depth 5
+py cli.py intel debug 4.4.2
+py cli.py fix debug 4.4.2
+```
+
+| exit | meaning |
+|---|---|
+| `0` | clean |
+| `1` | something in the tree is **confirmed malicious** |
+| `2` | known vulnerabilities, no malware (only with `--fail-on vuln`) |
+| `3` | the scan could not be completed |
+
+Malware and vulnerabilities are separate exit codes on purpose. Malware means
+somebody attacked you and the build must stop; a ReDoS advisory in a dev
+dependency should not wake anyone at 2am, so it is non-fatal by default.
+
+```yaml
+# .github/workflows/supply-chain.yml
+name: supply chain
+on: [push, pull_request]
+
+jobs:
+  blast-radius:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt
+      - name: Fail the build if anything in the tree is malicious
+        run: python cli.py audit ./package-lock.json
+```
+
+`audit` talks only to osv.dev and the npm registry, so it needs no HydraDB and
+no crawl — it works in a bare CI container.
+
 ## Reliability, measured
 
 Uptime is not a claim worth making about the future, so what is claimed here is

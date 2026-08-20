@@ -578,7 +578,12 @@ def test_api_lockfile_malformed(requests_mod, seeded):
     r = requests_mod.post(f"{BASE}/api/lockfile", params={"name": seeded},
                           data=b"not json", timeout=60)
     assert r.status_code == 400
-    assert "not valid JSON" in r.json()["error"]
+    body = r.json()
+    # `error` is a machine-readable code; the prose lives in `message`, so a
+    # caller can branch on the failure without parsing English.
+    assert body["ok"] is False
+    assert body["error"] == "bad_request"
+    assert "not valid JSON" in body["message"]
 
 
 def test_api_lockfile_empty_body(requests_mod, seeded):
