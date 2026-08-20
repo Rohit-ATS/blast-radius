@@ -31,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from urllib.parse import quote
 
-from hydra import Hydra, RESULT_LIMIT, nid
+from hydra import Hydra, RESULT_LIMIT, pkg_id
 
 MAX_DEPTH = 8
 
@@ -63,11 +63,11 @@ def _depth(depth: int) -> int:
 EXISTS = "MATCH (p:Package {id: $id}) RETURN p.name"
 
 
-def resolve_package(h: Hydra, name: str):
+def resolve_package(h: Hydra, name: str, ecosystem: str = "npm"):
     """(known, latency_ms). The crawl runs in the background, so 'not here yet'
     is a normal answer during a demo, not an error — the API says so plainly
     instead of returning an empty blast radius that looks like safety."""
-    rows, ms = h.timed(EXISTS, {"id": nid(name)})
+    rows, ms = h.timed(EXISTS, {"id": pkg_id(name, ecosystem)})
     return bool(rows and rows[0].get("p.name")), ms
 
 
@@ -90,7 +90,8 @@ REACH_COUNT = "MATCH (t {id: $id})-[:REQUIRED_BY*1..%d]->(v) RETURN count(*)"
 REACH_NAMES = "MATCH (t {id: $id})-[:REQUIRED_BY*1..%d]->(v) RETURN DISTINCT v.name LIMIT $limit"
 
 
-def blast_radius(h: Hydra, name: str, depth: int = 5, limit: int = 5000):
+def blast_radius(h: Hydra, name: str, depth: int = 5, limit: int = 5000,
+                 ecosystem: str = "npm"):
     """Everything that transitively depends on `name`, with a per-depth
     breakdown. Returns ({total, histogram, victims, truncated}, latency_ms).
 
@@ -100,7 +101,7 @@ def blast_radius(h: Hydra, name: str, depth: int = 5, limit: int = 5000):
     dominated by the deepest traversal repeated d times.
     """
     d = _depth(depth)
-    target = nid(name)
+    target = pkg_id(name, ecosystem)
     limit = min(limit, RESULT_LIMIT)
 
     def count_at(k: int) -> int:
@@ -136,16 +137,17 @@ def blast_radius(h: Hydra, name: str, depth: int = 5, limit: int = 5000):
     }, ms_total
 
 
-def victim_set(h: Hydra, name: str, depth: int = 5, limit: int = RESULT_LIMIT):
+def victim_set(h: Hydra, name: str, depth: int = 5, limit: int = RESULT_LIMIT,
+               ecosystem: str = "npm"):
     """Just the reachable names, as a set. Used by the lockfile check."""
     d = _depth(depth)
-    rows, ms = h.timed(REACH_NAMES % d, {"id": nid(name),
+    rows, ms = h.timed(REACH_NAMES % d, {"id": pkg_id(name, ecosystem),
                                          "limit": min(limit, RESULT_LIMIT)})
     return {r["v.name"] for r in rows if r.get("v.name")}, ms
 
 
 def subgraph(h: Hydra, db: sqlite3.Connection, name: str, depth: int = 3,
-             per_level: int = 28, max_nodes: int = 160):
+             per_level: int = 28, max_nodes: int = 160, ecosystem: str = "npm"):
     """A drawable slice of the blast radius: nodes tagged with the depth they
     are first reached at, plus the edges between them.
 
@@ -162,7 +164,7 @@ def subgraph(h: Hydra, db: sqlite3.Connection, name: str, depth: int = 3,
     says how much it left out; the UI says so too.
     """
     d = _depth(depth)
-    target = nid(name)
+    target = pkg_id(name, ecosystem)
     t0 = time.perf_counter()
 
     # Authoritative reach per depth, from the graph.
@@ -614,69 +616,12 @@ def search(db: sqlite3.Connection, q: str, limit: int = 12):
 
 
 # --------------------------------------------------------------------------
-# semver: enough of npm's range grammar to be honest
+# semver
 # --------------------------------------------------------------------------
+#
+# npm's range grammar moved to ecosystems/npm.py when the adapter layer landed.
+# Every ecosystem has its own, and they disagree in ways that silently invert
+# an answer, so there is no shared implementation to fall back on. Re-exported
+# here because callers and tests predate the move.
 
-_V = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
-
-
-def _parse(v: str):
-    m = _V.match(v.strip())
-    return tuple(int(g) for g in m.groups()) if m else None
-
-
-def _cmp(a, b) -> int:
-    return (a > b) - (a < b)
-
-
-@lru_cache(maxsize=200_000)
-def satisfies(version: str, rng: str) -> bool:
-    """True if `version` satisfies npm range `rng`.
-
-    Handles ^ ~ >= > <= < = * x || and hyphen ranges, which covers the
-    overwhelming majority of real npm manifests. Anything unrecognised
-    (git URLs, `file:`, `npm:` aliases, workspace protocols) returns False
-    rather than guessing — under-reporting exposure is the safer error.
-    """
-    v = _parse(version)
-    if v is None:
-        return False
-    rng = (rng or "").strip()
-    if rng in ("", "*", "x", "latest", "next"):
-        return True
-    if "||" in rng:
-        return any(satisfies(version, part) for part in rng.split("||"))
-    if " - " in rng:
-        lo, hi = rng.split(" - ", 1)
-        return satisfies(version, f">={lo.strip()}") and satisfies(version, f"<={hi.strip()}")
-    for comparator in rng.split():
-        if not _one(v, comparator.strip()):
-            return False
-    return True
-
-
-def _one(v, c: str) -> bool:
-    if not c or c in ("*", "x"):
-        return True
-    if c.startswith("^"):
-        b = _parse(c[1:])
-        if not b:
-            return False
-        if b[0] > 0:
-            return _cmp(v, b) >= 0 and v[0] == b[0]
-        if b[1] > 0:
-            return _cmp(v, b) >= 0 and v[:2] == b[:2]
-        return v == b
-    if c.startswith("~"):
-        b = _parse(c[1:])
-        return bool(b) and _cmp(v, b) >= 0 and v[:2] == b[:2]
-    for op in (">=", "<=", ">", "<", "="):
-        if c.startswith(op):
-            b = _parse(c[len(op):])
-            if not b:
-                return False
-            r = _cmp(v, b)
-            return {">=": r >= 0, "<=": r <= 0, ">": r > 0,
-                    "<": r < 0, "=": r == 0}[op]
-    b = _parse(c)
-    return bool(b) and v == b
+from ecosystems.npm import satisfies                              # noqa: E402,F401

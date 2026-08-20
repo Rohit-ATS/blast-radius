@@ -30,7 +30,7 @@ import feed as feedmod
 import intel
 import lockfiles
 import scan
-from hydra import Hydra, HydraError, nid
+from hydra import Hydra, HydraError, pkg_id
 from ingest import DEPS_DB, SIDECAR_SCHEMA
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -422,7 +422,7 @@ def _warm_once() -> None:
                    for d in range(1, blast.MAX_DEPTH_DEFAULT + 1)
                    if (n, d) not in _warm_done]
     for name, depth in outstanding:
-        hydra_patient.query(blast.REACH_COUNT % depth, {"id": nid(name)},
+        hydra_patient.query(blast.REACH_COUNT % depth, {"id": pkg_id(name)},
                             retries=1)
         _warm_done.add((name, depth))
 
@@ -462,7 +462,7 @@ def _warm_supervisor() -> None:
             time.sleep(WARM_PROBE_INTERVAL)
             try:
                 hydra_patient.query(blast.REACH_COUNT % 1,
-                                    {"id": nid(WARM_PACKAGES[0])}, retries=1)
+                                    {"id": pkg_id(WARM_PACKAGES[0])}, retries=1)
             except Exception as e:
                 _warm_done.clear()
                 _warm.update(state="warming", detail=f"probe failed: {e}"[:160])
@@ -515,7 +515,7 @@ def api_health():
     t0 = time.perf_counter()
     try:
         hydra.query("MATCH (p:Package {id: $id}) RETURN p.name",
-                    {"id": nid("debug")}, retries=1)
+                    {"id": pkg_id("debug")}, retries=1)
         out["components"]["hydradb"] = {
             "up": True, "latency_ms": round((time.perf_counter() - t0) * 1000, 1)}
     except Exception as e:
@@ -573,7 +573,7 @@ def api_blast(name: str = Query(..., min_length=1, max_length=214),
     if not ok:
         return not_yet(name, ms_lookup)
     result, ms = blast.blast_radius(hydra, name, depth, limit)
-    return {**result, "name": name, "vertex_id": nid(name),
+    return {**result, "name": name, "vertex_id": pkg_id(name),
             "latency_ms": round(ms, 1), "lookup_ms": round(ms_lookup, 1)}
 
 
