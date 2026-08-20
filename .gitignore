@@ -9,6 +9,7 @@ crawl.log
 verify.log
 verify_full.log
 audit.log
+graphify.log
 server.log
 seeds.log
 __pycache__/

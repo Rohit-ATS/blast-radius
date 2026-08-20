@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import blast
+import chains
 import intel
 import scan
 from hydra import Hydra, HydraError, nid
@@ -413,6 +414,48 @@ def api_maintainers(name: str = Query(..., min_length=1, max_length=214),
         result["message"] = (f"'{name}' is in the graph, but the crawl has not "
                              f"recorded its maintainers yet.")
     return {**result, "name": name, "latency_ms": round(ms, 1)}
+
+
+@app.get("/api/attack-surface")
+def api_attack_surface(maintainer: str = Query(..., min_length=1, max_length=214),
+                       depth: int = Query(4, ge=1, le=blast.MAX_DEPTH)):
+    """Everything one npm account can reach: Maintainer -MAINTAINS-> Package
+    -REQUIRED_BY*-> the blast radius. Two hops, two edge types.
+
+    The number that matters after an account is phished is not how many
+    packages they publish, but how much of npm sits downstream of those.
+    """
+    return chains.attack_surface(hydra, maintainer, depth)
+
+
+@app.get("/api/why-exposed")
+def api_why_exposed(source: str = Query(..., alias="from", min_length=1, max_length=214),
+                    target: str = Query(..., alias="to", min_length=1, max_length=214),
+                    depth: int = Query(6, ge=1, le=blast.MAX_DEPTH)):
+    """The actual chain, hop by hop — not merely that a chain exists.
+
+    The depth is computed in the graph and is authoritative. The concrete path
+    is rebuilt from the sidecar (HydraDB 0.1.0 returns no path binding) and
+    then every hop is re-confirmed against the graph.
+    """
+    with db() as conn:
+        return chains.why_exposed(hydra, conn, source, target, depth)
+
+
+@app.get("/api/blast-advisory")
+def api_blast_advisory(osv_id: str = Query(..., min_length=3, max_length=64),
+                       depth: int = Query(4, ge=1, le=blast.MAX_DEPTH)):
+    """Blast radius of a CVE rather than of a package: Advisory -AFFECTS->
+    Package -REQUIRED_BY*-> everyone downstream."""
+    return chains.blast_advisory(hydra, osv_id, depth)
+
+
+@app.get("/api/typosquat-risk")
+def api_typosquat_risk(name: str = Query(..., min_length=1, max_length=214),
+                       depth: int = Query(3, ge=1, le=blast.MAX_DEPTH)):
+    """Similarly-named packages, and how many packages already pull each one.
+    A near-miss name with real dependents is an incident, not a curiosity."""
+    return chains.typosquat_risk(hydra, name, depth)
 
 
 @app.get("/api/intel")
