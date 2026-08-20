@@ -1,7 +1,10 @@
 """Adapter registry. Everything above this layer takes an ecosystem by name."""
 
 from .base import Adapter, ParsedPkg, strip_env_marker, version_key
+from .crates import CratesAdapter
+from .golang import GoAdapter
 from .npm import NpmAdapter
+from .pypi import PyPIAdapter
 
 _ADAPTERS: dict[str, Adapter] = {}
 
@@ -12,6 +15,9 @@ def register(adapter: Adapter) -> Adapter:
 
 
 register(NpmAdapter())
+register(PyPIAdapter())
+register(CratesAdapter())
+register(GoAdapter())
 
 DEFAULT = "npm"
 
