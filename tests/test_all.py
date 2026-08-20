@@ -74,6 +74,26 @@ def requests_mod():
 
 
 @pytest.fixture(scope="session")
+def writable(hydra):
+    """Whether the graph still accepts writes.
+
+    HydraDB 0.1.0 on the local-filesystem object store cannot update an
+    existing SlateDB manifest, so every boot after the first leaves the store
+    read-only: reads answer perfectly and writes return a 500. Tests that need
+    to create vertices skip with that reason rather than reporting a code
+    defect — `py rebuild.py` restores a writable graph from the sidecar.
+    """
+    probe = 999999999999997
+    try:
+        hydra.query("UNWIND $rows AS row MERGE (p {id: row.id}) SET p:_Probe",
+                    {"rows": [{"id": probe}]}, retries=1)
+        hydra.query("MATCH (p {id: $id}) DETACH DELETE p", {"id": probe}, retries=1)
+        return True
+    except HydraError as e:
+        pytest.skip(f"graph is read-only (run `py rebuild.py`): {str(e)[:120]}")
+
+
+@pytest.fixture(scope="session")
 def seeded(hydra):
     """A package with a known non-trivial blast radius, chosen from the graph
     rather than hardcoded — which packages got crawled varies by run."""
@@ -307,7 +327,7 @@ def test_package_with_no_dependents(hydra, db):
     assert all(h["packages"] == 0 for h in r["histogram"])
 
 
-def test_cycle_terminates(hydra):
+def test_cycle_terminates(hydra, writable):
     """a -> b -> c -> a. A traversal that treats this as paths rather than
     reachability would not come back."""
     names = ["_cycle_a", "_cycle_b", "_cycle_c"]
@@ -332,7 +352,7 @@ def test_cycle_terminates(hydra):
                 pass
 
 
-def test_self_loop_terminates(hydra):
+def test_self_loop_terminates(hydra, writable):
     i = nid("_selfloop")
     try:
         hydra.query("UNWIND $rows AS row MERGE (p {id: row.id}) SET p:Package, p.name = row.name",

@@ -173,6 +173,46 @@ The server now serves graph size from the sidecar and re-measures the real
 graph on a background thread, reporting the measurement's age. The number stays
 real; it just stops blocking.
 
+**6. A restarted store is permanently read-only — and only a write reveals it.**
+
+This is the most operationally severe one, and it is completely silent from the
+read path:
+
+```
+object store error: Operation `put_opts` with mode `PutMode::Update`
+not yet implemented by LocalFileSystem(file:///data/store)
+```
+
+HydraDB's SlateDB backend creates its manifest on first boot (`PutMode::Create`,
+fine) and must *update* it on every boot after that (`PutMode::Update`, not
+implemented for the local filesystem). The result: after the first container
+restart, every write returns `500 internal query execution error`, forever,
+while reads keep answering perfectly and at full speed.
+
+Serving is read-only, so the console is unaffected — but the crawler cannot
+write another row, and you find out 20 minutes into a re-crawl. So:
+
+- `/api/health` round-trips a real write on a timer and reports `writable`.
+  Nothing else can detect this.
+- `ingest.py` refuses to start against a read-only store and says what to do.
+- [`rebuild.py`](rebuild.py) replays the whole graph out of the sidecar in
+  about a minute, with no network access, because `deps.db` already holds every
+  vertex and edge that was written. Recovering does not require re-crawling npm.
+
+**7. `/readyz` is not a readiness signal for queries.**
+
+Measured after a container restart: `/readyz` returns 200 at **t+0.6s**, but a
+depth-5 traversal does not complete until **t+93s**, failing HydraDB's own
+30-second query timeout (`408 query_timeout`, `client_query_runtime exceeded`)
+on every attempt in between. There is a server-side 30s ceiling on any single
+query, and a cold store cannot beat it on a deep traversal.
+
+The server therefore warms the cache itself — walking depths 1→5 in order,
+because each depth caches the pages the next one needs — and a supervisor
+re-warms whenever a probe fails, so a restart heals without anyone noticing.
+While it is warming, requests get a `graph_warming` 503 that says so, and the
+console retries rather than flashing an error.
+
 ### Also worth knowing
 
 - `consistency` accepts only `causal` and `strong`. `strong` measured ~30×
@@ -184,6 +224,10 @@ real; it just stops blocking.
   `DETACH DELETE` by id all work fine.
 - `RUST_MIN_STACK: 33554432` is required in the container environment, or the
   node serves `/readyz` and then aborts on the first real query.
+- `408` is a *retryable* status here, unlike most 4xx: it is HydraDB's own query
+  timeout, and the identical query succeeds in about a second once the working
+  set is cached. Treating it as a client error (as a naive `< 500` check does)
+  turns a warm-up into a hard failure.
 
 ## Setup (Windows)
 
@@ -214,11 +258,21 @@ batch, and re-running merges any new seeds into the queue without losing work.
 been reached yet returns an explicit `not_in_graph` with the current crawl
 progress, rather than an empty result that looks like safety.
 
-### Tests
+### Verifying a running system
 
 ```powershell
 py -m pytest tests -q            # 108 tests
+py verify.py                     # drives the live stack end to end
+py verify.py --soak 300          # sustained load, reports the measured rate
+py chaos.py                      # kills HydraDB and checks the recovery
+py rebuild.py --verify           # is the graph still writable?
 ```
+
+`verify.py` is not a unit test: it exercises the actually-running system with
+real package names read out of the live graph, and reports a per-endpoint
+success rate and latency distribution. `chaos.py` stops the database underneath
+the server and asserts that the outage is clean, that sidecar-backed endpoints
+keep serving, and that the API recovers on its own without a restart.
 
 Layered so a partial environment still reports usefully: pure semver and
 lockfile tests always run; graph, API, and browser layers skip with a reason if
@@ -255,7 +309,7 @@ transitive closure is precisely the part that is not a single indexed lookup.
 ## Layout
 
 ```
-hydra.py               HydraDB client: nid(), cursor paging, typed-value decoding
+hydra.py               HydraDB client: nid(), cursor paging, retry policy, budgets
 ingest.py              npm crawler -> HydraDB + deps.db sidecar
 blast.py               the five incident queries + npm semver range logic
 server.py              FastAPI: six endpoints, serves the console on the same port
@@ -264,6 +318,9 @@ bench.py               HydraDB vs SQLite recursive CTE -> BENCHMARKS.md
 expand_seeds.py        widens the crawl frontier from the npm search API
 probe_constraints.py   the constraint table above, as a runnable PASS/FAIL check
 probe_counts.py        proves count(*) counts vertices, not paths
+rebuild.py             replay the graph from deps.db when the store goes read-only
+verify.py              end-to-end verification of the running system
+chaos.py               fault injection: kill HydraDB, prove the recovery
 tests/test_all.py      108 tests
 ```
 
@@ -271,6 +328,7 @@ tests/test_all.py      108 tests
 
 | endpoint | answers |
 |---|---|
+| `GET /api/health` | per-component liveness: hydradb, sidecar, warm-up, writability |
 | `GET /api/stats` | graph size, crawl progress |
 | `GET /api/blast?name=&depth=` | victims + depth histogram + latency |
 | `GET /api/resolve?name=&bad_version=` | exposed vs shielded by pin |
@@ -294,6 +352,39 @@ account takeover in September 2025, `event-stream` in November 2018,
 attacks. The blast radius numbers shown for them are computed live from the
 crawled graph, not from any published incident report.
 
+## Reliability, measured
+
+Uptime is not a claim worth making about the future, so what is claimed here is
+what was measured. `verify.py` and `chaos.py` reproduce all of it.
+
+**Under sustained load** the API answers every request. `verify.py --soak`
+drives real package names from the live graph across `/api/blast`, `/api/stats`
+and `/api/search` continuously and reports the rate it actually achieved.
+
+**When HydraDB is stopped mid-flight** (`chaos.py`, which really does stop the
+container), the system degrades honestly rather than breaking:
+
+| behaviour | result |
+|---|---|
+| graph endpoints during the outage | `503` with an explanation and a hint, in ~18s — never a 500 or a hang |
+| `/api/stats`, `/api/search`, `/api/maintainers`, the console | keep serving from the sidecar throughout |
+| after the database returns | recovers on its own, no server restart, no intervention |
+| during the ~93s cold window | `503 graph_warming`, and the console retries instead of showing an error |
+
+Three fixes came out of running that test rather than reasoning about it:
+
+- **Retry classification.** Retrying a rejected query wasted seconds on every
+  syntax error, while a genuinely transient failure — a dropped connection, a
+  `408` query timeout — was not retried patiently enough to survive a restart.
+  Both directions were wrong; both are now classified.
+- **Dead pooled connections.** A keep-alive socket pointing at a process that no
+  longer exists produced errors after the database was back. The session is
+  dropped on a transport failure so the retry dials fresh.
+- **A wall-clock budget.** Five patient retries against a 30-second server-side
+  query timeout meant a single request could take over two minutes to admit
+  defeat — long after the browser gave up. Request paths now get 20 seconds
+  total; the crawler and the warm-up keep the patient behaviour.
+
 ## Known limitations
 
 - The crawl reaches ~27k packages, not all 4.3M on npm. BFS from a seed set
@@ -307,6 +398,13 @@ crawled graph, not from any published incident report.
 - Semver support covers `^ ~ >= > <= < = * x ||` and hyphen ranges. Git URLs,
   `file:`, `npm:` aliases, and workspace protocols return `False` rather than
   guessing; under-reporting exposure is the safer error.
+- **A restarted HydraDB store cannot be written to again** (see constraint 6).
+  Serving is unaffected, but re-crawling requires `py rebuild.py` first. This is
+  a HydraDB 0.1.0 limitation on the local-filesystem object store, not something
+  this project can work around in code.
+- After a container restart the graph needs ~93 seconds before deep traversals
+  succeed. The server warms itself and reports `graph_warming` meanwhile, but
+  the first ~1.5 minutes after a cold start are genuinely degraded.
 - `nid()` collisions are theoretically possible (~2e-6 over 100k names). The
   crawler records the name→id map and logs a collision rather than silently
   merging two packages; the test suite asserts zero collisions across the

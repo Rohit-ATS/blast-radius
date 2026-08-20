@@ -13,16 +13,29 @@ const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const DEPTH = 5;
 const num = n => (typeof n === 'number' ? n.toLocaleString('en-US') : String(n ?? '—'));
 
-async function api(path, opts) {
-  const res = await fetch(path, opts);
-  let body;
-  try { body = await res.json(); }
-  catch { throw Object.assign(new Error('server sent a non-JSON response'), { status: res.status }); }
-  if (!res.ok) {
+/* A cold HydraDB exceeds its own 30s query timeout on deep traversals for up
+ * to a minute and a half after a restart. That is a real state, not an error
+ * worth showing someone — so a `graph_warming` 503 is retried here, with the
+ * page saying what it is waiting for rather than flashing a failure. */
+const WARM_RETRIES = 4;
+
+async function api(path, opts, onWarming) {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(path, opts);
+    let body;
+    try { body = await res.json(); }
+    catch { throw Object.assign(new Error('server sent a non-JSON response'), { status: res.status }); }
+    if (res.ok) return body;
+
+    const warming = res.status === 503 && body.error === 'graph_warming';
+    if (warming && attempt < WARM_RETRIES) {
+      if (onWarming) onWarming(body, attempt);
+      await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
+      continue;
+    }
     throw Object.assign(new Error(body.message || body.error || `http ${res.status}`),
-                        { status: res.status, payload: body });
+                        { status: res.status, payload: body, warming });
   }
-  return body;
 }
 
 function esc(s) {
@@ -89,7 +102,9 @@ async function pollStats() {
     line.textContent = bits.join(' · ');
   } catch (err) {
     pulse.className = 'pulse dead';
-    line.textContent = err.status === 503 ? 'hydradb unreachable' : 'stats unavailable';
+    line.textContent = err.warming ? 'hydradb warming up…'
+                     : err.status === 503 ? 'hydradb unreachable'
+                     : 'stats unavailable';
   }
 }
 
@@ -200,7 +215,11 @@ function wireSuggest() {
 
 function errorBox(where, err) {
   const detail = err.payload?.message || err.message;
-  where.innerHTML = `<div class="errbox"><b>${err.status === 404 ? 'not in the graph' : 'query failed'}</b>${esc(detail)}</div>`;
+  const title = err.warming ? 'graph is still warming up'
+              : err.status === 404 ? 'not in the graph'
+              : err.status === 503 ? 'hydradb unreachable'
+              : 'query failed';
+  where.innerHTML = `<div class="errbox"><b>${title}</b>${esc(detail)}</div>`;
 }
 
 function renderHistogram(hist) {
@@ -291,8 +310,12 @@ async function runQuery(name, version) {
     // Ask for the graph size alongside the traversal rather than trusting the
     // background poll to have landed — printing "0 edges" because a number has
     // not arrived yet is exactly the kind of invented figure this page avoids.
+    const onWarming = (body, attempt) => {
+      $('#verdictline').textContent =
+        `hydradb is warming its cache — retrying (${attempt + 1}/${WARM_RETRIES})…`;
+    };
     const [b, statsSettled] = await Promise.all([
-      api(`/api/blast?name=${encodeURIComponent(name)}&depth=${DEPTH}`),
+      api(`/api/blast?name=${encodeURIComponent(name)}&depth=${DEPTH}`, undefined, onWarming),
       api('/api/stats').then(s => (lastStats = s)).catch(() => null),
     ]);
     const rtt = performance.now() - t0;

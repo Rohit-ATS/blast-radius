@@ -8,6 +8,7 @@ no routing table negotiation, and gives clearer errors while iterating fast.
 import hashlib
 import json
 import os
+import random
 import threading
 import time
 from typing import Any, Iterable
@@ -35,9 +36,12 @@ RESULT_LIMIT = 100_000
 
 class Hydra:
     def __init__(self, url: str = HYDRA_URL, token: str = HYDRA_TOKEN,
-                 graph: str = HYDRA_GRAPH, cell: str = HYDRA_CELL):
+                 graph: str = HYDRA_GRAPH, cell: str = HYDRA_CELL,
+                 timeout: float = 180.0, budget: float | None = None):
         self.endpoint = f"{url}/v1/graphs/{graph}/query"
         self.cell = cell
+        self.timeout = timeout
+        self.budget = budget
         self._headers = {
             "Authorization": f"Bearer {token}",
             "X-Graph-Namespace": graph,
@@ -58,11 +62,23 @@ class Hydra:
         return s
 
     def query(self, cypher: str, params: dict[str, Any] | None = None,
-              consistency: str = "causal", retries: int = 3) -> list[dict]:
+              consistency: str = "causal", retries: int = 5,
+              budget: float | None = None) -> list[dict]:
+        """Run a query, following cursors, retrying what is worth retrying.
+
+        `budget` is a wall-clock ceiling for the whole call including retries.
+        Without one, a cold HydraDB — which fails its own 30-second query
+        timeout on every attempt — turns five patient retries into a request
+        that takes over two minutes to admit defeat, by which point the browser
+        has given up and the user has learned nothing. The crawler wants
+        patience; a request handler wants an answer or an honest error.
+        """
         body: dict[str, Any] = {"cell_id": self.cell, "query": cypher,
                                 "consistency": consistency}
         if params:
             body["parameters"] = params
+        budget = self.budget if budget is None else budget
+        deadline = (time.time() + budget) if budget else None
 
         # HydraDB pages results at 1024 rows and returns a `next_cursor`. A
         # client that ignores it silently truncates every large answer — which
@@ -78,7 +94,7 @@ class Hydra:
             if cursor is not None:
                 page["cursor"] = cursor
                 page["query_id"] = query_id
-            payload = self._post(page, cypher, retries)
+            payload = self._post(page, cypher, retries, deadline)
             out.extend(_rows(payload))
             if not isinstance(payload, dict):
                 return out
@@ -87,19 +103,50 @@ class Hydra:
             if cursor is None:
                 return out
 
-    def _post(self, body: dict, cypher: str, retries: int):
+    def _post(self, body: dict, cypher: str, retries: int, deadline=None):
+        """One request, with a retry policy that distinguishes 'try again' from
+        'this will never work'.
+
+        Both halves matter. Retrying a rejected query burns seconds on every
+        genuine syntax error for nothing; *not* retrying a connection failure
+        means a HydraDB restart shows up as user-visible errors, because the
+        server accepts connections and serves /readyz before it can actually
+        execute against a restored store.
+        """
         last = None
         for attempt in range(retries):
+            timeout = self.timeout
+            if deadline is not None:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                # Never wait past the budget: a request handler that blows its
+                # deadline is indistinguishable from a hang.
+                timeout = min(timeout, remaining)
             try:
-                r = self.session.post(self.endpoint, data=json.dumps(body), timeout=180)
+                r = self.session.post(self.endpoint, data=json.dumps(body),
+                                      timeout=timeout)
                 if r.status_code >= 400:
                     raise HydraError(f"{r.status_code}: {r.text[:600]}")
                 return r.json()
             except (requests.RequestException, HydraError) as e:
                 last = e
+                if isinstance(e, (requests.ConnectionError, requests.Timeout)):
+                    # The pooled keep-alive socket is pointing at a process that
+                    # no longer exists. Drop the whole session so the retry
+                    # dials a fresh connection instead of reusing a dead one.
+                    self._local.session = None
+                elif not _retryable(e):
+                    raise HydraError(f"{e}\n{cypher[:300]}") from None
                 if attempt == retries - 1:
                     break
-                time.sleep(1.5 * (attempt + 1))
+                # Exponential backoff with jitter: a cold HydraDB needs several
+                # seconds, and unjittered retries from the histogram's parallel
+                # queries would all land on the same instant.
+                nap = min(6.0, 0.5 * 2 ** attempt) * (0.75 + random.random() / 2)
+                if deadline is not None and time.time() + nap >= deadline:
+                    break
+                time.sleep(nap)
         raise HydraError(f"query failed after {retries} attempts: {last}\n{cypher[:300]}")
 
     def timed(self, cypher: str, params: dict[str, Any] | None = None,
@@ -144,6 +191,30 @@ class Hydra:
                 pass
             time.sleep(3)
         raise HydraError("HydraDB never became ready — check `docker compose logs hydradb`")
+
+
+def _retryable(err: Exception) -> bool:
+    """Is this failure worth another attempt?
+
+    Transport failures and 5xx are transient. A 4xx is the engine telling us
+    the query is wrong, and it will be just as wrong next time — the one
+    exception being 429, which is retryable when it is backpressure but *not*
+    when it is the deterministic result-size ceiling.
+    """
+    if isinstance(err, (requests.ConnectionError, requests.Timeout)):
+        return True
+    text = str(err)
+    status = text.split(":", 1)[0].strip()
+    if status == "429":
+        return "query_result_limit" not in text
+    if status == "408":
+        # HydraDB's own 30-second query timeout. It is a 4xx, but it is very
+        # much transient: a cold store fails this repeatedly and then answers
+        # the identical query in a second once the working set is cached.
+        return True
+    if status.isdigit():
+        return int(status) >= 500
+    return True
 
 
 def _rows(payload: Any) -> list[dict]:

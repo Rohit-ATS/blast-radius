@@ -221,6 +221,26 @@ def _version_sort_key(v: str):
 def crawl(args) -> None:
     h = Hydra()
     h.wait_ready()
+
+    # HydraDB 0.1.0 on the local-filesystem object store cannot update an
+    # existing SlateDB manifest, so any boot after the first leaves the store
+    # permanently read-only: reads keep working, every write returns a 500.
+    # Finding that out 20 minutes into a crawl is miserable, so check first.
+    try:
+        h.query("UNWIND $rows AS row MERGE (p {id: row.id}) SET p:_Probe",
+                {"rows": [{"id": 999999999999998}]}, retries=1)
+        h.query("MATCH (p {id: $id}) DETACH DELETE p",
+                {"id": 999999999999998}, retries=1)
+    except Exception as e:
+        print("[fatal] HydraDB is not accepting writes — the store has been "
+              "restarted at least once and its manifest can no longer be "
+              "updated on the local filesystem backend.", file=sys.stderr)
+        print("        Rebuild it from the sidecar (about a minute, no "
+              "network):", file=sys.stderr)
+        print("          py rebuild.py", file=sys.stderr)
+        print(f"        underlying error: {str(e)[:200]}", file=sys.stderr)
+        raise SystemExit(2)
+
     db = open_sidecar(args.db)
 
     # name -> id map, so a collision surfaces as evidence instead of a merge.
