@@ -6,6 +6,8 @@ smoke.db
 .crawl_state.json
 crawl_state.json
 crawl.log
+verify.log
+verify_full.log
 server.log
 seeds.log
 __pycache__/

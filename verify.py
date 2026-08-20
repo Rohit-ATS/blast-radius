@@ -375,8 +375,28 @@ def soak(res, db, seconds):
         "SELECT name FROM packages WHERE crawled = 1 ORDER BY nid LIMIT 200")]
     sent = failed = 0
     times = []
+    # Aggregated so the diagnosis survives scrollback: what failed, why, when,
+    # and on which package — a bare failure count is not actionable.
+    reasons: dict[str, int] = {}
+    examples: dict[str, str] = {}
+    first_fail_at = last_fail_at = None
     deadline = time.time() + seconds
+    started = time.time()
     i = 0
+
+    def record(path, q, status, body, name):
+        nonlocal failed, first_fail_at, last_fail_at
+        failed += 1
+        key = f"{path} -> {status}"
+        if isinstance(body, dict) and body.get("error"):
+            key += f" ({body['error']})"
+        reasons[key] = reasons.get(key, 0) + 1
+        examples.setdefault(key, f"{name}: {str(body)[:160]}")
+        now = time.time() - started
+        if first_fail_at is None:
+            first_fail_at = now
+        last_fail_at = now
+
     while time.time() < deadline:
         name = names[i % len(names)]
         i += 1
@@ -388,13 +408,15 @@ def soak(res, db, seconds):
                 sent += 1
                 times.append(ms)
                 if r.status_code not in (200, 404):
-                    failed += 1
-                    print(f"    {RED}{path} {name} -> {r.status_code}{OFF}")
+                    try:
+                        body = r.json()
+                    except Exception:
+                        body = r.text[:160]
+                    record(path, q, r.status_code, body, name)
             except Exception as e:
                 sent += 1
-                failed += 1
-                print(f"    {RED}{path} {name} -> {e.__class__.__name__}{OFF}")
-        if sent % 60 == 0:
+                record(path, q, e.__class__.__name__, None, name)
+        if sent % 300 == 0:
             print(f"    {DIM}{sent} requests, {failed} failed, "
                   f"{int(deadline - time.time())}s left{OFF}")
     for t in times:
@@ -402,6 +424,13 @@ def soak(res, db, seconds):
     rate = 100.0 * (sent - failed) / sent if sent else 0
     res.check(f"soak success rate over {sent} requests", failed == 0,
               f"{rate:.2f}% ({sent - failed}/{sent})")
+    if reasons:
+        print(f"    {RED}failure breakdown{OFF} "
+              f"{DIM}(first at t+{first_fail_at:.0f}s, "
+              f"last at t+{last_fail_at:.0f}s of {seconds}s){OFF}")
+        for key, n in sorted(reasons.items(), key=lambda kv: -kv[1]):
+            print(f"      {n:>5}x {key}")
+            print(f"            {DIM}{examples[key]}{OFF}")
 
 
 def main():
@@ -412,6 +441,8 @@ def main():
     p.add_argument("--each", type=int, default=6)
     p.add_argument("--soak", type=int, default=0, help="seconds of sustained load")
     p.add_argument("--no-browser", action="store_true")
+    p.add_argument("--soak-only", action="store_true",
+                   help="skip the functional pass and just apply load")
     args = p.parse_args()
 
     overall = True
@@ -424,6 +455,11 @@ def main():
         if db is None:
             res.summary()
             return 1
+        if args.soak_only:
+            soak(res, db, args.soak or 60)
+            print(f"{DIM}pass took {time.time() - started:.0f}s{OFF}")
+            overall = res.summary() and overall
+            continue
         check_consistency(res, db)
         check_presets(res)
         check_sampled_packages(res, db, args.sample)
