@@ -26,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 import apimeta
 import blast
 import chains
+import feed as feedmod
 import intel
 import lockfiles
 import scan
@@ -75,8 +76,14 @@ _WRITE_PROBE_ID = 999999999999998
 # caller's behalf, so an unbounded client is an unbounded bill for someone.
 RATE_LIMIT = int(os.environ.get("RATE_LIMIT", "120"))
 
-# npm's published package count, used only to state coverage honestly.
-NPM_TOTAL = 4_310_000
+# npm's published package count, used only to state coverage honestly. The
+# live feed replaces this with the registry's own doc_count once it anchors.
+NPM_TOTAL = 4_311_957
+
+# Watch npm publish while the console is open. Disabled in DEMO_MODE, where
+# determinism matters more than liveness.
+LIVE_FEED = os.environ.get("LIVE_FEED", "1") == "1"
+_feed = feedmod.Feed(hydra=hydra, blast_mod=blast)
 
 # Demo safety. DEMO_MODE=1 serves captured real responses for the preset
 # incidents, so a recording is deterministic and instant. Independently of that
@@ -231,9 +238,10 @@ def graph_coverage():
             crawled = conn.execute(
                 "SELECT count(*) FROM packages WHERE crawled = 1").fetchone()[0]
             known = conn.execute("SELECT count(*) FROM packages").fetchone()[0]
+        total = _feed.npm_total or NPM_TOTAL
         return {"packages_in_graph": known, "packages_crawled": crawled,
-                "npm_total_estimate": NPM_TOTAL,
-                "fraction": round(known / NPM_TOTAL, 5)}
+                "npm_total": total,
+                "fraction": round(known / total, 5)}
     except Exception:
         return None
 
@@ -459,6 +467,8 @@ def _start_background_threads():
                 rate_limit=RATE_LIMIT)
     threading.Thread(target=_warm_supervisor, daemon=True, name="warm").start()
     threading.Thread(target=_probe_writable, daemon=True, name="writable").start()
+    if LIVE_FEED and not DEMO_MODE:
+        _feed.start()
     threading.Thread(target=_refresh_graph_counts, daemon=True,
                      name="graph-counts").start()
 
@@ -660,6 +670,17 @@ def api_maintainers(name: str = Query(..., min_length=1, max_length=214),
     return {**result, "name": name, "latency_ms": round(ms, 1)}
 
 
+@app.get("/api/feed")
+def api_feed(limit: int = Query(25, ge=1, le=60)):
+    """What npm has published in the last few minutes, and who it reaches.
+
+    npm rejects `feed=continuous` on its replication endpoint, so this polls
+    `_changes?since=<seq>` every few seconds — near-real-time rather than
+    streaming, which is what the response says.
+    """
+    return _feed.snapshot(limit)
+
+
 @app.get("/api/expand")
 def api_expand(name: str = Query(..., min_length=1, max_length=214),
                kind: str = Query("package", pattern="^(package|maintainer|advisory)$"),
@@ -798,6 +819,7 @@ async def api_events(request: Request):
     """
     async def stream():
         last = None
+        last_publish = [None]
         while True:
             if await request.is_disconnected():
                 return
@@ -816,6 +838,15 @@ async def api_events(request: Request):
                     yield f"event: stats\ndata: {frame}\n\n"
                 else:
                     yield ": keepalive\n\n"
+
+                # Publishes ride the same stream. Only pushed when the newest
+                # one actually changed, so an idle minute costs nothing.
+                fresh = _feed.snapshot(limit=6)["events"]
+                newest = fresh[0]["at"] if fresh else None
+                if newest and newest != last_publish[0]:
+                    last_publish[0] = newest
+                    yield ("event: publish\ndata: "
+                           + json.dumps({"events": fresh}) + "\n\n")
             except Exception as e:
                 yield f"event: error\ndata: {json.dumps({'error': str(e)[:200]})}\n\n"
             await asyncio.sleep(2)

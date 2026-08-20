@@ -187,6 +187,25 @@
     </div>
   </section>
 
+  <!-- ---------------------------------------------------------- live feed -->
+  <section class="live" id="live">
+    <h2>npm, right now</h2>
+    <p class="lede">every package published to npm in the last few minutes, checked against the
+      graph as it arrives. most publishes are somebody's first version with nothing
+      downstream — the ones worth watching are the packages thousands of things already
+      depend on, because that is the moment a supply-chain attack goes live.</p>
+
+    <div class="win">
+      <div class="bar">
+        <i class="dot r"></i><i class="dot a"></i><i class="dot g"></i>
+        <span class="title">live publish feed</span>
+        <span class="barctl"><span class="feedstat" id="feedstat">connecting…</span></span>
+      </div>
+      <div class="body nopad"><div class="ticker" id="ticker"></div></div>
+      <div class="cap">npm-changes.log — polled from replicate.npmjs.com every few seconds</div>
+    </div>
+  </section>
+
   <!-- ------------------------------------------------------------ explorer -->
   <section class="explorer" id="explorer">
     <h2>walk the graph yourself</h2>
