@@ -27,7 +27,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from hydra import Hydra, nid
+from hydra import Hydra, adv_id, maint_id, pkg_id
 from ingest import DEPS_DB, open_sidecar
 import blast
 import intel
@@ -86,7 +86,7 @@ def new_edges(db, kind, pairs):
 
 # --------------------------------------------------------------------------
 
-def do_maintainers(h, db, chunk, min_dependents=10):
+def do_maintainers(h, db, chunk, min_dependents=10, eco="npm"):
     """Only maintainers of packages that something actually depends on.
 
     Measured the hard way: HydraDB 0.1.0 traversal cost scales with the *total*
@@ -109,13 +109,13 @@ def do_maintainers(h, db, chunk, min_dependents=10):
           f"(packages with >= {min_dependents} dependents)")
 
     h.write_batch(UPSERT_NODES % "Maintainer",
-                  [{"id": nid("maint:" + m), "name": m} for m in names],
+                  [{"id": maint_id(m), "name": m} for m in names],
                   chunk=chunk)
 
     fresh = new_edges(db, "MAINTAINS", rows)
     print(f"[maintainers] {len(fresh):,} new edges")
     h.write_batch(CREATE_EDGE % "MAINTAINS",
-                  [{"src": nid("maint:" + m), "dst": nid(p)} for m, p in fresh],
+                  [{"src": maint_id(m), "dst": pkg_id(p, eco)} for m, p in fresh],
                   chunk=chunk)
 
     # The reverse edge as well. A traversal needs a fixed source id, so without
@@ -129,12 +129,12 @@ def do_maintainers(h, db, chunk, min_dependents=10):
     back = new_edges(db, "MAINTAINED_BY", [(p, m) for m, p in all_maintains])
     print(f"[maintainers] {len(back):,} new reverse edges")
     h.write_batch(CREATE_EDGE % "MAINTAINED_BY",
-                  [{"src": nid(p), "dst": nid("maint:" + m)} for p, m in back],
+                  [{"src": pkg_id(p, eco), "dst": maint_id(m)} for p, m in back],
                   chunk=chunk)
     return len(names), len(fresh)
 
 
-def do_advisories(h, db, chunk, limit):
+def do_advisories(h, db, chunk, limit, eco="npm"):
     """Ask OSV about every crawled package at its latest version, in batch."""
     pkgs = db.execute(
         "SELECT name, latest FROM packages WHERE crawled = 1 AND latest != '' "
@@ -156,7 +156,7 @@ def do_advisories(h, db, chunk, limit):
     if repair:
         print(f"[advisories] {len(repair):,} reverse edges backfilled")
         h.write_batch(CREATE_EDGE % "HAS_ADVISORY",
-                      [{"src": nid(p), "dst": nid("adv:" + a)} for p, a in repair],
+                      [{"src": pkg_id(p, eco), "dst": adv_id(a)} for p, a in repair],
                       chunk=chunk)
 
     if not flagged:
@@ -197,22 +197,22 @@ def do_advisories(h, db, chunk, limit):
           f"{len(links):,} links")
 
     h.write_batch(UPSERT_ADVISORIES,
-                  [{"id": nid("adv:" + r["osv_id"]), "name": r["osv_id"], **r}
+                  [{"id": adv_id(r["osv_id"]), "name": r["osv_id"], **r}
                    for r in records.values()], chunk=chunk)
     fresh = new_edges(db, "AFFECTS", links)
     h.write_batch(CREATE_EDGE % "AFFECTS",
-                  [{"src": nid("adv:" + a), "dst": nid(p)} for a, p in fresh],
+                  [{"src": adv_id(a), "dst": pkg_id(p, eco)} for a, p in fresh],
                   chunk=chunk)
     all_affects = db.execute(
         "SELECT src, dst FROM graph_edges WHERE kind = 'AFFECTS'").fetchall()
     back = new_edges(db, "HAS_ADVISORY", [(p, a) for a, p in all_affects])
     h.write_batch(CREATE_EDGE % "HAS_ADVISORY",
-                  [{"src": nid(p), "dst": nid("adv:" + a)} for p, a in back],
+                  [{"src": pkg_id(p, eco), "dst": adv_id(a)} for p, a in back],
                   chunk=chunk)
     return len(records), len(fresh)
 
 
-def do_similar(h, db, chunk, top):
+def do_similar(h, db, chunk, top, eco="npm"):
     """Name-similarity edges among packages we already know about.
 
     Only names that exist are linked, and only for the packages worth
@@ -237,7 +237,7 @@ def do_similar(h, db, chunk, top):
     print(f"[similar] {len(fresh):,} new edges "
           f"({len({a for a, _ in fresh}):,} names involved)")
     h.write_batch(CREATE_EDGE % "SIMILAR_TO",
-                  [{"src": nid(a), "dst": nid(b)} for a, b in fresh],
+                  [{"src": pkg_id(a, eco), "dst": pkg_id(b, eco)} for a, b in fresh],
                   chunk=chunk)
     return len(fresh)
 
@@ -246,6 +246,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--db", default=DEPS_DB)
     p.add_argument("--chunk", type=int, default=500)
+    p.add_argument("--ecosystem", default="npm")
     p.add_argument("--limit", type=int, default=30000,
                    help="packages to ask OSV about")
     p.add_argument("--top", type=int, default=4000,
@@ -263,11 +264,11 @@ def main():
 
     started = time.time()
     if args.only in (None, "maintainers"):
-        do_maintainers(h, db, args.chunk, args.min_dependents)
+        do_maintainers(h, db, args.chunk, args.min_dependents, args.ecosystem)
     if args.only in (None, "advisories"):
-        do_advisories(h, db, args.chunk, args.limit)
+        do_advisories(h, db, args.chunk, args.limit, args.ecosystem)
     if args.only in (None, "similar"):
-        do_similar(h, db, args.chunk, args.top)
+        do_similar(h, db, args.chunk, args.top, args.ecosystem)
 
     print(f"\n[graphify] done in {time.time() - started:.0f}s")
     for label, q in (("Package", "MATCH (n:Package) RETURN count(*)"),

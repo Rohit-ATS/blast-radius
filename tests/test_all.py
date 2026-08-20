@@ -25,7 +25,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import blast                                                    # noqa: E402
-from hydra import Hydra, HydraError, nid                        # noqa: E402
+from hydra import Hydra, HydraError, nid, pkg_id               # noqa: E402
 
 BASE = os.environ.get("BLAST_BASE", "http://127.0.0.1:8000")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -98,7 +98,7 @@ def seeded(hydra):
     """A package with a known non-trivial blast radius, chosen from the graph
     rather than hardcoded — which packages got crawled varies by run."""
     for candidate in ("debug", "ms", "chalk", "tslib", "semver"):
-        rows = hydra.query(blast.EXISTS, {"id": nid(candidate)})
+        rows = hydra.query(blast.EXISTS, {"id": pkg_id(candidate, "npm")})
         if rows and rows[0].get("p.name"):
             return candidate
     pytest.skip("no seed package present in the graph")
@@ -258,6 +258,8 @@ def test_nid_is_stable_and_in_range():
     assert nid("left-pad") != nid("left-pads")
     for name in ("a", "@types/node", "debug", "x" * 214):
         assert 0 <= nid(name) < 2 ** 53 - 1
+    # Ecosystems must not collide: `requests` exists on PyPI and RubyGems.
+    assert pkg_id("requests", "npm") != pkg_id("requests", "pypi")
 
 
 def test_nid_no_collisions_across_the_crawled_corpus(db):
@@ -331,10 +333,10 @@ def test_cycle_terminates(hydra, writable):
     """a -> b -> c -> a. A traversal that treats this as paths rather than
     reachability would not come back."""
     names = ["_cycle_a", "_cycle_b", "_cycle_c"]
-    ids = [nid(n) for n in names]
+    ids = [pkg_id(n, "npm") for n in names]
     try:
         hydra.query("UNWIND $rows AS row MERGE (p {id: row.id}) SET p:Package, p.name = row.name",
-                    {"rows": [{"id": nid(n), "name": n} for n in names]})
+                    {"rows": [{"id": pkg_id(n, "npm"), "name": n} for n in names]})
         hydra.query("UNWIND $rows AS row CREATE (a {id: row.src})-[:REQUIRED_BY]->(b {id: row.dst})",
                     {"rows": [{"src": ids[0], "dst": ids[1]},
                               {"src": ids[1], "dst": ids[2]},
@@ -353,7 +355,7 @@ def test_cycle_terminates(hydra, writable):
 
 
 def test_self_loop_terminates(hydra, writable):
-    i = nid("_selfloop")
+    i = pkg_id("_selfloop", "npm")
     try:
         hydra.query("UNWIND $rows AS row MERGE (p {id: row.id}) SET p:Package, p.name = row.name",
                     {"rows": [{"id": i, "name": "_selfloop"}]})
@@ -484,7 +486,7 @@ def test_api_blast_happy(requests_mod, seeded):
     assert d["name"] == seeded
     assert len(d["histogram"]) == 3
     assert d["latency_ms"] > 0
-    assert d["vertex_id"] == nid(seeded)
+    assert d["vertex_id"] == pkg_id(seeded, "npm")
 
 
 def test_api_blast_unknown_package_is_404_with_explanation(requests_mod):

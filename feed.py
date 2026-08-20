@@ -23,7 +23,7 @@ from collections import deque
 import requests
 
 import intel
-from hydra import nid
+from hydra import pkg_id
 
 REPLICATE = "https://replicate.npmjs.com"
 UA = {"User-Agent": "blast-radius-hackhydra/0.1 (+supply-chain monitor)"}
@@ -156,7 +156,7 @@ class Feed:
                 if known:
                     rows = self.hydra.query(
                         self.blast.REACH_COUNT % self.depth,
-                        {"id": nid(name)})
+                        {"id": pkg_id(name)})
                     dependents = rows[0]["count(*)"] if rows else 0
             except Exception:
                 dependents = None

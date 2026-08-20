@@ -284,6 +284,32 @@ def nid(name: str) -> int:
     return int.from_bytes(digest, "big") & _NID_MASK
 
 
+# Ids are namespaced by entity kind, and packages additionally by ecosystem.
+# `requests` exists on PyPI and on RubyGems and they are not the same package;
+# without the prefix they would collide onto one vertex and quietly merge two
+# dependency graphs into a wrong answer.
+
+def pkg_id(name: str, ecosystem: str = "npm") -> int:
+    """Vertex id for a package in a specific ecosystem."""
+    return nid(f"{ecosystem}:{name}")
+
+
+def maint_id(identity: str) -> int:
+    """Vertex id for a maintainer.
+
+    Deliberately *not* namespaced by ecosystem: one human publishing to npm and
+    to PyPI is one node, which is what makes the cross-ecosystem question
+    answerable. The adapter normalises the identity to an email where one
+    exists, so the join happens on something globally unique.
+    """
+    return nid(f"maint:{identity}")
+
+
+def adv_id(osv_id: str) -> int:
+    """Vertex id for an advisory. OSV ids are already globally unique."""
+    return nid(f"adv:{osv_id}")
+
+
 if __name__ == "__main__":
     h = Hydra()
     h.wait_ready()

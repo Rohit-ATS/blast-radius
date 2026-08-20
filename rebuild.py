@@ -33,7 +33,7 @@ import subprocess
 import sys
 import time
 
-from hydra import Hydra, HydraError, nid
+from hydra import Hydra, HydraError, pkg_id
 from ingest import CREATE_EDGES, UPSERT_PACKAGES, UPSERT_STUBS, DEPS_DB
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -73,14 +73,16 @@ def recreate_store() -> None:
                    capture_output=True, timeout=300)
 
 
-def replay(h: Hydra, db: sqlite3.Connection, chunk: int) -> tuple[int, int]:
+def replay(h: Hydra, db: sqlite3.Connection, chunk: int,
+           eco: str = "npm") -> tuple[int, int]:
     """Write every vertex, then every edge, exactly as ingest.py would have."""
     packages = db.execute(
         "SELECT name, latest FROM packages ORDER BY nid").fetchall()
     print(f"[replay] {len(packages):,} vertices")
-    full = [{"id": nid(n), "name": n, "latest": v or ""}
-            for n, v in packages if v]
-    stubs = [{"id": nid(n), "name": n} for n, v in packages if not v]
+    full = [{"id": pkg_id(n, eco), "name": n, "latest": v or "",
+             "ecosystem": eco} for n, v in packages if v]
+    stubs = [{"id": pkg_id(n, eco), "name": n, "ecosystem": eco}
+             for n, v in packages if not v]
     h.write_batch(UPSERT_STUBS, stubs, chunk=chunk)
     h.write_batch(UPSERT_PACKAGES, full, chunk=chunk)
 
@@ -88,7 +90,8 @@ def replay(h: Hydra, db: sqlite3.Connection, chunk: int) -> tuple[int, int]:
         "SELECT src, dst FROM deps WHERE kind = 'prod'").fetchall()
     print(f"[replay] {len(edges):,} edges")
     # Reversed, exactly as ingest.py writes them: dependency -> dependent.
-    rows = ({"src": nid(dst), "dst": nid(src)} for src, dst in edges)
+    rows = ({"src": pkg_id(dst, eco), "dst": pkg_id(src, eco)}
+            for src, dst in edges)
     h.write_batch(CREATE_EDGES, rows, chunk=chunk)
     return len(packages), len(edges)
 
@@ -97,6 +100,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--db", default=DEPS_DB)
     p.add_argument("--chunk", type=int, default=500)
+    p.add_argument("--ecosystem", default="npm")
     p.add_argument("--verify", action="store_true",
                    help="only report whether the graph is writable")
     p.add_argument("--yes", action="store_true",
@@ -133,7 +137,7 @@ def main():
               file=sys.stderr)
         return 1
 
-    pkgs, edges = replay(h, db, args.chunk)
+    pkgs, edges = replay(h, db, args.chunk, args.ecosystem)
 
     # Warm before counting: a whole-graph edge scan on a freshly written store
     # exceeds HydraDB's own 30-second query timeout. Walking the depths first
@@ -141,7 +145,7 @@ def main():
     for depth in range(1, 6):
         try:
             h.query(f"MATCH (t {{id: $id}})-[:REQUIRED_BY*1..{depth}]->(v) "
-                    f"RETURN count(*)", {"id": nid("debug")}, retries=2)
+                    f"RETURN count(*)", {"id": pkg_id("debug", args.ecosystem)}, retries=2)
         except HydraError:
             pass
     got_p = h.query("MATCH (p:Package) RETURN count(*)", retries=6)[0]["count(*)"]

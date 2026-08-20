@@ -23,7 +23,7 @@ against the graph, rather than asserted.
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from hydra import Hydra, RESULT_LIMIT, nid
+from hydra import Hydra, RESULT_LIMIT, adv_id, maint_id, pkg_id
 from blast import REACH_COUNT, REACH_NAMES, _depth
 
 MAINTAINS = "MATCH (m {id: $id})-[:MAINTAINS]->(p) RETURN p.name"
@@ -34,13 +34,14 @@ ADVISORY_NODE = ("MATCH (a:Advisory {id: $id}) "
 ONE_HOP = "MATCH (t {id: $id})-[:REQUIRED_BY*1..1]->(v) RETURN DISTINCT v.name"
 
 
-def _reach(h, name, depth):
-    rows = h.query(REACH_NAMES % depth, {"id": nid(name), "limit": RESULT_LIMIT})
+def _reach(h, name, depth, ecosystem="npm"):
+    rows = h.query(REACH_NAMES % depth, {"id": pkg_id(name, ecosystem),
+                                         "limit": RESULT_LIMIT})
     return {r["v.name"] for r in rows if r.get("v.name")}
 
 
-def _count(h, name, depth):
-    rows = h.query(REACH_COUNT % depth, {"id": nid(name)})
+def _count(h, name, depth, ecosystem="npm"):
+    rows = h.query(REACH_COUNT % depth, {"id": pkg_id(name, ecosystem)})
     return rows[0]["count(*)"] if rows else 0
 
 
@@ -64,17 +65,22 @@ EXPANSIONS = {
     "advisory": [("AFFECTS", "affects", "package")],
 }
 
-ID_PREFIX = {"package": "", "maintainer": "maint:", "advisory": "adv:"}
+# Package ids carry their ecosystem; maintainer and advisory ids deliberately
+# do not, because one human and one advisory are single nodes across all of them.
 NEIGHBOURS = "MATCH (t {id: $id})-[:%s]->(v) RETURN DISTINCT v.name LIMIT $limit"
 IDENTIFY = "MATCH (n {id: $id}) RETURN n.name, n.osv_id, n.is_malware, n.severity"
 
 
-def node_id(name: str, kind: str) -> int:
-    return nid(ID_PREFIX.get(kind, "") + name)
+def node_id(name: str, kind: str, ecosystem: str = "npm") -> int:
+    if kind == "maintainer":
+        return maint_id(name)
+    if kind == "advisory":
+        return adv_id(name)
+    return pkg_id(name, ecosystem)
 
 
 def expand(h: Hydra, name: str, kind: str = "package", limit: int = 40,
-           degree_for: bool = True):
+           degree_for: bool = True, ecosystem: str = "npm"):
     """One node and its neighbours across every edge type it participates in.
 
     This is the whole explorer in one call: the front end holds no model of the
@@ -82,7 +88,7 @@ def expand(h: Hydra, name: str, kind: str = "package", limit: int = 40,
     """
     t0 = time.perf_counter()
     kind = kind if kind in EXPANSIONS else "package"
-    root_id = node_id(name, kind)
+    root_id = node_id(name, kind, ecosystem)
 
     ident = h.query(IDENTIFY, {"id": root_id})
     if not ident or not ident[0].get("n.name"):
@@ -160,7 +166,7 @@ def attack_surface(h: Hydra, maintainer: str, depth: int = 4,
     """
     d = _depth(depth)
     t0 = time.perf_counter()
-    rows = h.query(MAINTAINS, {"id": nid("maint:" + maintainer)})
+    rows = h.query(MAINTAINS, {"id": maint_id(maintainer)})
     packages = sorted({r["p.name"] for r in rows if r.get("p.name")})
     if not packages:
         return {"maintainer": maintainer, "controls": [], "package_count": 0,
@@ -202,7 +208,8 @@ def attack_surface(h: Hydra, maintainer: str, depth: int = 4,
 # 2. why am I exposed — the actual chain
 # --------------------------------------------------------------------------
 
-def why_exposed(h: Hydra, db, source: str, target: str, depth: int = 6):
+def why_exposed(h: Hydra, db, source: str, target: str, depth: int = 6,
+                ecosystem: str = "npm"):
     """Not "you are exposed" — the specific chain, hop by hop.
 
     The depth at which `target` first becomes reachable is computed in the
@@ -233,7 +240,7 @@ def why_exposed(h: Hydra, db, source: str, target: str, depth: int = 6):
 
     # Rebuild backwards through the sidecar: who depends on whom.
     chain = _reconstruct(db, source, target, found_at)
-    verified = _verify_chain(h, chain) if chain else False
+    verified = _verify_chain(h, chain, ecosystem) if chain else False
 
     return {
         "from": source, "to": target, "connected": True,
@@ -278,12 +285,12 @@ def _reconstruct(db, source, target, want_len):
     return None
 
 
-def _verify_chain(h: Hydra, chain):
+def _verify_chain(h: Hydra, chain, ecosystem="npm"):
     """Confirm every hop really exists in the graph, not just the sidecar."""
     if not chain or len(chain) < 2:
         return False
     def hop(i):
-        rows = h.query(ONE_HOP, {"id": nid(chain[i])})
+        rows = h.query(ONE_HOP, {"id": pkg_id(chain[i], ecosystem)})
         return chain[i + 1] in {r["v.name"] for r in rows if r.get("v.name")}
     with ThreadPoolExecutor(max_workers=min(8, len(chain) - 1)) as pool:
         return all(pool.map(hop, range(len(chain) - 1)))
@@ -309,7 +316,7 @@ def blast_advisory(h: Hydra, osv_id: str, depth: int = 4):
     """
     d = _depth(depth)
     t0 = time.perf_counter()
-    aid = nid("adv:" + osv_id)
+    aid = adv_id(osv_id)
     meta_rows = h.query(ADVISORY_NODE, {"id": aid})
     rows = h.query(AFFECTS, {"id": aid})
     packages = sorted({r["p.name"] for r in rows if r.get("p.name")})
@@ -348,7 +355,8 @@ def blast_advisory(h: Hydra, osv_id: str, depth: int = 4):
 # 4. typosquat risk — a squat with dependents is an incident
 # --------------------------------------------------------------------------
 
-def typosquat_risk(h: Hydra, name: str, depth: int = 3):
+def typosquat_risk(h: Hydra, name: str, depth: int = 3,
+                   ecosystem: str = "npm"):
     """SIMILAR_TO neighbours, then how many packages already pull each one.
 
     A near-miss name nobody uses is trivia. A near-miss name with real
@@ -356,7 +364,7 @@ def typosquat_risk(h: Hydra, name: str, depth: int = 3):
     """
     d = _depth(depth)
     t0 = time.perf_counter()
-    rows = h.query(SIMILAR, {"id": nid(name)})
+    rows = h.query(SIMILAR, {"id": pkg_id(name, ecosystem)})
     neighbours = sorted({r["q.name"] for r in rows if r.get("q.name")})
     if not neighbours:
         return {"name": name, "neighbours": [], "at_risk": 0, "depth": d,

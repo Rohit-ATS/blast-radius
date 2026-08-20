@@ -43,7 +43,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
-from hydra import Hydra, nid
+from hydra import Hydra, pkg_id
 
 REGISTRY = "https://registry.npmjs.org"
 SLIM = {"Accept": "application/vnd.npm.install-v1+json"}
@@ -63,7 +63,8 @@ _stop = threading.Event()
 UPSERT_PACKAGES = """
 UNWIND $rows AS row
 MERGE (p {id: row.id})
-SET p:Package, p.name = row.name, p.latest = row.latest
+SET p:Package, p.name = row.name, p.latest = row.latest,
+    p.ecosystem = row.ecosystem
 """
 
 # A dependency we have seen named but not yet crawled. Sets name only, so it
@@ -71,7 +72,7 @@ SET p:Package, p.name = row.name, p.latest = row.latest
 UPSERT_STUBS = """
 UNWIND $rows AS row
 MERGE (p {id: row.id})
-SET p:Package, p.name = row.name
+SET p:Package, p.name = row.name, p.ecosystem = row.ecosystem
 """
 
 # Reversed on purpose: src is the dependency, dst is the dependent.
@@ -263,8 +264,10 @@ def crawl(args) -> None:
     done = 0
     edges_written = 0
 
+    ecosystem = getattr(args, "ecosystem", "npm")
+
     def vid(name: str) -> int:
-        i = nid(name)
+        i = pkg_id(name, ecosystem)
         prev = known.get(i)
         if prev is None:
             known[i] = name
@@ -305,7 +308,8 @@ def crawl(args) -> None:
                 i = vid(name)
                 if i not in written:
                     written.add(i)
-                    stub_rows.append({"id": i, "name": name})
+                    stub_rows.append({"id": i, "name": name,
+                                      "ecosystem": ecosystem})
                     db.execute("INSERT OR IGNORE INTO packages (nid, name) VALUES (?,?)",
                                (i, name))
 
@@ -325,7 +329,8 @@ def crawl(args) -> None:
             h.write_batch(UPSERT_STUBS, stub_rows, chunk=args.chunk)
         if pkg_rows:
             h.write_batch(UPSERT_PACKAGES,
-                          [{"id": vid(r["name"]), "name": r["name"], "latest": r["latest"]}
+                          [{"id": vid(r["name"]), "name": r["name"],
+                            "latest": r["latest"], "ecosystem": ecosystem}
                            for r in pkg_rows], chunk=args.chunk)
         if edge_rows:
             h.write_batch(CREATE_EDGES, edge_rows, chunk=args.chunk)
@@ -435,6 +440,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--seeds", default="seeds.txt")
     p.add_argument("--db", default=DEPS_DB, help="SQLite sidecar path")
+    p.add_argument("--ecosystem", default="npm",
+                   help="which registry to crawl")
     p.add_argument("--max-packages", type=int, default=25000)
     p.add_argument("--max-versions", type=int, default=5,
                    help="versions kept per package; 0 = all. Guard against edge blowup.")
