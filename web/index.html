@@ -186,6 +186,40 @@
     </div>
   </section>
 
+  <!-- --------------------------------------------------------------- audit -->
+  <section class="audit" id="audit">
+    <h2>is anything in my project <em>already</em> malicious?</h2>
+    <p class="lede">the check above answers "am i exposed to <i>this</i> incident". this one
+      answers the question you have before anyone tells you there is an incident. every
+      package in your lockfile is checked against
+      <a href="https://osv.dev">osv.dev</a> — google's open source vulnerabilities
+      database, the canonical feed for npm advisories, including <code>MAL-</code>
+      identifiers for <b>confirmed malicious packages</b>. no graph coverage needed:
+      your lockfile is your tree.</p>
+
+    <div class="drop" id="auditdrop" tabindex="0" role="button"
+         aria-label="drop a package-lock.json to scan for known malware">
+      <div class="dropinner">
+        <div class="dropicon" aria-hidden="true">
+          <svg viewBox="0 0 40 48" width="40" height="48"><path d="M6 2h20l10 10v34H6Z" fill="#efefec" stroke="#b9b9b2" stroke-width="1.6"/><path d="M26 2v10h10" fill="none" stroke="#b9b9b2" stroke-width="1.6"/><circle cx="20" cy="30" r="7" fill="none" stroke="#8d8d86" stroke-width="2"/><path d="M25 35l6 6" stroke="#8d8d86" stroke-width="2" stroke-linecap="round"/></svg>
+        </div>
+        <div class="droptext">scan my <b>package-lock.json</b> for known malware</div>
+        <div class="dropsub">or <button type="button" class="linkbtn" id="auditpick">choose a file</button> ·
+          checked live against osv.dev · nothing is stored</div>
+      </div>
+      <input type="file" id="auditfile" accept=".json,application/json" hidden>
+    </div>
+
+    <div class="auditresult" id="auditresult" hidden>
+      <div class="verdict" id="auditverdict"></div>
+      <div class="win">
+        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">what is in your tree</span></div>
+        <div class="body nopad"><div id="auditfindings"></div></div>
+        <div class="cap">osv-audit.json</div>
+      </div>
+    </div>
+  </section>
+
   <!-- -------------------------------------------------------------- status -->
   <section class="sys" id="status">
     <h2>the system, right now</h2>

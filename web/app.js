@@ -450,6 +450,7 @@ function boot() {
   wireDragging();
   wireSuggest();
   wireLockfile();
+  wireAudit();
   wireMap();
 
   $('#queryform').addEventListener('submit', e => {
@@ -823,4 +824,165 @@ function syncUrl(name, version) {
   if (name) q.set('pkg', name);
   if (version) q.set('v', version);
   history.replaceState(null, '', q.toString() ? `?${q}` : location.pathname);
+}
+
+/* ----------------------------------------------------- live project audit */
+/* "Am I exposed to this incident" needs the graph. "Is anything in my tree
+ * already known-malicious" does not: the lockfile is the tree, so every entry
+ * goes straight to OSV. That makes this the one feature that works on any
+ * project on earth regardless of what our crawl reached. */
+
+const VERDICT_COPY = {
+  COMPROMISED: n => `${num(n)} package${n === 1 ? '' : 's'} in your tree ${n === 1 ? 'is' : 'are'} confirmed malicious.`,
+  VULNERABLE: n => `no malware, but ${num(n)} package${n === 1 ? ' has' : 's have'} known vulnerabilities.`,
+  CLEAN: () => 'nothing in your tree matches a known advisory.',
+};
+
+function copyButton(label, text) {
+  const id = 'c' + Math.random().toString(36).slice(2, 9);
+  window.__copy = window.__copy || {};
+  window.__copy[id] = text;
+  return `<button type="button" class="copybtn" data-copy="${id}">${esc(label)}</button>`;
+}
+
+function wireCopy(root) {
+  $$('.copybtn[data-copy]', root).forEach(b => {
+    b.addEventListener('click', async () => {
+      const text = (window.__copy || {})[b.dataset.copy] || '';
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch {
+        // Clipboard needs a secure context; select-and-copy still works.
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand('copy'); } finally { ta.remove(); }
+      }
+      const was = b.textContent;
+      b.textContent = 'copied';
+      b.classList.add('done');
+      setTimeout(() => { b.textContent = was; b.classList.remove('done'); }, 1600);
+    });
+  });
+}
+
+function renderFinding(f) {
+  const mal = f.malware.length;
+  const advisories = [...f.malware, ...f.vulnerabilities];
+  const rows = advisories.map(a => `
+    <div class="adv-row">
+      <span class="badge ${a.kind === 'malware' ? 'mal' : 'vuln'}">${a.kind}</span>
+      <b>${esc(a.id)}</b>${a.severity ? ` <span class="ver">· ${esc(a.severity)}</span>` : ''}
+      <div>${esc(a.summary || 'no summary published')}</div>
+      <a href="${esc(a.url)}" target="_blank" rel="noopener">${esc(a.url)}</a>
+    </div>`).join('');
+  return `
+    <details class="finding" data-name="${esc(f.name)}" data-version="${esc(f.version)}">
+      <summary>
+        <span class="badge ${mal ? 'mal' : 'vuln'}">${mal ? 'malware' : 'vuln'}</span>
+        <span class="pkg">${esc(f.name)}</span><span class="ver">@${esc(f.version)}</span>
+        <span class="adv">${num(advisories.length)} advisor${advisories.length === 1 ? 'y' : 'ies'} · click to fix</span>
+      </summary>
+      <div class="detail">
+        ${rows}
+        <div class="fixslot"><button type="button" class="copybtn loadfix">show me how to fix this</button></div>
+      </div>
+    </details>`;
+}
+
+async function loadFix(details) {
+  const slot = $('.fixslot', details);
+  const name = details.dataset.name, version = details.dataset.version;
+  slot.innerHTML = '<span class="ver">working out the safe version…</span>';
+  try {
+    const f = await api(`/api/fix?name=${encodeURIComponent(name)}&bad_version=${encodeURIComponent(version)}`);
+    const overrides = JSON.stringify(f.package_json_overrides, null, 2);
+    slot.innerHTML = `
+      <div class="fixbox">
+        <h4>safe version</h4>
+        <div style="margin-bottom:10px">
+          ${f.recommended
+            ? `upgrade to <b>${esc(f.recommended)}</b> — the nearest release above
+               ${esc(version)} with no advisory against it${f.recommended !== f.latest
+                 ? ` (latest is ${esc(f.latest)}, but you do not have to go that far)` : ''}`
+            : `no clean release above ${esc(version)} was found. pin to a fork or remove it.`}
+        </div>
+        ${f.recommended ? `<h4>force it everywhere, including transitive copies</h4>
+        <pre>${esc(overrides)}</pre>
+        ${copyButton('copy overrides', overrides)}` : ''}
+        <h4 style="margin-top:14px">hand it to your ai</h4>
+        <pre>${esc(f.ai_prompt)}</pre>
+        <div class="fixrow">
+          ${copyButton('copy prompt for cursor / claude / codex', f.ai_prompt)}
+          <span class="ver">a self-contained brief — paste it into any coding agent</span>
+        </div>
+      </div>`;
+    wireCopy(slot);
+  } catch (err) {
+    slot.innerHTML = `<span class="ver">could not build a fix: ${esc(err.message)}</span>`;
+  }
+}
+
+async function runAudit(text, filename) {
+  const out = $('#auditresult'), verdict = $('#auditverdict'), list = $('#auditfindings');
+  out.hidden = false;
+  verdict.className = 'verdict';
+  verdict.innerHTML = `<div class="word" style="font-size:26px;color:var(--ink-3)">scanning…</div>
+    <div class="sub">checking every package in ${esc(filename)} against osv.dev</div>`;
+  list.innerHTML = '';
+
+  try {
+    const r = await api('/api/audit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: text,
+    });
+    const cls = { COMPROMISED: 'compromised', VULNERABLE: 'vulnerable', CLEAN: 'clean' }[r.verdict];
+    const n = r.verdict === 'COMPROMISED' ? r.malicious_count : r.vulnerable_count;
+    verdict.className = `verdict ${cls}`;
+    verdict.innerHTML = `<div class="word">${r.verdict}</div>
+      <div class="sub">${VERDICT_COPY[r.verdict](n)}
+        <b>${num(r.scanned)}</b> packages checked in ${Math.round(r.latency_ms)}ms.</div>`;
+
+    if (!r.findings.length) {
+      list.innerHTML = `<div class="empty" style="padding:16px 14px">
+        every one of the ${num(r.scanned)} resolved packages in ${esc(filename)} was
+        checked against osv.dev and none of them match a published advisory.</div>`;
+      return;
+    }
+    list.innerHTML = r.findings.map(renderFinding).join('')
+      + (r.truncated ? `<div class="empty" style="padding:12px 14px">
+          ${num(r.flagged)} packages were flagged; the ${num(r.detailed)} with the most
+          advisories are detailed above.</div>` : '');
+    $$('.finding .loadfix', list).forEach(b => b.addEventListener('click', e => {
+      e.preventDefault();
+      loadFix(b.closest('.finding'));
+    }, { once: true }));
+  } catch (err) {
+    verdict.className = 'verdict';
+    verdict.innerHTML = `<div class="word" style="font-size:26px;color:var(--red)">scan failed</div>
+      <div class="sub">${esc(err.payload?.message || err.message)}</div>`;
+  }
+}
+
+function wireAudit() {
+  const drop = $('#auditdrop'), file = $('#auditfile');
+  const read = f => {
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => runAudit(String(reader.result), f.name);
+    reader.readAsText(f);
+  };
+  ['dragenter', 'dragover'].forEach(ev =>
+    drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+  ['dragleave', 'drop'].forEach(ev =>
+    drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+  drop.addEventListener('drop', e => read(e.dataTransfer?.files?.[0]));
+  drop.addEventListener('click', () => file.click());
+  drop.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); file.click(); }
+  });
+  $('#auditpick').addEventListener('click', e => { e.stopPropagation(); file.click(); });
+  file.addEventListener('change', () => { read(file.files[0]); file.value = ''; });
 }
