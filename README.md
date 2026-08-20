@@ -357,9 +357,23 @@ crawled graph, not from any published incident report.
 Uptime is not a claim worth making about the future, so what is claimed here is
 what was measured. `verify.py` and `chaos.py` reproduce all of it.
 
-**Under sustained load** the API answers every request. `verify.py --soak`
-drives real package names from the live graph across `/api/blast`, `/api/stats`
-and `/api/search` continuously and reports the rate it actually achieved.
+**Under sustained load**, on a warm graph of 27,076 packages and 91,544 edges:
+
+| measurement | result |
+|---|---|
+| full verification pass | **61/61 checks**, including the browser flow |
+| 180-second soak, mixed endpoints | **100.00% — 5,571/5,571 requests** |
+| soak latency | p50 **28 ms**, p95 **57 ms**, max 488 ms |
+| `/api/blast` depth 5 (3,650 exposed) | p50 45 ms, p95 83 ms |
+| 32 concurrent mixed requests | 32/32, 1.7 s wall |
+
+One honest caveat on that 100%: an earlier soak run, taken minutes after
+`rebuild.py` had just rewritten all 91,544 edges, measured **90.21%
+(4,246/4,707)** — a burst of fast failures at the start that stopped entirely
+and never recurred. That run's detail was not captured, so it is recorded here
+as unexplained rather than diagnosed; `verify.py` now aggregates failure
+reasons, endpoints and timing so a repeat would be. Two subsequent runs against
+a warm store, one of them 5,571 requests, were clean.
 
 **When HydraDB is stopped mid-flight** (`chaos.py`, which really does stop the
 container), the system degrades honestly rather than breaking:
