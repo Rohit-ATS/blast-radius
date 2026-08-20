@@ -34,6 +34,9 @@ from hydra import Hydra, RESULT_LIMIT, nid
 
 MAX_DEPTH = 8
 
+# A crawl whose last sidecar write is older than this is treated as stopped.
+CRAWL_HEARTBEAT = 90.0
+
 
 def _depth(depth: int) -> int:
     """HydraDB rejects a parameter as the hop bound ("unbounded variable-length
@@ -166,6 +169,14 @@ def quick_stats(db: sqlite3.Connection):
     packages = db.execute("SELECT count(*) FROM packages").fetchone()[0]
     edges = db.execute("SELECT count(*) FROM deps WHERE kind = 'prod'").fetchone()[0]
     crawled = db.execute("SELECT count(*) FROM packages WHERE crawled = 1").fetchone()[0]
+    # A crawler that was killed rather than finished would leave its flag set
+    # forever, so a stale heartbeat counts as stopped.
+    try:
+        heartbeat = time.time() - float(meta.get("updated_at", 0))
+    except (TypeError, ValueError):
+        heartbeat = 1e9
+    running = meta.get("running") == "1" and heartbeat < CRAWL_HEARTBEAT
+
     return {
         "packages": packages,
         "edges": edges,
@@ -174,7 +185,8 @@ def quick_stats(db: sqlite3.Connection):
             "crawled": crawled,
             "known": packages,
             "queued": int(meta.get("queued", 0)),
-            "running": meta.get("running") == "1",
+            "running": running,
+            "last_write_s": round(heartbeat, 1) if heartbeat < 1e8 else None,
             "collisions": db.execute("SELECT count(*) FROM collisions").fetchone()[0],
         },
     }

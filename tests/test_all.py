@@ -1,0 +1,672 @@
+"""Blast Radius test suite.
+
+Four layers, in order of how much they need running:
+
+  1. semver + lockfile parsing   — pure, no services
+  2. graph queries               — needs HydraDB
+  3. HTTP API                    — needs `py server.py`
+  4. the console in a browser    — needs Playwright + Chrome
+
+Layers that cannot run are skipped with the reason, so a partial environment
+still gives a useful signal instead of a wall of errors.
+
+Run:  py -m pytest tests -v
+"""
+
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import blast                                                    # noqa: E402
+from hydra import Hydra, HydraError, nid                        # noqa: E402
+
+BASE = os.environ.get("BLAST_BASE", "http://127.0.0.1:8000")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+DB_PATH = os.path.join(ROOT, "deps.db")
+
+# Synthetic test vertices are addressed at nid(name), because that is the id
+# blast_radius() derives from a name and traverses from. Writing them anywhere
+# else makes the traversal start from an empty vertex and quietly find nothing.
+# The names are underscore-prefixed, which npm does not allow, so they cannot
+# collide with a crawled package.
+
+
+# --------------------------------------------------------------------------
+# fixtures
+# --------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def hydra():
+    h = Hydra()
+    try:
+        h.query("MATCH (p:Package) RETURN count(*)")
+    except Exception as e:
+        pytest.skip(f"HydraDB not reachable: {e}")
+    return h
+
+
+@pytest.fixture(scope="session")
+def db():
+    if not os.path.exists(DB_PATH):
+        pytest.skip("deps.db not present — run ingest.py first")
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    if not conn.execute("SELECT count(*) FROM packages").fetchone()[0]:
+        pytest.skip("deps.db is empty — run ingest.py first")
+    return conn
+
+
+@pytest.fixture(scope="session")
+def requests_mod():
+    requests = pytest.importorskip("requests")
+    try:
+        requests.get(f"{BASE}/api/stats", timeout=5).raise_for_status()
+    except Exception as e:
+        pytest.skip(f"server not running at {BASE}: {e}")
+    return requests
+
+
+@pytest.fixture(scope="session")
+def seeded(hydra):
+    """A package with a known non-trivial blast radius, chosen from the graph
+    rather than hardcoded — which packages got crawled varies by run."""
+    for candidate in ("debug", "ms", "chalk", "tslib", "semver"):
+        rows = hydra.query(blast.EXISTS, {"id": nid(candidate)})
+        if rows and rows[0].get("p.name"):
+            return candidate
+    pytest.skip("no seed package present in the graph")
+
+
+# --------------------------------------------------------------------------
+# 1. semver
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("version,rng,expected", [
+    # caret: locks the leftmost non-zero
+    ("4.4.2",  "^4.1.0",  True),
+    ("5.0.0",  "^4.1.0",  False),
+    ("4.0.9",  "^4.1.0",  False),
+    ("0.7.29", "^0.7.0",  True),
+    ("0.8.0",  "^0.7.0",  False),     # 0.x: minor is breaking
+    ("0.0.4",  "^0.0.3",  False),     # 0.0.x: exact only
+    ("0.0.3",  "^0.0.3",  True),
+    # tilde: minor locked
+    ("1.2.9",  "~1.2.3",  True),
+    ("1.3.0",  "~1.2.3",  False),
+    ("1.2.2",  "~1.2.3",  False),
+    # comparators
+    ("2.0.0",  ">=1.0.0", True),
+    ("0.9.0",  ">=1.0.0", False),
+    ("1.0.0",  "=1.0.0",  True),
+    ("1.0.1",  "<1.0.1",  False),
+    ("1.0.0",  "<=1.0.0", True),
+    # compound (space-separated = AND)
+    ("1.5.0",  ">=1.0.0 <2.0.0", True),
+    ("2.0.0",  ">=1.0.0 <2.0.0", False),
+    # union
+    ("3.0.0",  "^1.0.0 || ^3.0.0", True),
+    ("2.0.0",  "^1.0.0 || ^3.0.0", False),
+    # hyphen range
+    ("1.5.0",  "1.0.0 - 2.0.0", True),
+    ("2.5.0",  "1.0.0 - 2.0.0", False),
+    ("2.0.0",  "1.0.0 - 2.0.0", True),   # inclusive
+    # wildcards
+    ("9.9.9",  "*",  True),
+    ("9.9.9",  "",   True),
+    ("9.9.9",  "x",  True),
+    # prerelease versions parse to their release triple
+    ("1.0.0-beta.1", "^1.0.0", True),
+    ("1.0.0+build7", "^1.0.0", True),
+    # a leading v is tolerated
+    ("v1.2.3", "^1.2.0", True),
+])
+def test_semver(version, rng, expected):
+    assert blast.satisfies(version, rng) is expected
+
+
+@pytest.mark.parametrize("rng", [
+    "git+https://github.com/a/b.git",
+    "github:user/repo#semver:^1.0.0",
+    "file:../local-package",
+    "npm:@scope/other@^1.0.0",
+    "workspace:*",
+    "link:../thing",
+    "http://example.com/pkg.tgz",
+    "not a version at all",
+    ">>>>1.0.0",
+    "^",
+    "~",
+])
+def test_semver_unparseable_is_false_not_crash(rng):
+    """Under-reporting exposure is the safe failure. What must never happen is
+    an exception in the middle of an incident query."""
+    assert blast.satisfies("1.0.0", rng) is False
+
+
+@pytest.mark.parametrize("version", ["", "not-a-version", "1.2", "1", None, "1.2.3.4.5"])
+def test_semver_bad_version_is_false(version):
+    assert blast.satisfies(version if version is not None else "", "^1.0.0") is False
+
+
+# --------------------------------------------------------------------------
+# 2. lockfile parsing
+# --------------------------------------------------------------------------
+
+def test_lockfile_v3_flat_packages():
+    lock = {"lockfileVersion": 3, "packages": {
+        "": {"name": "root", "version": "1.0.0"},
+        "node_modules/express": {"version": "4.18.2"},
+        "node_modules/debug": {"version": "4.4.2"},
+    }}
+    got = blast.parse_lockfile(json.dumps(lock))
+    assert got == {"express": "4.18.2", "debug": "4.4.2"}
+
+
+def test_lockfile_v2_has_both_shapes():
+    lock = {"lockfileVersion": 2,
+            "packages": {"node_modules/a": {"version": "1.0.0"}},
+            "dependencies": {"b": {"version": "2.0.0"}}}
+    got = blast.parse_lockfile(json.dumps(lock))
+    assert got == {"a": "1.0.0", "b": "2.0.0"}
+
+
+def test_lockfile_v1_nested_tree_is_walked():
+    """v1 nests dependencies inside dependencies; a non-recursive parser sees
+    only the top level and reports a far smaller tree than you actually have."""
+    lock = {"lockfileVersion": 1, "dependencies": {
+        "express": {"version": "4.17.1", "dependencies": {
+            "debug": {"version": "2.6.9", "dependencies": {
+                "ms": {"version": "2.0.0"}}}}}}}
+    got = blast.parse_lockfile(json.dumps(lock))
+    assert got == {"express": "4.17.1", "debug": "2.6.9", "ms": "2.0.0"}
+
+
+def test_lockfile_scoped_names_survive():
+    lock = {"lockfileVersion": 3, "packages": {
+        "node_modules/@types/node": {"version": "20.1.0"},
+        "node_modules/a/node_modules/@babel/core": {"version": "7.0.0"},
+    }}
+    got = blast.parse_lockfile(json.dumps(lock))
+    assert got["@types/node"] == "20.1.0"
+    assert got["@babel/core"] == "7.0.0"
+
+
+def test_lockfile_empty_object():
+    assert blast.parse_lockfile("{}") == {}
+
+
+@pytest.mark.parametrize("text", ["", "not json", "[1,2,3]", "null", '{"a":'])
+def test_lockfile_malformed_raises_cleanly(text):
+    with pytest.raises((json.JSONDecodeError, ValueError)):
+        blast.parse_lockfile(text)
+
+
+def test_lockfile_huge_is_handled():
+    """25k entries — bigger than most real monorepo lockfiles."""
+    lock = {"lockfileVersion": 3, "packages": {
+        f"node_modules/pkg-{i}": {"version": f"1.0.{i}"} for i in range(25_000)}}
+    text = json.dumps(lock)
+    assert len(text) > 1_000_000
+    t0 = time.perf_counter()
+    got = blast.parse_lockfile(text)
+    assert len(got) == 25_000
+    assert (time.perf_counter() - t0) < 10
+
+
+def test_lockfile_entries_without_versions_are_skipped():
+    lock = {"lockfileVersion": 3, "packages": {
+        "node_modules/a": {"version": "1.0.0"},
+        "node_modules/b": {},                       # link/workspace stub
+        "node_modules/c": "not-a-dict",
+    }}
+    assert blast.parse_lockfile(json.dumps(lock)) == {"a": "1.0.0"}
+
+
+# --------------------------------------------------------------------------
+# 3. graph queries
+# --------------------------------------------------------------------------
+
+def test_nid_is_stable_and_in_range():
+    assert nid("left-pad") == nid("left-pad")
+    assert nid("left-pad") != nid("left-pads")
+    for name in ("a", "@types/node", "debug", "x" * 214):
+        assert 0 <= nid(name) < 2 ** 53 - 1
+
+
+def test_nid_no_collisions_across_the_crawled_corpus(db):
+    """The whole id scheme rests on this. Check it against every real name."""
+    names = [r[0] for r in db.execute("SELECT name FROM packages")]
+    ids = {}
+    for n in names:
+        i = nid(n)
+        assert ids.setdefault(i, n) == n, f"collision: {ids[i]!r} vs {n!r} -> {i}"
+    assert db.execute("SELECT count(*) FROM collisions").fetchone()[0] == 0
+
+
+def test_unknown_package_is_absent_not_empty(hydra):
+    known, _ = blast.resolve_package(hydra, "definitely-not-a-real-package-zzz-9182")
+    assert known is False
+
+
+def test_known_package_resolves(hydra, seeded):
+    known, ms = blast.resolve_package(hydra, seeded)
+    assert known is True
+    assert ms >= 0
+
+
+@pytest.mark.parametrize("depth", [1, 2, 3, 4, 5, 6])
+def test_blast_radius_at_each_depth(hydra, seeded, depth):
+    r, ms = blast.blast_radius(hydra, seeded, depth)
+    assert len(r["histogram"]) == depth
+    assert r["depth"] == depth
+    assert r["total"] >= 0
+    assert ms > 0
+    # The listed victims must agree with the count, not be a truncated page.
+    if not r["truncated"]:
+        assert len(r["victims"]) == r["total"]
+
+
+def test_blast_radius_is_monotonic_in_depth(hydra, seeded):
+    """Reach can only grow as the bound grows. If it shrinks, the differencing
+    that builds the histogram is measuring something other than reachability."""
+    totals = [blast.blast_radius(hydra, seeded, d)[0]["total"] for d in (1, 2, 3, 4)]
+    assert totals == sorted(totals)
+    assert all(t >= 0 for t in totals)
+
+
+def test_histogram_sums_to_total(hydra, seeded):
+    r, _ = blast.blast_radius(hydra, seeded, 5)
+    assert sum(h["packages"] for h in r["histogram"]) == r["total"]
+
+
+def test_blast_radius_rejects_absurd_depth(hydra, seeded):
+    for bad in (0, -1, 99):
+        with pytest.raises(ValueError):
+            blast.blast_radius(hydra, seeded, bad)
+
+
+def test_package_with_no_dependents(hydra, db):
+    """A leaf: in the graph, but nothing requires it. Must be 0, not an error."""
+    row = db.execute(
+        """SELECT p.name FROM packages p
+           WHERE p.crawled = 1
+             AND NOT EXISTS (SELECT 1 FROM deps d WHERE d.dst = p.name)
+           LIMIT 1""").fetchone()
+    if not row:
+        pytest.skip("every crawled package has at least one dependent")
+    r, _ = blast.blast_radius(hydra, row[0], 5)
+    assert r["total"] == 0
+    assert r["victims"] == []
+    assert all(h["packages"] == 0 for h in r["histogram"])
+
+
+def test_cycle_terminates(hydra):
+    """a -> b -> c -> a. A traversal that treats this as paths rather than
+    reachability would not come back."""
+    names = ["_cycle_a", "_cycle_b", "_cycle_c"]
+    ids = [nid(n) for n in names]
+    try:
+        hydra.query("UNWIND $rows AS row MERGE (p {id: row.id}) SET p:Package, p.name = row.name",
+                    {"rows": [{"id": nid(n), "name": n} for n in names]})
+        hydra.query("UNWIND $rows AS row CREATE (a {id: row.src})-[:REQUIRED_BY]->(b {id: row.dst})",
+                    {"rows": [{"src": ids[0], "dst": ids[1]},
+                              {"src": ids[1], "dst": ids[2]},
+                              {"src": ids[2], "dst": ids[0]}]})
+        r, ms = blast.blast_radius(hydra, "_cycle_a", 6)
+        # Reachable set is {b, c, a} — a is reachable from itself around the loop.
+        assert r["total"] <= 3
+        assert "_cycle_b" in r["victims"] and "_cycle_c" in r["victims"]
+        assert ms < 30_000
+    finally:
+        for i in ids:
+            try:
+                hydra.query("MATCH (p {id: $id}) DETACH DELETE p", {"id": i})
+            except HydraError:
+                pass
+
+
+def test_self_loop_terminates(hydra):
+    i = nid("_selfloop")
+    try:
+        hydra.query("UNWIND $rows AS row MERGE (p {id: row.id}) SET p:Package, p.name = row.name",
+                    {"rows": [{"id": i, "name": "_selfloop"}]})
+        hydra.query("UNWIND $rows AS row CREATE (a {id: row.src})-[:REQUIRED_BY]->(b {id: row.dst})",
+                    {"rows": [{"src": i, "dst": i}]})
+        r, _ = blast.blast_radius(hydra, "_selfloop", 5)
+        assert r["total"] <= 1
+    finally:
+        try:
+            hydra.query("MATCH (p {id: $id}) DETACH DELETE p", {"id": i})
+        except HydraError:
+            pass
+
+
+def test_pagination_returns_more_than_one_page(hydra, db):
+    """HydraDB pages at 1024 rows. Find a package with a bigger reach and check
+    the client stitched the pages rather than stopping at the first."""
+    row = db.execute(
+        "SELECT dst, count(*) c FROM deps WHERE kind='prod' GROUP BY dst "
+        "ORDER BY c DESC LIMIT 1").fetchone()
+    if not row:
+        pytest.skip("no dependency edges")
+    r, _ = blast.blast_radius(hydra, row[0], 5, limit=100_000)
+    if r["total"] <= 1024:
+        pytest.skip(f"widest package {row[0]!r} reaches only {r['total']}")
+    assert len(r["victims"]) == r["total"] > 1024
+    assert len(set(r["victims"])) == len(r["victims"])
+
+
+# --------------------------------------------------------------------------
+# 4. sidecar-backed queries
+# --------------------------------------------------------------------------
+
+def test_would_resolve_splits_exposed_from_pinned(db):
+    row = db.execute(
+        "SELECT dep FROM release_deps WHERE range LIKE '^%' GROUP BY dep "
+        "ORDER BY count(*) DESC LIMIT 1").fetchone()
+    if not row:
+        pytest.skip("no caret ranges in the sidecar")
+    r, ms = blast.would_resolve(db, row[0], "999.0.0")
+    assert r["checked"] > 0
+    assert ms >= 0
+    # A caret range cannot admit 999.0.0, but `*`, `latest` and `>=x` all can,
+    # so the exposed bucket is not expected to be empty — every member of it
+    # must simply be there for a reason semver agrees with.
+    for e in r["exposed"]:
+        assert any(blast.satisfies("999.0.0", rng) for rng in e["ranges"]), e
+    for sh in r["shielded"]:
+        assert not any(blast.satisfies("999.0.0", rng) for rng in sh["ranges"]), sh
+    # Every name appears in exactly one bucket.
+    assert not ({e["name"] for e in r["exposed"]} & {s["name"] for s in r["shielded"]})
+
+
+def test_would_resolve_finds_real_exposure(db):
+    row = db.execute(
+        "SELECT dep, range FROM release_deps WHERE range LIKE '^_._._' "
+        "AND dep NOT LIKE '@%' LIMIT 1").fetchone()
+    if not row:
+        pytest.skip("no simple caret range to probe")
+    dep, rng = row
+    r, _ = blast.would_resolve(db, dep, rng.lstrip("^"))
+    assert r["exposed_count"] >= 1, f"{rng} must admit its own base version"
+
+
+def test_search_prefix(db):
+    rows, ms = blast.search(db, "deb", 10)
+    assert rows and all(r["name"].startswith("deb") for r in rows)
+    assert ms >= 0
+
+
+def test_search_escapes_wildcards(db):
+    """A bare % would otherwise match every package in the corpus."""
+    rows, _ = blast.search(db, "%", 10)
+    assert rows == []
+
+
+def test_maintainer_pivot(db):
+    row = db.execute(
+        "SELECT package FROM maintainers GROUP BY package HAVING count(*) >= 1 "
+        "LIMIT 1").fetchone()
+    if not row:
+        pytest.skip("no maintainer rows")
+    r, ms = blast.maintainer_pivot(db, row[0])
+    assert r["maintainers"]
+    assert row[0] not in [s["package"] for s in r["also_controls"]]
+    assert ms >= 0
+
+
+def test_shortest_path_reconstruction(db):
+    edge = db.execute("SELECT src, dst FROM deps WHERE kind='prod' LIMIT 1").fetchone()
+    if not edge:
+        pytest.skip("no edges")
+    src, dst = edge
+    chain = blast.shortest_path(db, [src], dst)
+    assert chain and chain[0] == src and chain[-1] == dst
+
+
+def test_typosquat_ring(db):
+    r, ms = blast.typosquat_ring(db, "express")
+    assert r["candidates"] > 0
+    assert all(h["name"] != "express" for h in r["existing"])
+    assert ms >= 0
+
+
+# --------------------------------------------------------------------------
+# 5. HTTP API
+# --------------------------------------------------------------------------
+
+def test_api_stats(requests_mod):
+    r = requests_mod.get(f"{BASE}/api/stats", timeout=30)
+    assert r.status_code == 200
+    d = r.json()
+    assert d["packages"] > 0 and d["edges"] > 0
+    assert "crawl" in d and "latency_ms" in d
+
+
+def test_api_stats_is_fast(requests_mod):
+    """It sits behind a 4-second browser poll; a full graph scan here would
+    wedge the page, which is why the scan moved to a background thread."""
+    t0 = time.perf_counter()
+    requests_mod.get(f"{BASE}/api/stats", timeout=30)
+    assert (time.perf_counter() - t0) < 3.0
+
+
+def test_api_blast_happy(requests_mod, seeded):
+    d = requests_mod.get(f"{BASE}/api/blast",
+                         params={"name": seeded, "depth": 3}, timeout=120).json()
+    assert d["name"] == seeded
+    assert len(d["histogram"]) == 3
+    assert d["latency_ms"] > 0
+    assert d["vertex_id"] == nid(seeded)
+
+
+def test_api_blast_unknown_package_is_404_with_explanation(requests_mod):
+    r = requests_mod.get(f"{BASE}/api/blast",
+                         params={"name": "no-such-package-zzz-9182"}, timeout=60)
+    assert r.status_code == 404
+    d = r.json()
+    assert d["error"] == "not_in_graph"
+    assert "message" in d and d["name"] == "no-such-package-zzz-9182"
+
+
+def test_api_blast_missing_param(requests_mod):
+    assert requests_mod.get(f"{BASE}/api/blast", timeout=30).status_code == 422
+
+
+@pytest.mark.parametrize("depth", [0, 99, -3, 9])
+def test_api_blast_rejects_out_of_range_depth(requests_mod, seeded, depth):
+    r = requests_mod.get(f"{BASE}/api/blast",
+                         params={"name": seeded, "depth": depth}, timeout=30)
+    assert r.status_code == 422
+
+
+def test_api_resolve(requests_mod, seeded):
+    d = requests_mod.get(f"{BASE}/api/resolve",
+                         params={"name": seeded, "bad_version": "999.0.0"},
+                         timeout=60).json()
+    assert d["checked"] >= 0
+    assert d["exposed_count"] + d["shielded_count"] <= d["checked"]
+    # Anything counted as exposed to 999.0.0 got there through an open range.
+    for e in d["exposed"]:
+        assert any(blast.satisfies("999.0.0", rng) for rng in e["ranges"]), e
+
+
+def test_api_resolve_missing_version(requests_mod, seeded):
+    r = requests_mod.get(f"{BASE}/api/resolve", params={"name": seeded}, timeout=30)
+    assert r.status_code == 422
+
+
+def test_api_maintainers(requests_mod, seeded):
+    d = requests_mod.get(f"{BASE}/api/maintainers",
+                         params={"name": seeded}, timeout=60).json()
+    assert "also_controls" in d and "latency_ms" in d
+
+
+def test_api_search(requests_mod):
+    d = requests_mod.get(f"{BASE}/api/search", params={"q": "expr"}, timeout=30).json()
+    assert d["results"]
+
+
+def test_api_search_blank_is_empty_not_error(requests_mod):
+    d = requests_mod.get(f"{BASE}/api/search", params={"q": "   "}, timeout=30).json()
+    assert d["results"] == []
+
+
+def _fixture(name):
+    path = os.path.join(FIXTURES, name)
+    if not os.path.exists(path):
+        pytest.skip(f"missing fixture {name}")
+    return open(path, "rb").read()
+
+
+def test_api_lockfile_exposed(requests_mod, seeded):
+    lock = json.dumps({"lockfileVersion": 3, "packages": {
+        "": {"name": "t", "version": "1.0.0"},
+        f"node_modules/{seeded}": {"version": "1.0.0"}}})
+    d = requests_mod.post(f"{BASE}/api/lockfile", params={"name": seeded},
+                          data=lock.encode(), timeout=120).json()
+    assert d["verdict"] == "EXPOSED"
+    assert d["direct"]["version"] == "1.0.0"
+
+
+def test_api_lockfile_clear(requests_mod, seeded):
+    lock = json.dumps({"lockfileVersion": 3, "packages": {
+        "node_modules/totally-unrelated-zzz-9182": {"version": "1.0.0"}}})
+    d = requests_mod.post(f"{BASE}/api/lockfile", params={"name": seeded},
+                          data=lock.encode(), timeout=120).json()
+    assert d["verdict"] == "CLEAR"
+    assert d["affected_count"] == 0
+
+
+def test_api_lockfile_shielded_by_pin(requests_mod, seeded):
+    lock = json.dumps({"lockfileVersion": 3, "packages": {
+        f"node_modules/{seeded}": {"version": "1.0.0"}}})
+    d = requests_mod.post(f"{BASE}/api/lockfile",
+                          params={"name": seeded, "bad_version": "99.99.99"},
+                          data=lock.encode(), timeout=120).json()
+    assert d["verdict"] == "SHIELDED"
+
+
+def test_api_lockfile_malformed(requests_mod, seeded):
+    r = requests_mod.post(f"{BASE}/api/lockfile", params={"name": seeded},
+                          data=b"not json", timeout=60)
+    assert r.status_code == 400
+    assert "not valid JSON" in r.json()["error"]
+
+
+def test_api_lockfile_empty_body(requests_mod, seeded):
+    r = requests_mod.post(f"{BASE}/api/lockfile", params={"name": seeded},
+                          data=b"", timeout=60)
+    assert r.status_code == 400
+
+
+def test_api_lockfile_v1_fixture(requests_mod):
+    body = _fixture("lock-v1.json")
+    d = requests_mod.post(f"{BASE}/api/lockfile",
+                          params={"name": "debug", "bad_version": "2.6.9"},
+                          data=body, timeout=120).json()
+    assert d["verdict"] in ("EXPOSED", "SHIELDED", "CLEAR")
+    assert d["resolved_count"] == 3
+
+
+def test_api_serves_the_console(requests_mod):
+    for path, needle in (("/", b"blast radius"), ("/app.js", b"draggable"),
+                         ("/style.css", b"--paper")):
+        r = requests_mod.get(f"{BASE}{path}", timeout=30)
+        assert r.status_code == 200 and needle in r.content
+
+
+# --------------------------------------------------------------------------
+# 6. the console, in a real browser
+# --------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def page(requests_mod):
+    sync_playwright = pytest.importorskip(
+        "playwright.sync_api", reason="playwright not installed").sync_playwright
+    pw = sync_playwright().start()
+    try:
+        browser = pw.chromium.launch(channel="chrome", headless=True)
+    except Exception as e:
+        pw.stop()
+        pytest.skip(f"no Chrome for Playwright: {e}")
+    pg = browser.new_page(viewport={"width": 1600, "height": 1100})
+    pg.errors = []
+    pg.on("console", lambda m: pg.errors.append(m.text) if m.type == "error" else None)
+    pg.on("pageerror", lambda e: pg.errors.append(str(e)))
+    # networkidle never fires — the header polls /api/stats every 4 seconds.
+    pg.goto(BASE, wait_until="domcontentloaded")
+    pg.wait_for_selector("#peek-hist .skel", state="detached", timeout=40_000)
+    yield pg
+    browser.close()
+    pw.stop()
+
+
+def test_ui_loads_with_live_stats(page):
+    assert "connecting" not in page.text_content("#statline")
+    assert "packages" in page.text_content("#statline")
+    assert page.get_attribute("#pulse", "class") == "pulse live"
+
+
+def test_ui_hero_previews_hold_real_numbers(page):
+    text = page.text_content("#peek-graph")
+    assert "packages" in text and any(c.isdigit() for c in text)
+
+
+def test_ui_query_renders_results(page):
+    page.click(".chip")
+    page.wait_for_function("document.querySelector('#latency').textContent !== '—'",
+                           timeout=90_000)
+    page.wait_for_timeout(1200)
+    assert page.text_content("#latency").endswith("ms")
+    assert page.eval_on_selector_all(".hrow", "e => e.length") == 5
+    # Bars must actually paint: .fill is not a grid item and would stay inline.
+    widths = page.eval_on_selector_all(
+        ".hrow .fill", "els => els.map(e => getComputedStyle(e).width)")
+    assert any(w != "0px" and w != "auto" for w in widths), widths
+    assert page.eval_on_selector_all("#victims .r", "e => e.length") > 0
+
+
+def test_ui_windows_drag(page):
+    # A previous test smooth-scrolls the results into view; measuring a
+    # bounding box mid-scroll aims the drag at where the window used to be.
+    page.evaluate("window.scrollTo({top: 0, behavior: 'instant'})")
+    page.wait_for_function("window.scrollY === 0", timeout=10_000)
+    page.wait_for_timeout(250)
+    handle = page.query_selector(".scatter .win .bar")
+    if not handle:
+        pytest.skip("scatter hidden at this viewport")
+    before = page.eval_on_selector(".scatter .win", "el => el.style.transform")
+    bb = handle.bounding_box()
+    page.mouse.move(bb["x"] + bb["width"] / 2, bb["y"] + bb["height"] / 2)
+    page.mouse.down()
+    page.mouse.move(bb["x"] + bb["width"] / 2 + 110, bb["y"] + bb["height"] / 2 + 70,
+                    steps=10)
+    page.mouse.up()
+    after = page.eval_on_selector(".scatter .win", "el => el.style.transform")
+    assert before != after, "title-bar drag did not move the window"
+
+
+def test_ui_lockfile_drop(page):
+    path = os.path.join(FIXTURES, "lock-v3.json")
+    if not os.path.exists(path):
+        pytest.skip("missing lock-v3.json fixture")
+    page.fill("#pkg", "debug")
+    page.fill("#ver", "2.6.9")
+    page.set_input_files("#file", path)
+    page.wait_for_function(
+        "document.querySelector('#verdict .word')?.textContent?.match(/EXPOSED|SHIELDED|CLEAR/)",
+        timeout=90_000)
+    assert page.text_content("#verdict .word") in ("EXPOSED", "SHIELDED", "CLEAR")
+
+
+def test_ui_no_console_errors(page):
+    """Runs last: by now the page has loaded, queried, dragged and scanned."""
+    assert page.errors == [], page.errors
