@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 
 import blast
 import intel
+import scan
 from hydra import Hydra, HydraError, nid
 from ingest import DEPS_DB, SIDECAR_SCHEMA
 
@@ -431,6 +432,19 @@ def api_intel(name: str = Query(..., min_length=1, max_length=214),
     result["in_graph"] = row is not None
     result["blast_radius_available"] = bool(row and row[0])
     return JSONResponse(result, status_code=200 if result.get("exists") else 404)
+
+
+@app.get("/api/scan")
+def api_scan(name: str = Query(..., min_length=1, max_length=214),
+             version: str = Query(..., min_length=1, max_length=64),
+             against: str | None = Query(None, max_length=64)):
+    """Download the published tarball and read it. Optionally diff a release.
+
+    Slow by nature — it fetches and unpacks real bytes — so it is deliberately
+    a separate call the console makes on demand rather than part of a query.
+    """
+    result = scan.scan(name, version, against)
+    return JSONResponse(result, status_code=200 if result.get("ok") else 422)
 
 
 @app.get("/api/fix")
