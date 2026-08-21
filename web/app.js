@@ -365,6 +365,13 @@ async function runQuery(name, version) {
     $('#verdictline').innerHTML =
       `<b>${esc(name)}</b>${version ? '@' + esc(version) : ''} — ${num(b.total)} packages transitively depend on it`;
 
+    // A partial graph produces a real number that is too small, and at the
+    // extreme a confident zero. Never render that as an all-clear.
+    if (b.coverage && b.coverage.complete === false) {
+      $('#verdictline').innerHTML +=
+        `<div class="note" style="margin-top:10px">${esc(b.coverage.message)}</div>`;
+    }
+
     renderHistogram(b.histogram);
     renderVictims(b);
   } catch (err) {
