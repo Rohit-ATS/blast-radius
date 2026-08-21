@@ -44,6 +44,178 @@ VERTEX_BATCH = 1_000
 EDGE_BATCH = 1_000
 
 
+# Packages whose dependents are loaded whatever the budget says.
+#
+# A bounded rebuild spends its edges most-depended-upon first, which is the
+# right instinct — during an incident people ask about packages a lot of things
+# depend on — but applied alone it is precisely wrong for this tool. Measured at
+# REHYDRATE_MAX_EDGES=55000, the cut lands at 28 dependents, and every package
+# below that line has *no* edges at all. Look at what that excludes:
+#
+#     debug           746 dependents    in
+#     chalk           871 dependents    in
+#     ua-parser-js     16 dependents    OUT
+#     rc               12 dependents    OUT
+#     event-stream     11 dependents    OUT
+#     coa               1 dependent     OUT
+#     node-ipc          1 dependent     OUT
+#
+# That is a list of actual npm supply-chain compromises, and popularity ranking
+# drops all of them. It is not bad luck: attackers pick small packages buried in
+# the tree, because those are the ones nobody is watching — which is the same
+# property that puts them below any popularity cutoff. Ranking by dependents
+# systematically evicts exactly the packages this tool was built to answer for.
+#
+# So they are pinned, and their whole reverse closure is pinned with them — see
+# PIN_MAX_EDGES. Measured against the 55,000-edge budget, holding every one of
+# the evicted packages complete to depth 5 costs 1,000 edges, under 2% of the
+# budget. Which is the whole point: being unpopular is what put them below the
+# cut, and it is the same thing that makes them nearly free to keep.
+#
+# REHYDRATE_PIN (comma-separated) adds to this list; set it when an incident
+# breaks and the package is not yet here.
+PINNED = (
+    "event-stream", "flatmap-stream",   # Nov 2018, the bitcoin-wallet backdoor
+    "eslint-scope",                     # Jul 2018, stolen npm credentials
+    "getcookies",                       # May 2018, backdoor via express-cookies
+    "ua-parser-js",                     # Oct 2021, maintainer account takeover
+    "coa", "rc",                        # Nov 2021, the same week, same method
+    "node-ipc",                         # Mar 2022, protestware from the author
+    "colors", "faker",                  # Jan 2022, sabotaged by the author
+    "debug", "chalk",                   # Sep 2025, the phishing-led takeover
+)
+
+
+def pinned_packages() -> list[str]:
+    extra = os.environ.get("REHYDRATE_PIN", "")
+    names = list(PINNED) + [p.strip() for p in extra.split(",") if p.strip()]
+    seen, out = set(), []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+# How far the pinned set is chased, and how much it may spend doing it.
+#
+# Direct dependents are not enough. Pinning only those gave event-stream its 11
+# direct dependents and stopped, so the console answered 11 against a true blast
+# radius of 26 — better than the 0 it answered before, and still wrong, because
+# the dependents *of* those 11 were never loaded. A traversal is only as deep as
+# the edges under it.
+#
+# So the closure is chased to exhaustion — not to a fixed depth. A depth limit
+# here has to be at least the deepest traversal the API will accept, and that is
+# blast.MAX_DEPTH = 8, not the 5 the console asks for; pinning to 5 and then
+# telling a depth-8 query its answer was exact is the same false confidence
+# this whole mechanism exists to prevent. Running the walk out has no downside
+# because it terminates on its own — `seen` closes the cycles — and PIN_MAX_EDGES
+# bounds it regardless.
+#
+# For the packages this list exists for that is nearly free: the entire reverse
+# closure of event-stream is 33 edges, ua-parser-js 134, rc 67 — cheap for the
+# same reason their direct sets were, which is that nothing much depends on them.
+#
+# The cap is what makes it safe to put a popular package in PINNED anyway.
+# debug's closure is 9,755 edges and chalk's is 4,241, which would be a sixth of
+# the entire budget spent re-buying edges the popularity ranking already bought.
+# So pins are walked cheapest-first and the walk stops at PIN_MAX_EDGES: the
+# small incident packages — the ones the ranking actually drops — are served
+# completely, and the popular ones are left to the budget that mostly covers
+# them already.
+#
+# Verified against the sidecar at REHYDRATE_MAX_EDGES=55000. Every package the
+# ranking evicted now answers exactly, and the walk stops inside debug:
+#
+#     coa 3, node-ipc 1, faker 2, event-stream 26, rc 61,
+#     eslint-scope 260, ua-parser-js 83, colors 162     — all exact
+#     debug, chalk                                      — left to the budget
+#
+# `debug` and `chalk` stay partial on a bounded instance, and /api/blast says so
+# on the response rather than presenting a floor as a total. See coverage_check
+# in server.py.
+PIN_MAX_EDGES = 1_000
+FRONTIER_CHUNK = 400        # keeps the IN list under sqlite's parameter limit
+
+
+def _pin_order(conn, pins: list[str]) -> list[str]:
+    """Pinned packages cheapest-first, by direct dependent count.
+
+    Ascending is the whole trick. The packages at the front are the ones the
+    popularity ranking evicted, and they are also the ones whose closures cost
+    almost nothing — so they are all served long before the cap is in sight.
+    """
+    counts = {}
+    for i in range(0, len(pins), FRONTIER_CHUNK):
+        chunk = pins[i:i + FRONTIER_CHUNK]
+        marks = ",".join("?" for _ in chunk)
+        for name, n in conn.execute(
+                f"SELECT dst, count(*) FROM deps "
+                f"WHERE kind = 'prod' AND dst IN ({marks}) GROUP BY dst",
+                tuple(chunk)):
+            counts[name] = n
+    return sorted((p for p in pins if p in counts), key=lambda p: counts[p])
+
+
+def pinned_edges(conn, have: set, pins: list[str],
+                 log=print) -> tuple[list[tuple], list[str]]:
+    """Reverse closure of the pinned set, minus what the budget already holds.
+
+    Returns the edges added and the names whose closure was walked to the end.
+    That second list is the point of the exercise: it is the set the API can
+    describe as exact on an otherwise bounded graph, so `coverage_check` can
+    stop warning that a number is a floor when it is not. A pin the cap cut
+    short is deliberately absent from it.
+    """
+    cap = int(os.environ.get("REHYDRATE_PIN_MAX_EDGES") or PIN_MAX_EDGES)
+    added: list[tuple] = []
+    complete: list[str] = []
+    stopped_at = None
+
+    for name in _pin_order(conn, pins):
+        if len(added) >= cap:
+            stopped_at = stopped_at or name
+            break
+        seen, frontier = {name}, [name]
+        while frontier and len(added) < cap:
+            rows = []
+            for i in range(0, len(frontier), FRONTIER_CHUNK):
+                chunk = frontier[i:i + FRONTIER_CHUNK]
+                marks = ",".join("?" for _ in chunk)
+                rows.extend(tuple(r) for r in conn.execute(
+                    f"SELECT d.dst, d.src FROM deps d "
+                    f"WHERE d.kind = 'prod' AND d.dst IN ({marks})",
+                    tuple(chunk)))
+            nxt = []
+            for edge in rows:
+                # Checked per edge, not per level. Checking between levels let a
+                # single level of a popular package overshoot a 2,500 cap to
+                # 4,488 — the cap has to bind where the spending happens.
+                if len(added) >= cap:
+                    stopped_at = stopped_at or name
+                    break
+                if edge not in have:
+                    have.add(edge)
+                    added.append(edge)
+                dependent = edge[1]
+                if dependent not in seen:
+                    seen.add(dependent)
+                    nxt.append(dependent)
+            frontier = nxt
+        # Walked the whole closure without the cap biting, so this one is exact
+        # at any depth the API accepts.
+        if len(added) < cap:
+            complete.append(name)
+
+    if stopped_at:
+        # Said out loud rather than left implicit. A silently truncated pin set
+        # reads exactly like a complete one from the outside.
+        log(f"[rehydrate] pin budget of {cap} edges reached at '{stopped_at}'; "
+            f"the popular pins past it are left to the main budget")
+    return added, complete
+
+
 # Anchored on a single id rather than `MATCH ()-[r:REQUIRED_BY]->()`. The
 # anonymous form is a full scan — HydraDB says so itself ("access_path
 # AllVertexScan") and there is no CREATE INDEX in 0.1.0 to fix it with, so it
@@ -133,6 +305,39 @@ def _paced(h: Hydra, cypher, rows, log, label: str) -> int:
     return total
 
 
+# Where the rebuild leaves a note for the API process.
+#
+# The two share a container but not an address space, and the API cannot work
+# out on its own which packages this rebuild managed to hold complete — it would
+# have to walk the sidecar's closure per request, which is the traversal the
+# graph exists to avoid. So the loader writes down what it did.
+#
+# Without this the API has to be conservative and warn that *every* answer on a
+# bounded graph is a floor, which is true in general and false for exactly the
+# packages the pinning went to the trouble of completing. Warning that
+# event-stream's 26 might be an undercount, when it is the same 26 the full
+# graph gives, trains people to ignore the warning that matters.
+MANIFEST = os.environ.get("REHYDRATE_MANIFEST") or os.path.join(
+    os.environ.get("GRAPH_DIR", "/data"), "rehydrate.json")
+
+
+def write_manifest(*, bounded: bool, edges: int, vertices: int,
+                   exact: list[str], log=print) -> None:
+    import json
+    payload = {"bounded": bounded, "edges": edges, "vertices": vertices,
+               "exact": sorted(exact), "at": time.time()}
+    try:
+        os.makedirs(os.path.dirname(MANIFEST), exist_ok=True)
+        tmp = MANIFEST + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, MANIFEST)         # never leave a half-written manifest
+    except OSError as e:
+        # Not fatal. A missing manifest costs precision in the coverage note,
+        # not correctness: the API falls back to warning about the whole graph.
+        log(f"[rehydrate] could not write {MANIFEST}: {e}")
+
+
 def run(h: Hydra, log=print, limit: int | None = None) -> dict:
     """Replay the sidecar's topology into the graph. Returns what it did."""
     if limit is None:
@@ -201,6 +406,27 @@ def run(h: Hydra, log=print, limit: int | None = None) -> dict:
         # vertex, `known()` reports it as not in the graph, and the API says so
         # instead of inventing a reassuring zero.
         edges = list(cur)
+
+        # The pinned set, added on top of the budget rather than inside it.
+        #
+        # Only meaningful when the rebuild is bounded — an unbounded one already
+        # holds every edge, and these queries return rows it has. Deduped
+        # against what the budget already bought, so pinning `debug` (which is
+        # popular enough to be loaded anyway) costs nothing and is not an error.
+        # See PINNED for why popularity ranking cannot be trusted to keep these.
+        pins = pinned_packages() if limit is not None else []
+        exact: list[str] = []
+        if pins:
+            # Normalised to tuples on both sides: sqlite3 and psycopg hand back
+            # different row objects, and only one of them compares equal to a
+            # plain tuple.
+            have = {tuple(r) for r in edges}
+            extra, exact = pinned_edges(conn, have, pins, log)
+            if extra:
+                edges.extend(extra)
+                log(f"[rehydrate] +{len(extra)} pinned edges so the incident "
+                    f"packages the popularity cut drops answer completely")
+
         names = {n for pair in edges for n in pair}
         log(f"[rehydrate] {len(edges)} edges touching {len(names)} packages")
 
@@ -218,6 +444,8 @@ def run(h: Hydra, log=print, limit: int | None = None) -> dict:
 
         took = time.perf_counter() - t0
         log(f"[rehydrate] {sent_v} vertices, {sent_e} edges in {took:.1f}s")
+        write_manifest(bounded=limit is not None, edges=sent_e,
+                       vertices=sent_v, exact=exact, log=log)
         return {"vertices": sent_v, "edges": sent_e, "seconds": round(took, 1)}
     finally:
         conn.close()
