@@ -28,6 +28,7 @@ from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
 
 import accounts
+import apidocs_page
 import apimeta
 import blast
 import chains
@@ -126,6 +127,12 @@ _registry = watchmod.Registry(hydra=hydra)
 # Its routes live in their own module so this file does not grow a third
 # concern; see constraints.py.
 app.include_router(constraints.router)
+
+# Serve the API reference from vendored assets instead of a third-party CDN.
+# Brave, uBlock and corporate proxies block cdn.jsdelivr.net, which renders the
+# docs blank behind a 200 — a server that looks healthy and a page that shows
+# nothing. Falls back to FastAPI's own page if the assets are not vendored.
+_docs_local = apidocs_page.install(app)
 
 # Demo safety. DEMO_MODE=1 serves captured real responses for the preset
 # incidents, so a recording is deterministic and instant. Independently of that
@@ -297,8 +304,40 @@ def fail(message: str, status: int = 400, code: str = "bad_request", **extra):
                         status_code=status)
 
 
+# A graph outage is sticky, and rediscovering it costs the caller real time.
+#
+# hydra.query retries five times with jittered backoff, which is right for a
+# cold database and wrong for one that is simply absent: every request pays
+# ~20s to learn what the previous request already found out. On the endpoints
+# that can answer without the graph that delay is pure loss — the answer was
+# available immediately and we made the user wait for a timeout to prove it.
+#
+# So failures are remembered briefly. Within the cooldown, code that has a
+# graph-free answer takes it directly. This never suppresses a real result:
+# it only skips an attempt that just failed, and the window is short enough
+# that a recovering graph is picked up on the next request.
+_GRAPH_DOWN_COOLDOWN = 30.0
+_graph_failed_at = 0.0
+
+
+def note_graph_failure() -> None:
+    global _graph_failed_at
+    _graph_failed_at = time.monotonic()
+
+
+def note_graph_success() -> None:
+    global _graph_failed_at
+    _graph_failed_at = 0.0
+
+
+def graph_probably_down() -> bool:
+    return (_graph_failed_at > 0.0
+            and (time.monotonic() - _graph_failed_at) < _GRAPH_DOWN_COOLDOWN)
+
+
 @app.exception_handler(HydraError)
 async def hydra_down(request: Request, exc: HydraError):
+    note_graph_failure()
     """Two different answers, because they mean different things to whoever is
     looking at the console: the database is here but still paging the store in
     (transient — 503 and come back), or it is gone (a failed dependency — 424,
@@ -446,9 +485,64 @@ _SOURCE = {
 }
 
 
+# Coverage is published on every response, so it is computed at most once a
+# minute rather than once a request.
+#
+# It costs two COUNT(*) queries. On SQLite that was free; on Postgres a count
+# is a sequential scan, and after the migration it is also two cross-region
+# round trips to Supabase — paid on every single API call, including the ones
+# that need no database at all. It measures a crawl that moves over hours, so
+# serving a value up to a minute old loses nothing real.
+_COVERAGE_TTL = 60.0
+_coverage_cache: tuple[float, dict | None] = (0.0, None)
+_coverage_lock = threading.Lock()
+
+
 def graph_coverage():
     """How much of npm the graph actually holds. Published on every response
     because it is the single honest caveat on any traversal answer."""
+    global _coverage_cache
+    at, cached = _coverage_cache
+    now = time.monotonic()
+    if cached is not None and (now - at) < _COVERAGE_TTL:
+        return cached
+    # Once a value exists, no request ever waits for the next one. The refresh
+    # runs on its own thread and the caller is served the previous number,
+    # which is at most a minute stale on a figure that moves over hours.
+    # Blocking the refreshing caller would mean one unlucky request per minute
+    # paying for everybody else's freshness.
+    if cached is not None:
+        if _coverage_lock.acquire(blocking=False):
+            threading.Thread(target=_refresh_coverage, daemon=True,
+                             name="coverage-refresh").start()
+        return cached
+
+    # Nothing cached yet — the first caller has to measure, or there is
+    # nothing honest to publish.
+    with _coverage_lock:
+        at, cached = _coverage_cache
+        if cached is not None:
+            return cached
+        fresh = _measure_coverage()
+        if fresh is not None:
+            _coverage_cache = (time.monotonic(), fresh)
+        return fresh
+
+
+def _refresh_coverage():
+    """Owns _coverage_lock on entry; releases it when done."""
+    global _coverage_cache
+    try:
+        fresh = _measure_coverage()
+        if fresh is not None:
+            _coverage_cache = (time.monotonic(), fresh)
+    except Exception:
+        pass  # keep serving the previous value
+    finally:
+        _coverage_lock.release()
+
+
+def _measure_coverage():
     try:
         with db() as conn:
             crawled = conn.execute(
@@ -706,7 +800,8 @@ def _warm_supervisor() -> None:
 def _start_background_threads():
     # Only DEMO_MODE needs them up front; otherwise they load on first use.
     n = load_demo() if DEMO_MODE else "lazy"
-    apimeta.log("startup", demo_mode=DEMO_MODE, fixtures=n,
+    apimeta.log("startup", docs="vendored" if _docs_local else "cdn",
+                demo_mode=DEMO_MODE, fixtures=n,
                 rate_limit=RATE_LIMIT,
                 hydra_url=HYDRA_URL, hydra_admin_url=hydra_admin_url())
     threading.Thread(target=_warm_supervisor, daemon=True, name="warm").start()
@@ -961,18 +1056,80 @@ async def api_lockfile(request: Request,
     except UnicodeDecodeError:
         return fail("lockfile is not valid UTF-8")
 
-    ok, ms_lookup = known(name)
-    if not ok:
-        return not_yet(name, ms_lookup)
+    # Parse before anything else. A malformed lockfile is the caller's problem
+    # and they should hear about it whatever the state of our own dependencies.
     try:
-        with db() as conn:
-            result, ms = blast.lockfile_exposure(hydra, conn, text, name,
-                                                 bad_version, depth)
+        resolved = blast.parse_lockfile(text)
     except json.JSONDecodeError as e:
         return fail(f"not valid JSON: {e}")
     except ValueError as e:
         return fail(str(e))
-    return {**result, "latency_ms": round(ms, 1)}
+
+    # The verdict does not need the graph, and making it wait for one was the
+    # bug. A lockfile is a complete, flattened record of everything the install
+    # actually resolved — that is its entire purpose — so "is this package in
+    # my tree, and at which version" is answerable from the file alone, and
+    # absence is conclusive rather than merely unobserved.
+    #
+    # What the graph adds is the explanation: which of your dependencies routes
+    # to it, and by what path. Valuable, and strictly secondary to the verdict.
+    # So the verdict is computed here and the paths are enrichment that is
+    # allowed to fail.
+    try:
+        if graph_probably_down():
+            raise HydraError("graph marked down by a recent failure")
+        with db() as conn:
+            result, ms = blast.lockfile_exposure(hydra, conn, text, name,
+                                                 bad_version, depth)
+        note_graph_success()
+
+        # Whether we have crawled this package decides how much the *paths* are
+        # worth, not whether there is an answer. Refusing to answer until the
+        # crawler reaches a package meant a fresh instance said "not crawled
+        # yet" about every package anyone asked for, while the lockfile in
+        # front of it already settled the question.
+        crawled, _ = known(name)
+        out = {**result, "latency_ms": round(ms, 1), "paths_complete": bool(crawled)}
+        if not crawled:
+            out["degraded"] = (
+                f"'{name}' has not been crawled yet, so the dependency paths "
+                f"below may be incomplete. The verdict is not affected — it "
+                f"comes from your lockfile, which records every package the "
+                f"install resolved.")
+        return out
+    except (HydraError, sqlite3.Error):
+        note_graph_failure()  # fall through to the lockfile-only answer below
+
+    pinned = resolved.get(name)
+    if pinned is None:
+        verdict, direct = "CLEAR", None
+    else:
+        direct = {"version": pinned,
+                  "malicious": bad_version is not None and pinned == bad_version}
+        verdict = ("EXPOSED" if (bad_version is None or direct["malicious"])
+                   else "SHIELDED")
+
+    return {
+        "verdict": verdict,
+        "resolved_count": len(resolved),
+        "compromised": name,
+        "bad_version": bad_version,
+        "direct": direct,
+        "affected": [],
+        "affected_count": 0,
+        "paths": ([{"entry": name, "path": [name], "depth": 0}]
+                  if pinned is not None else []),
+        "latency_ms": 0.0,
+        # The one thing the caller must not misread. CLEAR here still means the
+        # package is genuinely absent from the resolved tree — that much the
+        # lockfile proves on its own. What is missing is which of your
+        # dependencies would have routed to it, and by what path.
+        "paths_complete": False,
+        "degraded": "the dependency graph is unavailable, so the verdict below "
+                    "comes from your lockfile alone. It is accurate — a lockfile "
+                    "records every package the install resolved — but the "
+                    "dependency paths that explain it are not available.",
+    }
 
 
 @app.post("/api/audit")

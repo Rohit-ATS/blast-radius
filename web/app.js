@@ -404,7 +404,9 @@ async function scanLockfile(text, filename) {
       sub = `none of the ${num(r.resolved_count)} packages in <b>${esc(filename)}</b> reach ${esc(r.compromised)} within depth ${DEPTH}.`;
     }
     if (r.paths_complete === false) {
-      sub += ` <span style="color:var(--ink-3)">(from your lockfile alone — dependency paths unavailable)</span>`;
+      // The verdict is sound either way; only the explanation is partial. Say
+      // that precisely rather than implying the answer itself is provisional.
+      sub += ` <span style="color:var(--ink-3)">(verdict from your lockfile — dependency paths incomplete)</span>`;
     }
     verdict.innerHTML = `<div class="word">${r.verdict}</div><div class="sub">${sub}</div>`;
 
@@ -414,7 +416,11 @@ async function scanLockfile(text, filename) {
           `<span class="hop${i === p.path.length - 1 ? ' last' : ''}">${esc(h)}</span>`);
         return `<div class="pathrow">${hops.join('<span class="arrow">→</span>')}
                   <span style="color:var(--ink-3)"> · ${p.depth} hop${p.depth === 1 ? '' : 's'}</span></div>`;
-      }).join('') + `</div>`;
+      }).join('') + `</div>` +
+      // A partial path list looks exactly like a complete one. Without this the
+      // caveat is invisible precisely when paths exist to be misread.
+      (r.paths_complete === false && r.degraded
+        ? `<div class="note" style="margin-top:10px">${esc(r.degraded)}</div>` : '');
     } else if (r.paths_complete === false) {
       // Never print "no path reaches it" when we did not look. The verdict is
       // still sound — a lockfile records every package the install resolved —
