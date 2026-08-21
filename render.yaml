@@ -42,7 +42,16 @@ services:
     region: oregon
     dockerfilePath: ./Dockerfile
     dockerContext: .
-    dockerCommand: /usr/local/bin/app-entrypoint.sh web
+    # No dockerCommand. The image already resolves to exactly this —
+    # ENTRYPOINT ["/usr/local/bin/app-entrypoint.sh"] plus CMD ["web"] — and
+    # naming it here again only creates a way to be wrong. Docker appends a
+    # command to an ENTRYPOINT rather than replacing it, so under that reading
+    # `dockerCommand: /usr/local/bin/app-entrypoint.sh web` starts the
+    # container as
+    #     app-entrypoint.sh /usr/local/bin/app-entrypoint.sh web
+    # and the script exits 64 on `unknown role '/usr/local/bin/...'`. Verified
+    # by running the built image that way. Saying nothing is correct under both
+    # readings; saying it is correct under only one of them.
     autoDeploy: true
     branch: main
 

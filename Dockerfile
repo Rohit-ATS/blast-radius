@@ -83,6 +83,14 @@ RUN sed -i 's/\r$//' /usr/local/bin/app-entrypoint.sh \
 # The graph node writes here, and runs as 10001.
 RUN mkdir -p /data /app/state && chown -R 10001:10001 /data /app/state /app
 
+# $HOME is /home/graph in the upstream image and the directory is not in it.
+# Nothing needed it until gunicorn's control server did, which then failed at
+# every boot with
+#     [ERROR] Control server error: [Errno 13] Permission denied: '/home/graph'
+# — harmless in itself, and exactly the kind of standing ERROR that teaches
+# whoever reads these logs to skim past the line that eventually matters.
+RUN mkdir -p /home/graph && chown 10001:10001 /home/graph
+
 # A cold node exceeds its own query timeout on deep traversals without this.
 ENV RUST_MIN_STACK=33554432
 

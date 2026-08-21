@@ -1010,19 +1010,133 @@ def coverage_check(name: str, result: dict) -> dict | None:
 
     hist = {h["depth"]: h["packages"] for h in (result.get("histogram") or [])}
     direct = int(hist.get(1, 0))
-    if direct >= expected:
-        return None                       # the graph has them all
+    if direct < expected:
+        return {
+            "complete": False,
+            "direct_dependents_in_graph": direct,
+            "direct_dependents_known": expected,
+            "message": (
+                f"the graph holds {direct} of the {expected} packages that depend "
+                f"on '{name}' directly, so the number below is a floor, not the "
+                f"answer. This instance rebuilds a bounded subgraph to fit its "
+                f"memory; the packages with the most dependents are loaded "
+                f"first."),
+        }
 
-    return {
-        "complete": False,
-        "direct_dependents_in_graph": direct,
-        "direct_dependents_known": expected,
-        "message": (
-            f"the graph holds {direct} of the {expected} packages that depend on "
-            f"'{name}' directly, so the number below is a floor, not the answer. "
-            f"This instance rebuilds a bounded subgraph to fit its memory; the "
-            f"packages with the most dependents are loaded first."),
-    }
+    # The rebuild deliberately held this one's entire reverse closure, so the
+    # number is exact and nothing needs qualifying. See PINNED in rehydrate.py.
+    if name in _rebuild_exact():
+        return None
+
+    # Every direct dependent is here — which is not the same as the answer being
+    # complete, and reporting it as such was understating by 40% on the console's
+    # own default query.
+    #
+    # A blast radius is a walk, and it is only as deep as the edges under it. On
+    # a bounded graph a package can hold every one of its direct dependents and
+    # still be missing *their* dependents, so depth 2 and beyond come back short
+    # while depth 1 reconciles perfectly. Measured on the 55k-edge rebuild:
+    # `debug` reported 2,382 exposed against a true 3,900, with all 746 direct
+    # dependents present and this function returning "complete".
+    #
+    # There is no cheap exact answer — verifying the closure means walking the
+    # sidecar's 137,688 edges per request, which is the traversal the graph
+    # exists to avoid. But the *bound* is knowable for free, and a floor
+    # labelled as a floor is honest where an exact-looking number is not. So a
+    # bounded graph says so on any result that had somewhere further to go.
+    bound = _rebuild_bound() if any(hist.get(d, 0) for d in range(2, 6)) else None
+    if bound:
+        held, total = bound
+        return {
+            "complete": False,
+            "bounded_graph": True,
+            "direct_dependents_in_graph": direct,
+            "direct_dependents_known": expected,
+            "edges_in_graph": held,
+            "edges_known": total,
+            "message": (
+                f"every package that depends on '{name}' directly is in the "
+                f"graph, so depth 1 is exact. Beyond that it is a floor: this "
+                f"instance rebuilds {held:,} of {total:,} known dependency edges "
+                f"to fit its memory, so some packages further out are missing "
+                f"the edges that would have reached them."),
+        }
+    return None
+
+
+_BOUND_TTL = 300.0
+_bound_memo = {"at": 0.0, "total": None}
+_manifest_memo = {"at": 0.0, "value": None}
+
+
+def _rebuild_manifest() -> dict:
+    """What the boot rebuild wrote down about itself (rehydrate.py).
+
+    The API cannot work out on its own which packages a bounded rebuild managed
+    to hold complete — that would mean walking the sidecar's closure per
+    request, the traversal the graph exists to avoid — so the loader leaves a
+    note. Missing or unreadable yields `{}`, which is the conservative
+    direction: `coverage_check` then over-warns rather than over-claims.
+    """
+    now = time.monotonic()
+    if _manifest_memo["value"] is None or now - _manifest_memo["at"] > _BOUND_TTL:
+        value = {}
+        try:
+            path = os.environ.get("REHYDRATE_MANIFEST") or os.path.join(
+                os.environ.get("GRAPH_DIR", "/data"), "rehydrate.json")
+            with open(path, encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                value = loaded
+        except (OSError, ValueError):
+            pass
+        _manifest_memo.update(at=now, value=value)
+    return _manifest_memo["value"] or {}
+
+
+def _rebuild_exact() -> frozenset:
+    """Packages the rebuild holds complete — exact answers on a bounded graph.
+
+    A warning that fires on answers which are exact is how people learn to
+    ignore warnings, so these are excluded from the floor caveat.
+    """
+    return frozenset(_rebuild_manifest().get("exact") or ())
+
+
+def _rebuild_bound() -> tuple[int, int] | None:
+    """(edges rebuilt, edges known) when the graph is a bounded subgraph.
+
+    Read from the same environment the rebuild used rather than by counting the
+    graph, because counting edges in HydraDB 0.1.0 is a full scan — the exact
+    cost rehydrate.py refuses to pay once at boot, and this would pay it on
+    every request. `None` means the rebuild was unbounded, so every edge the
+    crawler has is present and nothing needs saying.
+
+    The env check is first so an unbounded deployment pays nothing at all here,
+    and the sidecar total is memoised: it moves only when the crawler writes,
+    which on this instance it does not.
+    """
+    raw = (os.environ.get("REHYDRATE_MAX_EDGES") or "").strip()
+    if not raw.isdigit() or int(raw) <= 0:
+        return None
+    # The manifest's count is what the graph actually holds; the env var is only
+    # the budget, and the pinned closures are loaded on top of it. Quoting the
+    # budget would understate the graph by exactly the edges added to make the
+    # incident packages exact.
+    held = int(_rebuild_manifest().get("edges") or raw)
+
+    now = time.monotonic()
+    if _bound_memo["total"] is None or now - _bound_memo["at"] > _BOUND_TTL:
+        try:
+            with db() as conn:
+                row = conn.execute(
+                    "SELECT count(*) FROM deps WHERE kind = 'prod'").fetchone()
+        except Exception:
+            return None               # never fail a good answer over this
+        _bound_memo.update(at=now, total=int(row[0]) if row else 0)
+
+    total = _bound_memo["total"]
+    return (held, total) if total and held < total else None
 
 
 @app.get("/api/blast")
