@@ -609,10 +609,51 @@ def end_session(token: str | None) -> None:
 # api keys
 # --------------------------------------------------------------------------
 
+# ---------------------------------------------------------------- key digests
+
+# API keys are not passwords, and the difference decides the algorithm.
+#
+# A password is low-entropy and human-chosen, so it needs a deliberately slow
+# KDF — that is what PBKDF2 is doing further down this file for the local
+# password store. A key here is `secrets.token_urlsafe(32)` reduced to 40
+# characters of [A-Za-z0-9]: on the order of 190 bits. No amount of hashing
+# speed makes that guessable, and running PBKDF2 over it would add its cost to
+# every single API request to defend against an attack that cannot happen.
+#
+# What a bare SHA-256 does leave open is an offline check: someone holding a
+# copy of this table can confirm a guessed key without touching the service.
+# The pepper closes that. It is HMAC rather than a concatenated salt because
+# HMAC is the construction designed for a keyed digest, and it is a single
+# server-side secret rather than a per-row salt because the lookup has to be an
+# indexed equality — a per-row salt would mean scanning the table on every
+# request to find out which row to compare against.
+#
+# BLAST_KEY_PEPPER unset falls back to a plain digest so the project still runs
+# with no configuration. Set it in production; see render.yaml.
+KEY_PEPPER = (config.get("BLAST_KEY_PEPPER") or "").encode()
+
+
+def key_digest(secret: str) -> str:
+    """The stored form of an API key. Never reversible, always constant-width."""
+    raw = secret.strip().encode()
+    if KEY_PEPPER:
+        return hmac.new(KEY_PEPPER, raw, hashlib.sha256).hexdigest()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _legacy_digest(secret: str) -> str:
+    """The unpeppered form, for keys issued before a pepper was configured.
+
+    Kept so that turning the pepper on does not invalidate every key already in
+    circulation. `resolve_key` upgrades a row the first time it sees one.
+    """
+    return hashlib.sha256(secret.strip().encode()).hexdigest()
+
+
 def create_key(account_id: str, name: str = "New key", ip: str = "", agent: str = "") -> dict:
     """Returns the plaintext secret exactly once. It is not recoverable."""
     secret = KEY_PREFIX + secrets.token_urlsafe(32).replace("-", "").replace("_", "")[:40]
-    key_hash = hashlib.sha256(secret.encode()).hexdigest()
+    key_hash = key_digest(secret)
     kid = _id("key")
     prefix = secret[:len(KEY_PREFIX) + 6]
 
@@ -652,11 +693,25 @@ def resolve_key(secret: str | None) -> dict | None:
     """Look a presented key up by hash. Bumps usage counters on success."""
     if not secret:
         return None
-    key_hash = hashlib.sha256(secret.strip().encode()).hexdigest()
+    key_hash = key_digest(secret)
     with db() as conn:
         row = conn.execute(
             "SELECT id, account_id, name, prefix, revoked_at FROM api_keys WHERE key_hash = ?",
             (key_hash,)).fetchone()
+
+        # A key issued before the pepper was configured is still valid; it is
+        # rewritten to the peppered form the first time it is used, so the old
+        # digests drain away as keys get used rather than needing a migration
+        # that cannot know the secrets.
+        if not row and KEY_PEPPER:
+            legacy = _legacy_digest(secret)
+            row = conn.execute(
+                "SELECT id, account_id, name, prefix, revoked_at FROM api_keys "
+                "WHERE key_hash = ?", (legacy,)).fetchone()
+            if row and not row["revoked_at"]:
+                conn.execute("UPDATE api_keys SET key_hash = ? WHERE id = ?",
+                             (key_hash, row["id"]))
+
         if not row or row["revoked_at"]:
             return None
         conn.execute(

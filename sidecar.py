@@ -294,16 +294,22 @@ def connect(path: str | None = None, read_only: bool = False):
     return conn
 
 
-def describe() -> dict:
-    """For /api/health. Never contains the password."""
+def describe(include_host: bool = False) -> dict:
+    """For /api/health. Never contains the password.
+
+    The hostname is off by default. It named the exact managed-database
+    instance and its region — `aws-0-us-west-2.pooler.supabase.com` — on a
+    public endpoint, which is a free first step for anyone deciding what to
+    attack. `backend` and `pooled` are what a reader of a health page actually
+    needs, and neither of them locates anything.
+    """
     if not IS_POSTGRES:
         return {"backend": "sqlite", "shared": False}
-    host = ""
-    m = re.search(r"@([^/:?]+)", DATABASE_URL)
-    if m:
-        host = m.group(1)
-    out = {"backend": "postgres", "shared": True, "host": host,
+    out = {"backend": "postgres", "shared": True,
            "pooled": POOLER_HINT in DATABASE_URL}
+    if include_host:
+        m = re.search(r"@([^/:?]+)", DATABASE_URL)
+        out["host"] = m.group(1) if m else ""
     if _pool is not None:
         s = _pool.get_stats()
         out["pool"] = {k: s.get(k) for k in

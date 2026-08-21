@@ -34,6 +34,9 @@ from fastapi import APIRouter, Query
 from fastapi.responses import FileResponse, JSONResponse
 
 import apimeta
+import errors
+
+_DEV_HINTS = os.environ.get("DEV_HINTS", "0") == "1"
 import probe_constraints
 from hydra import HYDRA_CELL, HYDRA_GRAPH, HYDRA_TOKEN, HYDRA_URL, _rows
 
@@ -84,8 +87,12 @@ def _post(query: str, params: dict | None = None) -> tuple[bool, object, float]:
             return False, str(msg)[:200], ms
         return True, payload, ms
     except Exception as exc:
+        # Classified. Every probe's detail is published under "surprises" on a
+        # public endpoint, so a graph that is merely unreachable was printing
+        # its address and a urllib3 stack twenty-five times over.
         ms = (time.perf_counter() - t0) * 1000
-        return False, f"{type(exc).__name__}: {exc}"[:200], ms
+        apimeta.log("constraint_probe_error", error=errors.detail(exc))
+        return False, errors.reason(exc), ms
 
 
 # --------------------------------------------------------------------------
@@ -379,7 +386,9 @@ def probe_all() -> dict:
     surprises = [r for r in predicted if not r["holds"]]
     return {
         "measured_at": time.time(),
-        "hydra_url": HYDRA_URL,
+        # Address withheld for the same reason as everywhere else; DEV_HINTS
+        # turns it back on where somebody can act on it.
+        "hydra_url": HYDRA_URL if _DEV_HINTS else None,
         "summary": {
             "probes": len(surface) + len(traps),
             "predictions": len(predicted),
@@ -405,8 +414,9 @@ def _sweep() -> None:
         with _lock:
             _cache.update(value=value, at=time.time(), error="")
     except Exception as exc:
+        apimeta.log("constraints_sweep_failed", error=errors.detail(exc))
         with _lock:
-            _cache["error"] = f"{type(exc).__name__}: {exc}"[:200]
+            _cache["error"] = errors.reason(exc)
     finally:
         with _lock:
             _cache["measuring"] = False
@@ -465,9 +475,13 @@ def api_constraints(refresh: bool = Query(False)):
     try:
         return {"ok": True, **cached(force=refresh)}
     except Exception as exc:
+        # The classification, not the exception. This endpoint is public and
+        # the exception here names the graph's internal host and port.
+        apimeta.log("constraints_probe_failed", error=errors.detail(exc))
         return JSONResponse(
             {"ok": False, "error": "probe_failed",
-             "message": f"could not probe HydraDB: {type(exc).__name__}: {exc}"[:300]},
+             "message": "could not probe HydraDB.",
+             "reason": errors.reason(exc)},
             status_code=503)
 
 

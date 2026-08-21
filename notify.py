@@ -21,6 +21,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+
+import errors
 import queue
 import smtplib
 import threading
@@ -95,7 +97,15 @@ def _post(url: str, secret: str, payload: dict) -> tuple[bool, str]:
         res = requests.post(url, data=body, headers=headers,
                             timeout=config.WEBHOOK_TIMEOUT)
     except Exception as exc:
-        return False, f"{exc.__class__.__name__}: {exc}"[:160]
+        # Classified, not raw. This string is stored on the webhook row and
+        # handed back through /api/webhooks/{id}/test, and a urllib3 exception
+        # carries our client internals along with the target address.
+        #
+        # The HTTP branches below are different and stay verbatim: a status
+        # code and a response body from the endpoint the account owner
+        # configured is their own server talking to them, which is the whole
+        # point of a test delivery.
+        return False, errors.reason(exc)
 
     if 200 <= res.status_code < 300:
         return True, f"{res.status_code}"
@@ -151,7 +161,15 @@ def _send_email(to: str, alert: dict) -> tuple[bool, str]:
             smtp.send_message(msg)
         return True, "sent"
     except Exception as exc:
-        return False, f"{exc.__class__.__name__}: {exc}"[:160]
+        # Classified, not raw. This string is stored on the webhook row and
+        # handed back through /api/webhooks/{id}/test, and a urllib3 exception
+        # carries our client internals along with the target address.
+        #
+        # The HTTP branches below are different and stay verbatim: a status
+        # code and a response body from the endpoint the account owner
+        # configured is their own server talking to them, which is the whole
+        # point of a test delivery.
+        return False, errors.reason(exc)
 
 
 # --------------------------------------------------------------------------
