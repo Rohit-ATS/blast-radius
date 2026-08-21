@@ -123,6 +123,7 @@
       <a href="#console">Console</a>
       <a href="#resolution">Resolution</a>
       <a href="#lockfile">Lockfile</a>
+      <a href="#monitor">Monitor</a>
       <a href="#analytics">Analytics</a>
       <a href="#pricing">Pricing</a>
     </nav>
@@ -563,15 +564,32 @@
 <section class="sec rails" id="live">
   <div class="wrap">
     <div class="head-split">
-      <h2 class="h-sec">npm, <span class="mut">right now</span></h2>
+      <h2 class="h-sec">Five registries, <span class="mut">right now</span></h2>
       <p class="lede">
         Most publishes are somebody's first version with nothing downstream. The ones
         worth watching are the packages <b>thousands of things already depend on</b>,
-        because that is the moment a supply-chain attack goes live.
+        because that is the moment a supply-chain attack goes live. Every publish
+        below was written into HydraDB as it happened.
       </p>
     </div>
 
+    <div class="eco-rail" id="ecorail" aria-label="live ingestion status per registry">
+      <div class="skel">reading ingestion status…</div>
+    </div>
+
     <div class="win">
+      <div class="bar">
+        <i class="dot r"></i><i class="dot a"></i><i class="dot g"></i>
+        <span class="title">graph writes — all ecosystems</span>
+        <span class="barctl"><span class="feedstat" id="ingeststat">connecting…</span></span>
+      </div>
+      <div class="body nopad"><div class="ticker" id="ingestticker">
+        <div class="empty">waiting for the first publish to land…</div>
+      </div></div>
+      <div class="cap">live.py — one poller per registry, writing straight into HydraDB</div>
+    </div>
+
+    <div class="win" style="margin-top:18px">
       <div class="bar">
         <i class="dot r"></i><i class="dot a"></i><i class="dot g"></i>
         <span class="title">live publish feed</span>
@@ -579,6 +597,66 @@
       </div>
       <div class="body nopad"><div class="ticker" id="ticker"></div></div>
       <div class="cap">npm-changes.log — polled from replicate.npmjs.com every few seconds</div>
+    </div>
+  </div>
+</section>
+
+<!-- ====================================================== 10b · monitoring -->
+<section class="sec-tight rails" id="monitor">
+  <div class="wrap">
+    <div class="head-split">
+      <h2 class="h-sec">Watch your own project <span class="mut">and get woken up</span></h2>
+      <p class="lede">
+        Register a lockfile and it becomes a node in the same graph as the packages.
+        When something you install publishes, the alert is routed by
+        <b>traversing from that package to you</b> — not by scanning a subscriber
+        table. Works for npm, PyPI, crates.io, Go and Maven.
+      </p>
+    </div>
+
+    <div class="mon-grid">
+      <div class="win">
+        <div class="bar">
+          <i class="dot r"></i><i class="dot a"></i><i class="dot g"></i>
+          <span class="title">register a project</span>
+          <span class="barctl"><span class="feedstat" id="mon-stat">no project registered</span></span>
+        </div>
+        <div class="body">
+          <div class="drop drop-sm" id="mondrop" tabindex="0" role="button"
+               aria-label="drop a lockfile or manifest to start monitoring it">
+            <div class="dropinner">
+              <div class="dropicon" aria-hidden="true">
+                <svg viewBox="0 0 40 48" width="34" height="41"><path d="M6 2h20l10 10v34H6Z" fill="#eef3ff" stroke="#c3d2ee" stroke-width="1.6"/><path d="M26 2v10h10" fill="none" stroke="#c3d2ee" stroke-width="1.6"/><circle cx="20" cy="29" r="6.4" fill="none" stroke="#2f6bff" stroke-width="2"/><path d="M20 25.4v7.2M16.4 29h7.2" stroke="#2f6bff" stroke-width="2" stroke-linecap="round"/></svg>
+              </div>
+              <div class="droptext">Watch my <b>lockfile</b> for compromised publishes</div>
+              <div class="dropsub" id="monhint">package-lock.json · requirements.txt ·
+                Cargo.lock · go.sum · pom.xml · poetry.lock · uv.lock · gradle.lockfile</div>
+            </div>
+            <input type="file" id="monfile" hidden>
+          </div>
+          <div class="mon-form">
+            <input type="text" id="monname" class="inp" maxlength="80"
+                   placeholder="project name" value="my-service">
+            <input type="text" id="monhook" class="inp" maxlength="300"
+                   placeholder="webhook URL (optional)">
+            <button type="button" class="btn ghost-sm" id="monpick">Choose file</button>
+          </div>
+          <div id="moncred" class="mon-cred" hidden></div>
+        </div>
+        <div class="cap">POST /api/watch/register — the token is shown once and is not recoverable</div>
+      </div>
+
+      <div class="win">
+        <div class="bar">
+          <i class="dot r"></i><i class="dot a"></i><i class="dot g"></i>
+          <span class="title">alerts</span>
+          <span class="barctl"><span class="feedstat" id="mon-alertstat">not streaming</span></span>
+        </div>
+        <div class="body nopad"><div class="ticker" id="monalerts">
+          <div class="empty">register a project and this streams its alerts live over SSE.</div>
+        </div></div>
+        <div class="cap">GET /api/watch/{id}/stream — server-sent events, one per routed publish</div>
+      </div>
     </div>
   </div>
 </section>
@@ -797,5 +875,6 @@
 
 <script src="/app.js"></script>
 <script src="/landing.js"></script>
+<script src="/live.js"></script>
 </body>
 </html>

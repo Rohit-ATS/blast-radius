@@ -1341,3 +1341,90 @@ code, .mono { font-family: var(--mono); }
   html { scroll-behavior: auto; }
   .rv, .rv.in { opacity: 1; transform: none; }
 }
+
+/* ============================================ live ingestion + monitoring */
+
+.eco-rail {
+  display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px;
+  margin-bottom: 18px;
+}
+@media (max-width: 900px) { .eco-rail { grid-template-columns: repeat(2, 1fr); } }
+
+.eco {
+  border: 1px solid var(--line); border-radius: 14px; background: var(--card);
+  padding: 13px 14px;
+}
+.eco-top { display: flex; align-items: center; gap: 7px; margin-bottom: 9px; }
+.eco-top b { font-size: 13px; }
+.eco-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--ink-4); }
+.eco-state {
+  margin-left: auto; font-family: var(--mono); font-size: 10px;
+  letter-spacing: .04em; text-transform: uppercase; color: var(--ink-3);
+}
+.eco-n { font-family: var(--mono); font-size: 21px; font-weight: 600; line-height: 1.1; }
+.eco-t { font-size: 11px; color: var(--ink-3); margin-top: 2px; }
+.eco-d {
+  margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line-2);
+  font-family: var(--mono); font-size: 10.5px; color: var(--ink-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* The four states the daemon can actually be in. A panel that is green while
+   a registry is failing is worse than no panel. */
+.eco.ok   .eco-dot { background: var(--green); box-shadow: 0 0 0 3px var(--green-bg); }
+.eco.wait .eco-dot { background: var(--blue-3); box-shadow: 0 0 0 3px var(--blue-bg); }
+.eco.warn { border-color: var(--amber-line); background: var(--amber-bg); }
+.eco.warn .eco-dot, .eco.warn .eco-state { background: var(--amber); color: var(--amber); }
+.eco.warn .eco-dot { background: var(--amber); }
+.eco.bad  { border-color: var(--red-line); background: var(--red-bg); }
+.eco.bad .eco-dot { background: var(--red); }
+.eco.bad .eco-state { color: var(--red); }
+
+.tick-t { color: var(--ink-3); font-size: 11px; white-space: nowrap; min-width: 62px; }
+.tick-n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 auto; }
+.tick-v { color: var(--ink-2); white-space: nowrap; }
+.tick-d { margin-left: auto; white-space: nowrap; font-size: 11px; color: var(--ink-3); }
+
+.badge.eco-npm    { background: #fdeeed; border-color: #f6d3cf; color: #c2352b; }
+.badge.eco-pypi   { background: #eef3ff; border-color: #d5e1ff; color: #1b51de; }
+.badge.eco-crates { background: #fdf6e8; border-color: #f0e2c0; color: #8a5a13; }
+.badge.eco-go     { background: #e9f6fb; border-color: #c4e5f1; color: #10708f; }
+.badge.eco-maven  { background: #f3eefb; border-color: #ddd0f2; color: #5b32a8; }
+
+.badge.sev-critical { background: var(--red-bg);   border-color: var(--red-line);   color: var(--red); }
+.badge.sev-high     { background: var(--amber-bg); border-color: var(--amber-line); color: var(--amber); }
+.badge.sev-medium   { background: var(--amber-bg); border-color: var(--amber-line); color: var(--amber); }
+.badge.sev-info     { background: var(--wash);     border-color: var(--line);       color: var(--ink-3); }
+.tick.sev-critical { background: var(--red-bg); }
+.tick.sev-critical .tick-n { color: var(--red); font-weight: 600; }
+.tick.sev-high, .tick.sev-medium { background: var(--amber-bg); }
+
+.mon-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; align-items: start; }
+@media (max-width: 980px) { .mon-grid { grid-template-columns: 1fr; } }
+
+.drop-sm { padding: 26px 18px; border-radius: 16px; }
+.drop-sm .droptext { font-size: 15.5px; }
+.drop-sm .dropsub { font-size: 11.5px; font-family: var(--mono); line-height: 1.7; }
+.drop-sm .dropicon { margin-bottom: 10px; }
+
+.mon-form { display: flex; gap: 9px; margin-top: 12px; flex-wrap: wrap; }
+.mon-form .inp { flex: 1 1 150px; min-width: 0; }
+.inp {
+  border: 1px solid var(--line); border-radius: 10px; padding: 9px 11px;
+  font-family: var(--mono); font-size: 12.5px; color: var(--ink);
+  background: var(--card);
+}
+.inp:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; border-color: var(--blue); }
+
+.mon-cred {
+  margin-top: 14px; padding-top: 13px; border-top: 1px solid var(--line-2);
+  display: grid; gap: 7px;
+}
+.cred-row { display: flex; gap: 10px; align-items: baseline; font-size: 11.5px; }
+.cred-row > span { color: var(--ink-3); min-width: 52px; font-family: var(--mono); }
+.cred-row code {
+  font-family: var(--mono); font-size: 11.5px; background: var(--wash);
+  border: 1px solid var(--line-2); border-radius: 6px; padding: 2px 7px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mon-cred .btn { justify-self: start; margin-top: 4px; }

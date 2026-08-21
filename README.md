@@ -167,8 +167,9 @@ Being precise about this matters more than sounding impressive.
 | **Package intel** — real, current, compromised | **all of npm** | registry + osv.dev, live |
 | **Remediation** — safe version, overrides, agent brief | **all of npm** | osv.dev, live |
 | **Typosquat existence check** | **all of npm** | registry, live |
-| **Live publish feed** | **all of npm** | replicate.npmjs.com, polled |
-| **Blast radius / chained traversals** | 27,076 packages (0.63%) | HydraDB graph |
+| **Live publish feed** | **npm, PyPI, crates.io, Go, Maven** | all five change feeds, polled |
+| **Blast radius / chained traversals** | 31,500+ packages, growing live | HydraDB graph |
+| **Project monitoring + alerts** | any lockfile, 5 ecosystems | HydraDB traversal |
 
 The universal features need no crawl — your lockfile *is* your tree. The graph
 powers the differentiated layer on top. Every API response carries
@@ -180,6 +181,125 @@ loads the fix inline — the safe version, the `overrides` block that forces eve
 transitive copy, and a self-contained brief for a coding agent:
 
 ![A compromised lockfile: debug@4.4.2 and ua-parser-js@0.7.29 flagged as malware, with the remediation expanded](docs/images/audit.png)
+
+## The graph writes itself
+
+`ingest.py` is a batch crawl: it walks a frontier, fills the graph, and stops.
+That is fine for building a snapshot and wrong for a tool whose entire claim is
+answering *who is exposed right now*. A blast radius computed against a graph
+written thirteen hours ago describes a dependency tree that has since changed.
+
+So [`live.py`](live.py) runs all five registries' change feeds continuously and
+writes what they report straight into HydraDB — one poller per registry, one
+writer, per-registry backoff. `GET /api/live/status` reports what is actually
+happening rather than what is supposed to be:
+
+| registry | polled every | source |
+|---|---|---|
+| npm | 5s | `replicate.npmjs.com/_changes?since=` |
+| PyPI | 15s | the RSS newest-packages feed |
+| Go | 20s | `index.golang.org/index?since=` |
+| crates.io | 30s | the summary endpoint |
+| Maven | 60s | Central search, sorted by publish timestamp |
+
+A registry having a bad afternoon backs off exponentially and says so; it does
+not take the other four down, and it does not sit there looking green. An
+ecosystem that has never seen a publish reports `last_event_at: null` rather
+than a plausible-looking timestamp.
+
+**Growth is budgeted, and that is the interesting part.** Continuous ingestion
+adds roughly 21,000 edges an hour, and this graph stops answering depth 4 and 5
+*at all* somewhere around 246,000 edges — the same cliff that broke an earlier
+phase. Left alone, live ingestion would have destroyed the thing it was
+feeding, inside an afternoon, and the failure would have looked like HydraDB
+being slow rather than like a crawler with no brakes. Past `BLAST_EDGE_BUDGET`
+the crawler keeps refreshing packages it already knows — the security-relevant
+work, which adds almost no vertices — and stops discovering packages nobody
+depends on yet. Coverage of the whole registry was never the goal.
+
+One honest consequence: the d+1 traversals behind a blast radius run
+concurrently against a graph that is being written to, so they do not observe
+the same instant. When nothing is truncated the enumerated victim list is
+treated as ground truth and the counts are clamped to it, so the histogram
+always sums to the headline instead of shipping a visible off-by-one.
+
+## Monitoring: the traversal *is* the alert router
+
+Register a lockfile and it becomes a `Project` vertex with one `REQUIRED_BY`
+edge per installed package — the same edge direction the dependency graph
+already uses, deliberately. "Who do I wake up about this publish" then stops
+being a fan-out over a subscriber table and becomes the query this database
+exists for:
+
+```cypher
+MATCH (p:Package {id: $published})-[:REQUIRED_BY*1..N]->(t:Project)
+RETURN t.pid
+```
+
+One traversal from the package that just changed, and out comes the exact set
+of affected projects. Measured at 6–35ms.
+
+**Exact versus inferred.** A lockfile is the resolved tree — everything
+installed is named in it — so every package becomes a direct edge and depth 1
+is a complete and precise answer. A manifest (`package.json`, `pyproject.toml`,
+`pom.xml`) names only direct dependencies, so the rest is reached by traversing
+the crawled graph and is exactly as complete as our coverage of it. Those are
+different claims, and every alert says which one it is.
+
+Fourteen project-file formats, detected by filename and then by content:
+
+| ecosystem | exact (resolved tree) | inferred (manifest) |
+|---|---|---|
+| npm | `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml` | `package.json` |
+| PyPI | `poetry.lock`, `Pipfile.lock`, `uv.lock`, pinned `requirements.txt` | `pyproject.toml`, ranged `requirements.txt` |
+| crates.io | `Cargo.lock` | `Cargo.toml` |
+| Go | `go.sum` | `go.mod` |
+| Maven | `gradle.lockfile` | `pom.xml`, `build.gradle` |
+
+A ranged requirement records an *empty* version and downgrades the project to
+inferred — never the range text stored where a resolved version belongs. That
+is the same rule as `satisfies()`: listing a dependency and pulling a specific
+version are different facts.
+
+### Wiring it into a real project
+
+```bash
+# register once — the token is shown once and is not recoverable
+curl -X POST "http://localhost:8000/api/watch/register?name=payments&filename=package-lock.json&webhook=https://hooks.example.com/blast" \
+     --data-binary @package-lock.json
+# {"project_id":"gFrLfOML7nFr","token":"…","watching":412,"precision":"exact","depth":1}
+```
+
+Then take alerts whichever way suits the system:
+
+```bash
+# poll — `since` is the last id you handled, so you get what is new and nothing twice
+curl "http://localhost:8000/api/watch/$ID/alerts?token=$TOKEN&since=$CURSOR&min_severity=high"
+
+# or hold a stream open; a heartbeat every 15s distinguishes quiet from dead
+curl -N "http://localhost:8000/api/watch/$ID/stream?token=$TOKEN"
+```
+
+Or point the webhook at an n8n Webhook node and route from there — an alert is
+a flat JSON body with `severity`, `kind`, `package`, `version`, `hops`,
+`precision` and the OSV advisories attached, which is enough to branch on
+without any further lookups.
+
+A webhook that fails is retried with backoff and its failure shows up on
+`GET /api/watch/{id}` as `webhook_failures` and `last_webhook_error`. An alert
+is written to SQLite before delivery is attempted, so it is never lost — an
+alert nobody received is worse than one that arrived late.
+
+Severity comes from asking OSV about the exact version that was just published,
+in that package's own ecosystem. A version-less question returns every advisory
+ever filed against the package, which would make a routine release of anything
+with history look like an incident.
+
+| severity | when |
+|---|---|
+| `critical` | OSV classifies the new version as malware |
+| `high` / `medium` | it carries a real advisory |
+| `info` | a clean publish — still the event you want, and the only warning that exists before an advisory does |
 
 ## HydraDB 0.1.0: constraints we hit and engineered around
 
@@ -399,6 +519,14 @@ it runs in a bare CI container.
 | `GET /api/resolve` | exposed vs shielded by pin |
 | `GET /api/maintainers` | what else those maintainers publish |
 | `GET /api/search` | package name autocomplete |
+| `GET /api/live/status` | per-registry ingestion health, edge budget |
+| `GET /api/live/events` | packages written into the graph, newest first |
+| `POST /api/watch/register` | register a lockfile or manifest for monitoring |
+| `GET /api/watch/{id}/alerts` | poll alerts since a cursor |
+| `GET /api/watch/{id}/stream` | SSE, one message per routed publish |
+| `POST /api/watch/{id}/ack/{n}` | acknowledge an alert |
+| `DELETE /api/watch/{id}` | stop watching and drop the edges |
+| `GET /api/watch` | aggregate monitoring counters |
 
 Every response carries `latency_ms` measured around the real query, plus `ok`,
 `source`, `graph_coverage`, `cached` and `request_id`. Interactive docs at
@@ -438,18 +566,26 @@ ingest.py              npm crawler -> HydraDB + deps.db sidecar
 graphify.py            maintainers, advisories, similarity -> graph nodes
 blast.py               blast radius, lockfiles, npm semver
 chains.py              the traversals that cross edge types
+ecosystems/            one adapter per registry — each with its OWN range grammar
+                         npm.py     bare version == exact pin
+                         pypi.py    PEP 440; ~= pins one component fewer than written
+                         crates.py  bare version == caret, the inverse of npm
+                         golang.py  no ranges at all; a require is an MVS floor
+                         maven.py   bare version is a soft *recommendation*
 intel.py               live registry + OSV: real, current, compromised
+live.py                continuous ingestion — five change feeds -> HydraDB
+watch.py               project registration + alert routing by traversal
 scan.py                tarball static analysis + version diffing
-lockfiles.py           npm / yarn v1 / yarn berry / pnpm
+lockfiles.py           14 project-file formats across the five ecosystems
 feed.py                live npm publish poller
-server.py              FastAPI: 18 endpoints, serves the console on one port
+server.py              FastAPI: 27 endpoints, serves the console on one port
 cli.py                 CI-usable CLI with meaningful exit codes
 web/                   the console — vanilla HTML/CSS/JS, no build step
 bench.py               HydraDB vs SQLite recursive CTE -> BENCHMARKS.md
 rebuild.py             replay the graph from deps.db
 verify.py / web_audit.py / chaos.py / demo_check.py
 probe_constraints.py / probe_counts.py
-tests/test_all.py      117 tests
+tests/                 328 tests — semver, graph, HTTP, browser
 ```
 
 The console has **no build step and no JavaScript dependencies** — the radial
@@ -459,9 +595,13 @@ while you are recording.
 
 ## Data
 
-Package metadata from the [npm registry](https://registry.npmjs.org), fetched
-live. Advisories from [OSV.dev](https://osv.dev). Publish feed from
-`replicate.npmjs.com`. npm registry data is provided by npm, Inc.
+Package metadata fetched live from the [npm registry](https://registry.npmjs.org),
+[PyPI](https://pypi.org), [crates.io](https://crates.io), the
+[Go module proxy](https://proxy.golang.org) and
+[Maven Central](https://repo1.maven.org). Advisories from
+[OSV.dev](https://osv.dev). Publish feeds from `replicate.npmjs.com`,
+PyPI's RSS, `index.golang.org`, the crates.io summary endpoint and Central's
+search index. npm registry data is provided by npm, Inc.
 
 The incidents referenced (`debug`/`chalk` via the qix account takeover,
 September 2025; `event-stream`, November 2018; `ua-parser-js`, October 2021) are
