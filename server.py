@@ -719,15 +719,28 @@ def _refresh_graph_counts() -> None:
             if TRUE_GRAPH_COUNTS:
                 value = blast.graph_stats(hydra_patient)
             else:
-                # The crawler writes a sidecar row and a graph vertex from the
-                # same batch, and only prod dependencies become edges, so these
-                # track what was written to HydraDB rather than approximating
-                # it. blast.quick_stats says as much where it is defined.
+                # The sidecar's totals, corrected for what the graph actually
+                # holds.
+                #
+                # quick_stats counts what the crawler has *written*, which
+                # equals the graph only when the graph is a full replay of it.
+                # On an instance that rebuilds a bounded subgraph it does not:
+                # the sidecar held 152,772 prod edges while the graph held
+                # 28,000, and reporting the larger number under a panel titled
+                # "edges in graph" overstates it by five times — on a page whose
+                # own strapline promises every figure came from a real query.
                 with db() as conn:
                     quick = blast.quick_stats(conn)
                 value = {"packages": quick["packages"], "edges": quick["edges"],
                          "measured_ms": quick.get("latency_ms", 0.0),
                          "source": "sidecar"}
+                bound = _rebuild_bound()
+                if bound:
+                    held, known = bound
+                    value["edges"] = held
+                    value["edges_known"] = known
+                    value["bounded_graph"] = True
+                    value["source"] = "sidecar (graph is a bounded subgraph)"
             _graph_cache.update(value=value, at=time.time(), error=None)
         except Exception as e:                       # a down server must not kill the thread
             _graph_cache.update(error=str(e)[:200], at=time.time())
@@ -861,6 +874,20 @@ def api_stats():
     """
     with db() as conn:
         value = blast.quick_stats(conn)
+
+    # quick_stats counts what the crawler has written, which is the size of the
+    # graph only when the graph is a full replay of the sidecar. This instance
+    # rebuilds a bounded subgraph, so the two diverged badly — 152,834 prod
+    # edges in the sidecar against 29,000 in the graph — and this is the number
+    # the page header prints as "edges in graph". Five times too large, under a
+    # strapline promising every figure came from a real query.
+    bound = _rebuild_bound()
+    if bound:
+        held, known = bound
+        value["edges_known"] = known
+        value["edges"] = held
+        value["bounded_graph"] = True
+
     measured = _graph_cache.get("value")
     if measured:
         value["graph"] = {**measured,
