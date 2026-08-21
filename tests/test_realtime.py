@@ -17,6 +17,7 @@ actually matters: a project that does not depend on a compromised package gets
 import json
 import os
 import sys
+import time
 
 import pytest
 
@@ -424,3 +425,69 @@ def test_sidecar_keys_keep_ecosystems_apart():
     assert live.qualified("pypi", "requests") == "pypi:requests"
     assert live.qualified("npm", "requests") != live.qualified("pypi", "requests")
     assert pkg_id("requests", "npm") != pkg_id("requests", "pypi")
+
+
+# ==========================================================================
+# single-flight — concurrent identical traversals share one walk
+# ==========================================================================
+
+def test_single_flight_runs_the_work_once():
+    """Twenty-four concurrent requests for the same hub package used to become
+    twenty-four concurrent traversals, saturate HydraDB, and 503 all of them."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    import apimeta
+
+    flight = apimeta.SingleFlight()
+    calls = []
+    started = threading.Event()
+
+    def produce():
+        calls.append(1)
+        started.set()
+        time.sleep(0.4)          # long enough for the followers to pile up
+        return "answer"
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        results = list(pool.map(lambda _: flight.run("k", produce), range(12)))
+
+    assert all(value == "answer" for value, _shared in results)
+    assert len(calls) == 1, f"produce ran {len(calls)} times, expected once"
+    assert flight.executed == 1
+    assert flight.coalesced == 11
+
+
+def test_single_flight_shares_the_failure_too():
+    """A follower must not be told the work succeeded because it was cheap to
+    say so. It waited on that call; it gets that call's outcome."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    import apimeta
+
+    flight = apimeta.SingleFlight()
+
+    def boom():
+        time.sleep(0.3)
+        raise RuntimeError("hydra is down")
+
+    def attempt(_):
+        try:
+            flight.run("k", boom)
+            return "ok"
+        except RuntimeError as exc:
+            return str(exc)
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        out = list(pool.map(attempt, range(6)))
+    assert all(o == "hydra is down" for o in out), out
+
+
+def test_different_keys_do_not_coalesce():
+    import apimeta
+    flight = apimeta.SingleFlight()
+    a, _ = flight.run("a", lambda: 1)
+    b, _ = flight.run("b", lambda: 2)
+    assert (a, b) == (1, 2)
+    assert flight.executed == 2
+    assert flight.coalesced == 0

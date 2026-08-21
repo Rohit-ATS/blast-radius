@@ -123,3 +123,72 @@ def log(msg: str, **fields):
 
 def request_id() -> str:
     return uuid.uuid4().hex[:16]
+
+
+class SingleFlight:
+    """Coalesce concurrent identical work into one execution.
+
+    A blast-radius traversal over a hub package takes seconds, and the console,
+    a demo audience and a load check all tend to ask for the *same* preset at
+    the same moment. Without this, twenty-four concurrent requests become
+    twenty-four concurrent traversals, HydraDB saturates, and everyone gets a
+    503 — including the twenty-three who would have been perfectly happy with
+    the answer the first one was already computing.
+
+    The first caller for a key runs the work; the rest block on the same result
+    and are told they waited rather than computed, so a latency number still
+    means what it says.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._inflight: dict[str, threading.Event] = {}
+        self._results: dict[str, tuple] = {}
+        self.coalesced = 0
+        self.executed = 0
+
+    def run(self, key: str, produce, timeout: float = 60.0):
+        """(value, was_coalesced). Raises whatever `produce` raises, for the
+        leader and every follower alike — a shared failure is still shared."""
+        with self._lock:
+            waiting = self._inflight.get(key)
+            if waiting is None:
+                event = threading.Event()
+                self._inflight[key] = event
+                leader = True
+            else:
+                event, leader = waiting, False
+
+        if not leader:
+            self.coalesced += 1
+            if not event.wait(timeout):
+                # The leader is taking longer than a follower is willing to
+                # wait. Doing the work independently is better than failing.
+                return produce(), False
+            ok, payload = self._results.get(key, (False, None))
+            if ok:
+                return payload, True
+            if isinstance(payload, BaseException):
+                raise payload
+            return produce(), False
+
+        self.executed += 1
+        try:
+            value = produce()
+            self._results[key] = (True, value)
+            return value, False
+        except BaseException as exc:
+            self._results[key] = (False, exc)
+            raise
+        finally:
+            event.set()
+            with self._lock:
+                self._inflight.pop(key, None)
+            # The result is only needed while followers are still waking up.
+            threading.Timer(5.0, lambda: self._results.pop(key, None)).start()
+
+    def stats(self) -> dict:
+        total = self.executed + self.coalesced
+        return {"executed": self.executed, "coalesced": self.coalesced,
+                "coalesce_rate": (round(self.coalesced / total, 3)
+                                  if total else None)}
