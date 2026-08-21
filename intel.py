@@ -27,34 +27,29 @@ from urllib.parse import quote
 
 import requests
 
+import apimeta
+
 REGISTRY = "https://registry.npmjs.org"
 OSV_API = "https://api.osv.dev/v1"
 UA = {"User-Agent": "blast-radius-hackhydra/0.1 (+supply-chain incident response)"}
 SLIM = {**UA, "Accept": "application/vnd.npm.install-v1+json"}
 
-# Live lookups are on the request path, so they are cached briefly. Short
-# enough that "latest version" stays honest during an unfolding incident.
-TTL = 300.0
-_cache: dict[str, tuple[float, object]] = {}
-_lock = threading.Lock()
+# Live lookups are on the request path, so they are cached. This used to be a
+# private dict here with one flat TTL and no counters, which meant two things:
+# an advisory and a registry document expired at the same rate despite changing
+# at wildly different ones, and /api/health reported a hit rate of 0 forever
+# because it was reading a different cache object that nothing used.
+#
+# Both now go through the shared instrumented cache, with the namespace in the
+# key so the hit rate can be read per source.
+TTL = apimeta.TTL_REGISTRY          # kept for callers that pass no ttl
 
 _session = requests.Session()
 _session.headers.update(UA)
 
 
 def _cached(key: str, produce, ttl: float = TTL):
-    now = time.time()
-    with _lock:
-        hit = _cache.get(key)
-        if hit and now - hit[0] < ttl:
-            return hit[1]
-    value = produce()
-    with _lock:
-        _cache[key] = (now, value)
-        if len(_cache) > 5000:                      # crude bound, oldest first
-            for k in sorted(_cache, key=lambda k: _cache[k][0])[:1000]:
-                _cache.pop(k, None)
-    return value
+    return apimeta.CACHE.cached(key, ttl, produce)
 
 
 # --------------------------------------------------------------------------
@@ -69,7 +64,7 @@ def npm_doc(name: str, timeout: float = 12.0) -> dict | None:
             return r.json() if r.status_code == 200 else None
         except Exception:
             return None
-    return _cached(f"doc:{name}", fetch)
+    return _cached(f"registry:doc:{name}", fetch, apimeta.TTL_REGISTRY)
 
 
 def npm_summary(name: str) -> dict | None:
@@ -187,7 +182,7 @@ def osv_query(name: str, version: str | None = None, timeout: float = 15.0,
         vulns.sort(key=lambda v: (v["kind"] != "malware", v["id"]))
         return {"ok": True, "vulns": vulns}
 
-    return _cached(key, fetch)
+    return _cached(key, fetch, apimeta.TTL_OSV)   # key already starts "osv:"
 
 
 def osv_batch(packages: list[tuple[str, str]], timeout: float = 25.0) -> dict:

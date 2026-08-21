@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 import accounts
 import apidocs
+import apimeta
 import config
 import notify
 
@@ -29,6 +30,12 @@ COOKIE = "br_session"
 SECURE_COOKIES = config.SECURE_COOKIES
 
 router = APIRouter()
+
+# A key raises the ceiling; it does not remove it. See apimeta.KeyQuota for why
+# an exempt key is the more dangerous configuration, not the safer one.
+QUOTA = apimeta.KeyQuota(
+    per_minute=int(config.number("API_KEY_PER_MINUTE", 3000)),
+    per_day=int(config.number("API_KEY_PER_DAY", 250_000)))
 
 # Injected by mount(). Keys are the v1 route names.
 HANDLERS: dict = {}
@@ -41,6 +48,17 @@ HANDLERS: dict = {}
 def _fail(message: str, status: int = 400, code: str = "bad_request", **extra):
     return JSONResponse({"ok": False, "error": code, "message": message, **extra},
                         status_code=status)
+
+
+class _QuotaExceeded(accounts.AuthError):
+    """A 429 has to carry Retry-After to be actionable, so it needs to survive
+    the guard as something richer than a message and a status."""
+
+    def __init__(self, message: str, retry_after: int, scope: str, usage: dict):
+        super().__init__(message, 429, "rate_limited")
+        self.retry_after = retry_after
+        self.scope = scope
+        self.usage = usage
 
 
 def _client(request: Request) -> tuple[str, str]:
@@ -83,6 +101,18 @@ def _require_key(request: Request) -> dict:
     if not key:
         raise accounts.AuthError(
             "that key is unknown or has been revoked.", 401, "bad_key")
+
+    allowed, retry, scope = QUOTA.check(key["id"])
+    if not allowed:
+        limit = QUOTA.per_day if scope == "daily" else QUOTA.per_minute
+        window = "day" if scope == "daily" else "minute"
+        raise _QuotaExceeded(
+            f"this key has used its {window} allowance of {limit:,} requests. "
+            f"It resets in {retry}s. Ceilings are generous and per key — if you "
+            f"are hitting them legitimately, open an issue rather than making a "
+            f"second key.",
+            retry_after=retry, scope=scope, usage=QUOTA.usage(key["id"]))
+
     ip, agent = _client(request)
     accounts.log_event(key["account_id"], "api.call",
                        f"{request.method} {request.url.path}", ip, agent, key["id"])
@@ -144,6 +174,14 @@ def _guard(fn):
             if hasattr(result, "__await__"):
                 result = await result
             return _envelope(result, request) if isinstance(result, dict) else result
+        except _QuotaExceeded as exc:
+            res = _fail(exc.message, exc.status, exc.code,
+                        retry_after_s=exc.retry_after, scope=exc.scope,
+                        usage=exc.usage,
+                        request_id=getattr(request.state, "request_id", None)
+                        if request is not None else None)
+            res.headers["Retry-After"] = str(exc.retry_after)
+            return res
         except accounts.AuthError as exc:
             return _fail(exc.message, exc.status, exc.code,
                          request_id=getattr(request.state, "request_id", None)
@@ -449,8 +487,11 @@ async def v1_whoami(request: Request):
     acct = accounts.get_account(key["account_id"])
     return {"ok": True, "account": {"id": acct["id"], "email": acct["email"]},
             "key": {"id": key["id"], "name": key["name"], "prefix": key["prefix"]},
-            "limits": {"rate_limited": False, "monthly_quota": None,
-                       "note": "there are no usage limits on this API."}}
+            "limits": {"rate_limited": True,
+                       **QUOTA.usage(key["id"]),
+                       "note": "generous per-key ceilings, not an exemption — a "
+                               "leaked key with no ceiling drains the upstream "
+                               "quota for everyone."}}
 
 
 @router.get("/api/v1/blast")

@@ -30,9 +30,29 @@ STARTED_AT = time.time()
 TTL = {"osv": 900.0, "registry": 3600.0, "hydradb": 60.0}
 
 
+# How long each kind of answer stays true enough to reuse.
+#
+# These are not arbitrary. An advisory that appears on osv.dev is news for
+# hours, so fifteen minutes of staleness costs nothing and saves an outbound
+# call on every audit of a shared dependency. A registry document changes only
+# when someone publishes, so an hour is generous and still catches a publish
+# well inside the window the live feed already watches. A graph traversal is
+# expensive and the graph moves only as fast as the crawler writes, so a minute
+# absorbs the burst of identical requests a single page load produces without
+# ever showing a number that is meaningfully old.
+TTL_OSV = 900.0        # 15 minutes
+TTL_REGISTRY = 3600.0  # 1 hour
+TTL_GRAPH = 60.0       # 1 minute
+
+
 class Cache:
     """A small TTL cache that reports whether it hit, because a latency number
-    means something different when it came from memory."""
+    means something different when it came from memory.
+
+    Counters are kept per namespace as well as in total. One aggregate hit rate
+    hides the thing worth knowing: OSV and the registry should hit most of the
+    time, and if they are not, the TTLs are wrong or the keys are.
+    """
 
     def __init__(self, max_entries: int = 4000):
         self._data: dict[str, tuple[float, object]] = {}
@@ -40,6 +60,13 @@ class Cache:
         self.max_entries = max_entries
         self.hits = 0
         self.misses = 0
+        self.evictions = 0
+        self._ns: dict[str, dict[str, int]] = {}
+
+    def _bump(self, key: str, field: str) -> None:
+        ns = key.split(":", 1)[0] if ":" in key else "other"
+        slot = self._ns.setdefault(ns, {"hits": 0, "misses": 0})
+        slot[field] += 1
 
     def get(self, key: str, ttl: float):
         now = time.time()
@@ -47,8 +74,10 @@ class Cache:
             hit = self._data.get(key)
             if hit and now - hit[0] < ttl:
                 self.hits += 1
+                self._bump(key, "hits")
                 return hit[1], True
-        self.misses += 1
+            self.misses += 1
+            self._bump(key, "misses")
         return None, False
 
     def put(self, key: str, value):
@@ -57,12 +86,97 @@ class Cache:
             if len(self._data) > self.max_entries:
                 for k in sorted(self._data, key=lambda k: self._data[k][0])[:500]:
                     self._data.pop(k, None)
+                    self.evictions += 1
+
+    def cached(self, key: str, ttl: float, produce):
+        """get-or-produce. The caller does not have to remember to put()."""
+        value, hit = self.get(key, ttl)
+        if hit:
+            return value
+        value = produce()
+        self.put(key, value)
+        return value
 
     def stats(self):
         total = self.hits + self.misses
+        by_ns = {}
+        for ns, c in sorted(self._ns.items()):
+            t = c["hits"] + c["misses"]
+            by_ns[ns] = {**c, "hit_rate": round(c["hits"] / t, 3) if t else None}
         return {"entries": len(self._data), "hits": self.hits,
-                "misses": self.misses,
-                "hit_rate": round(self.hits / total, 3) if total else None}
+                "misses": self.misses, "evictions": self.evictions,
+                "hit_rate": round(self.hits / total, 3) if total else None,
+                "ttl_seconds": {"osv": TTL_OSV, "registry": TTL_REGISTRY,
+                                "graph": TTL_GRAPH},
+                "by_source": by_ns}
+
+
+# One cache for the whole process. Previously intel.py kept a private dict with
+# a flat TTL and no counters, while /api/health reported a separate instance
+# that nothing ever called — so the hit rate read 0 forever no matter how well
+# the caching was actually working.
+CACHE = Cache()
+
+
+class KeyQuota:
+    """Per-key ceilings: a burst limit and a daily cap.
+
+    An API key used to be exempt from rate limiting entirely, on the reasoning
+    that a key identifies a real integrator. That is exactly backwards for the
+    failure that matters: a leaked key is *more* dangerous than an anonymous
+    flood, because it is trusted. One key in a public repository would have
+    drained the OSV quota and pinned the CPU with nothing to stop it and no
+    signal that it was happening.
+
+    So a key raises the ceiling rather than removing it. The daily cap is the
+    part that actually bounds the bill — a per-minute limit alone still permits
+    a sustained 24-hour drain.
+    """
+
+    def __init__(self, per_minute: int = 3000, per_day: int = 250_000):
+        self.per_minute = per_minute
+        self.per_day = per_day
+        self._minute: dict[str, deque] = {}
+        self._day: dict[str, list] = {}          # [window_start, count]
+        self._lock = threading.Lock()
+
+    def check(self, key_id: str):
+        """(allowed, retry_after_s, scope). `scope` says which ceiling bit, so
+        the 429 can explain itself instead of being a bare refusal."""
+        now = time.time()
+        with self._lock:
+            day = self._day.setdefault(key_id, [now, 0])
+            if now - day[0] >= 86400:
+                day[0], day[1] = now, 0
+            if day[1] >= self.per_day:
+                return False, int(86400 - (now - day[0])) + 1, "daily"
+
+            q = self._minute.setdefault(key_id, deque())
+            while q and now - q[0] > 60.0:
+                q.popleft()
+            if len(q) >= self.per_minute:
+                return False, int(60 - (now - q[0])) + 1, "burst"
+
+            q.append(now)
+            day[1] += 1
+
+            if len(self._minute) > 5000:
+                for k in [k for k, v in self._minute.items() if not v][:2000]:
+                    self._minute.pop(k, None)
+            return True, 0, ""
+
+    def usage(self, key_id: str) -> dict:
+        with self._lock:
+            day = self._day.get(key_id) or [time.time(), 0]
+            minute = len(self._minute.get(key_id) or ())
+        return {"minute_used": minute, "minute_limit": self.per_minute,
+                "day_used": day[1], "day_limit": self.per_day,
+                "day_resets_in_s": max(0, int(86400 - (time.time() - day[0])))}
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {"keys_seen": len(self._day),
+                    "per_minute": self.per_minute, "per_day": self.per_day}
 
 
 class RateLimiter:

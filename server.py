@@ -173,6 +173,50 @@ def ensure_db() -> None:
         conn.close()
 
 
+# The largest lockfile this will read. A real package-lock.json for a large
+# monorepo is a few megabytes; 10MB is generous for anything genuine and small
+# enough that a hostile upload cannot exhaust memory. The body is read into RAM
+# to be parsed, so this bound is the memory bound.
+MAX_LOCKFILE_BYTES = int(os.environ.get("MAX_LOCKFILE_BYTES", 10 * 1024 * 1024))
+
+# npm's own rules: optional @scope/, lowercase, and a restricted character set.
+# Applied at the edge so a malformed name is a 422 with a reason rather than a
+# lookup that silently misses. It is not an injection defence — no user string
+# reaches a Cypher query, see tests/test_cypher_safety.py — it is input
+# validation, which is a different and also necessary thing.
+PACKAGE_NAME_PATTERN = r"^(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$"
+
+
+def too_large(limit: int, got: int):
+    return JSONResponse(
+        {"ok": False, "error": "payload_too_large",
+         "message": f"lockfile is {got:,} bytes; the limit is {limit:,}. "
+                    "If this is a genuine lockfile that big, open an issue.",
+         "limit_bytes": limit, "received_bytes": got},
+        status_code=413)
+
+
+async def read_capped_body(request: Request, limit: int = MAX_LOCKFILE_BYTES):
+    """Read the body, refusing anything over the cap.
+
+    Content-Length is checked first so an oversized upload is rejected before a
+    single byte of it is buffered, and the stream is still measured as it
+    arrives because Content-Length is a claim, not a guarantee — a chunked
+    request has none, and a lying one is exactly the request worth stopping.
+    """
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > limit:
+        return None, too_large(limit, int(declared))
+
+    chunks, total = [], 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            return None, too_large(limit, total)
+        chunks.append(chunk)
+    return b"".join(chunks), None
+
+
 def fail(message: str, status: int = 400, code: str = "bad_request", **extra):
     """Every failure carries a machine-readable code as well as prose."""
     return JSONResponse({"ok": False, "error": code, "message": message, **extra},
@@ -258,7 +302,9 @@ def not_yet(name: str, ms: float):
 # --------------------------------------------------------------------------
 
 apimeta.setup_logging()
-_cache = apimeta.Cache()
+# The one cache the whole process shares — intel.py fills it with OSV and
+# registry answers, and the traversal endpoints below add graph results.
+_cache = apimeta.CACHE
 
 # Concurrent identical traversals share one walk. See api_blast.
 _flight = apimeta.SingleFlight()
@@ -675,7 +721,8 @@ def api_health():
 
 
 @app.get("/api/blast")
-def api_blast(name: str = Query(..., min_length=1, max_length=214),
+def api_blast(name: str = Query(..., min_length=1, max_length=214,
+                                pattern=PACKAGE_NAME_PATTERN),
               depth: int = Query(5, ge=1, le=blast.MAX_DEPTH),
               limit: int = Query(5000, ge=1, le=200_000)):
     """Who is transitively exposed, and at what depth.
@@ -690,9 +737,21 @@ def api_blast(name: str = Query(..., min_length=1, max_length=214),
     if not ok:
         return not_yet(name, ms_lookup)
 
-    key = f"blast:{name}:{depth}:{limit}"
+    # Two different problems, two different mechanisms. Single-flight collapses
+    # requests that arrive *together* onto one walk; the cache serves requests
+    # that arrive *shortly after* one. A page load does both: several panels
+    # ask at once, and then the visitor reloads.
+    key = f"graph:blast:{name}:{depth}:{limit}"
+    cached, was_hit = _cache.get(key, apimeta.TTL_GRAPH)
+    if was_hit:
+        result, ms = cached
+        return {**result, "name": name, "vertex_id": pkg_id(name),
+                "latency_ms": round(ms, 1), "lookup_ms": round(ms_lookup, 1),
+                "cached": True, "coalesced": False}
+
     (result, ms), shared = _flight.run(
         key, lambda: blast.blast_radius(hydra, name, depth, limit))
+    _cache.put(key, (result, ms))
     return {**result, "name": name, "vertex_id": pkg_id(name),
             "latency_ms": round(ms, 1), "lookup_ms": round(ms_lookup, 1),
             # A follower waited for somebody else's traversal, so its latency
@@ -702,7 +761,8 @@ def api_blast(name: str = Query(..., min_length=1, max_length=214),
 
 
 @app.get("/api/resolve")
-def api_resolve(name: str = Query(..., min_length=1, max_length=214),
+def api_resolve(name: str = Query(..., min_length=1, max_length=214,
+                                pattern=PACKAGE_NAME_PATTERN),
                 bad_version: str = Query(..., min_length=1, max_length=64)):
     """Whose declared range would actually have admitted the bad version."""
     with db() as conn:
@@ -717,16 +777,17 @@ def api_resolve(name: str = Query(..., min_length=1, max_length=214),
 
 @app.post("/api/lockfile")
 async def api_lockfile(request: Request,
-                       name: str = Query(..., min_length=1, max_length=214),
+                       name: str = Query(..., min_length=1, max_length=214,
+                                pattern=PACKAGE_NAME_PATTERN),
                        bad_version: str | None = Query(None, max_length=64),
                        depth: int = Query(5, ge=1, le=blast.MAX_DEPTH)):
     """The raw package-lock.json is the request body; the incident is the query
     string. Returns EXPOSED / SHIELDED / CLEAR plus the path that reaches it."""
-    raw = await request.body()
+    raw, oversize = await read_capped_body(request)
+    if oversize is not None:
+        return oversize
     if not raw:
         return fail("empty body — POST the package-lock.json as the request body")
-    if len(raw) > 64 * 1024 * 1024:
-        return fail("lockfile larger than 64MB", status=413)
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -759,11 +820,11 @@ async def api_audit(request: Request,
     there is an incident: is anything in my tree already known to be malicious?
     It needs no graph coverage at all — the lockfile is the tree.
     """
-    raw = await request.body()
+    raw, oversize = await read_capped_body(request)
+    if oversize is not None:
+        return oversize
     if not raw:
         return fail("empty body — POST the package-lock.json as the request body")
-    if len(raw) > 64 * 1024 * 1024:
-        return fail("lockfile larger than 64MB", status=413)
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -789,7 +850,8 @@ async def api_audit(request: Request,
 
 
 @app.get("/api/maintainers")
-def api_maintainers(name: str = Query(..., min_length=1, max_length=214),
+def api_maintainers(name: str = Query(..., min_length=1, max_length=214,
+                                pattern=PACKAGE_NAME_PATTERN),
                     limit: int = Query(200, ge=1, le=2000)):
     """What else the compromised maintainers publish — the next blast radius."""
     with db() as conn:
@@ -815,7 +877,8 @@ def api_feed(limit: int = Query(25, ge=1, le=60)):
 
 
 @app.get("/api/expand")
-def api_expand(name: str = Query(..., min_length=1, max_length=214),
+def api_expand(name: str = Query(..., min_length=1, max_length=214,
+                                pattern=PACKAGE_NAME_PATTERN),
                kind: str = Query("package", pattern="^(package|maintainer|advisory)$"),
                limit: int = Query(40, ge=1, le=200)):
     """One node and everything adjacent to it, across every edge type.
@@ -864,7 +927,8 @@ def api_blast_advisory(osv_id: str = Query(..., min_length=3, max_length=64),
 
 
 @app.get("/api/typosquat-risk")
-def api_typosquat_risk(name: str = Query(..., min_length=1, max_length=214),
+def api_typosquat_risk(name: str = Query(..., min_length=1, max_length=214,
+                                pattern=PACKAGE_NAME_PATTERN),
                        depth: int = Query(3, ge=1, le=blast.MAX_DEPTH)):
     """Similarly-named packages, and how many packages already pull each one.
     A near-miss name with real dependents is an incident, not a curiosity."""
@@ -872,7 +936,8 @@ def api_typosquat_risk(name: str = Query(..., min_length=1, max_length=214),
 
 
 @app.get("/api/intel")
-def api_intel(name: str = Query(..., min_length=1, max_length=214),
+def api_intel(name: str = Query(..., min_length=1, max_length=214,
+                                pattern=PACKAGE_NAME_PATTERN),
               version: str | None = Query(None, max_length=64)):
     """Is this package real, current, and compromised? — live, for any of npm.
 
@@ -891,7 +956,8 @@ def api_intel(name: str = Query(..., min_length=1, max_length=214),
 
 
 @app.get("/api/scan")
-def api_scan(name: str = Query(..., min_length=1, max_length=214),
+def api_scan(name: str = Query(..., min_length=1, max_length=214,
+                                pattern=PACKAGE_NAME_PATTERN),
              version: str = Query(..., min_length=1, max_length=64),
              against: str | None = Query(None, max_length=64)):
     """Download the published tarball and read it. Optionally diff a release.
@@ -904,7 +970,8 @@ def api_scan(name: str = Query(..., min_length=1, max_length=214),
 
 
 @app.get("/api/fix")
-def api_fix(name: str = Query(..., min_length=1, max_length=214),
+def api_fix(name: str = Query(..., min_length=1, max_length=214,
+                                pattern=PACKAGE_NAME_PATTERN),
             bad_version: str = Query(..., min_length=1, max_length=64),
             depth: int = Query(5, ge=1, le=blast.MAX_DEPTH)):
     """A remediation bundle: the safe version, the exact commands, the
@@ -928,7 +995,8 @@ def api_fix(name: str = Query(..., min_length=1, max_length=214),
 
 
 @app.get("/api/subgraph")
-def api_subgraph(name: str = Query(..., min_length=1, max_length=214),
+def api_subgraph(name: str = Query(..., min_length=1, max_length=214,
+                                pattern=PACKAGE_NAME_PATTERN),
                  depth: int = Query(3, ge=1, le=blast.MAX_DEPTH),
                  per_level: int = Query(28, ge=1, le=120),
                  max_nodes: int = Query(160, ge=2, le=600)):
@@ -992,7 +1060,8 @@ async def api_events(request: Request):
 
 
 @app.get("/api/typosquats")
-def api_typosquats(name: str = Query(..., min_length=1, max_length=214)):
+def api_typosquats(name: str = Query(..., min_length=1, max_length=214,
+                                pattern=PACKAGE_NAME_PATTERN)):
     """One-edit neighbours of this name that actually exist on npm."""
     with db() as conn:
         result, ms = blast.typosquat_ring(conn, name)
@@ -1067,7 +1136,10 @@ async def api_watch_register(request: Request,
     endpoint for this project — it is not recoverable, and it is not stored in
     a form we can read back to you.
     """
-    raw = (await request.body()).decode("utf-8", "replace")
+    body, oversize = await read_capped_body(request)
+    if oversize is not None:
+        return oversize
+    raw = (body or b"").decode("utf-8", "replace")
     if not raw.strip():
         return fail("send the lockfile or manifest as the request body.",
                     code="empty_body")
