@@ -39,6 +39,7 @@ import lockfiles
 import notify
 import platform_api
 import scan
+import sidecar
 import watch as watchmod
 from hydra import Hydra, HydraError, pkg_id
 from ingest import DEPS_DB, SIDECAR_SCHEMA
@@ -156,12 +157,17 @@ def demo_for(request):
     return JSONResponse(body, status_code=hit.get("status", 200))
 
 
-def db() -> sqlite3.Connection:
-    """A fresh read connection per request. WAL means readers never block the
-    crawler, which is still writing while the console is being demoed."""
-    conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
-    conn.execute("PRAGMA query_only=ON")
-    return conn
+def db():
+    """A connection to the predicate store — SQLite locally, Postgres in
+    production. See sidecar.py for why: a Render disk attaches to one service,
+    the worker writes this store and the web service reads it, and SQLite has
+    no network protocol.
+
+    The call sites are unchanged either way; sidecar presents the sqlite3
+    Connection surface over a pooled Postgres connection. On SQLite, WAL means
+    readers never block the crawler that is still writing.
+    """
+    return sidecar.connect(DB_PATH, read_only=True)
 
 
 def ensure_db() -> None:
@@ -659,7 +665,7 @@ def api_health():
             q = blast.quick_stats(conn)
         out["components"]["sidecar"] = {
             "up": True, "packages": q["packages"], "edges": q["edges"],
-            "latency_ms": q["latency_ms"]}
+            "latency_ms": q["latency_ms"], **sidecar.describe()}
         out["components"]["crawl"] = q["crawl"]
     except Exception as e:
         out["components"]["sidecar"] = {"up": False, "error": str(e)[:200]}
