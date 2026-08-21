@@ -16,6 +16,19 @@ from typing import Any, Iterable
 import requests
 
 HYDRA_URL = os.environ.get("HYDRA_URL", "http://127.0.0.1:8443")
+
+# HydraDB listens on two ports, and they are not interchangeable.
+#
+#   HYDRA_URL        the HTTP query API   /v1/graphs/{graph}/query
+#   HYDRA_ADMIN_URL  the admin surface    /readyz, /metrics
+#
+# Locally the compose file publishes 8443 and 9090. On Render the query port
+# comes from $PORT (Render picks 10000) while the admin port stays 9090, so
+# there is no single base URL that serves both — a readiness probe aimed at the
+# query port gets a 404 for /readyz, which reads as "not ready" forever against
+# a database that is perfectly healthy.
+HYDRA_ADMIN_URL = os.environ.get("HYDRA_ADMIN_URL", "http://127.0.0.1:9090")
+
 HYDRA_GRAPH = os.environ.get("HYDRA_GRAPH", "default")
 HYDRA_CELL = os.environ.get("HYDRA_CELL", "cell-0")
 
@@ -198,7 +211,15 @@ class Hydra:
             total += len(buf)
         return total
 
-    def wait_ready(self, admin: str = "http://127.0.0.1:9090", timeout: int = 180) -> None:
+    def wait_ready(self, admin: str | None = None, timeout: int = 180) -> None:
+        """Block until the graph can actually execute, not merely accept a socket.
+
+        `admin` defaults to HYDRA_ADMIN_URL rather than a hardcoded loopback
+        address: on Render the admin port is on a different host and a different
+        port from the query API, and hardcoding 127.0.0.1 made this probe check
+        the health of nothing at all.
+        """
+        admin = admin or HYDRA_ADMIN_URL
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:

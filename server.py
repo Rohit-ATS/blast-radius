@@ -138,8 +138,23 @@ DEMO_PATH = os.path.join(HERE, "fixtures", "demo.json")
 _demo: dict = {}
 
 
+_demo_loaded = False
+
+
 def load_demo():
-    global _demo
+    """Parse the captured responses. Lazy on purpose.
+
+    These exist as a *fallback* — a real answer recorded earlier, served when a
+    live call fails. A deploy that never has a failure never needs them, so a
+    web process should not pay for parsing them at boot. It is only ~1.1MB
+    resident, so this is not what was causing the OOM (two gunicorn workers
+    were), but it is memory and startup time bought for an eventuality rather
+    than a certainty.
+    """
+    global _demo, _demo_loaded
+    if _demo_loaded:
+        return len(_demo)
+    _demo_loaded = True
     try:
         with open(DEMO_PATH, encoding="utf-8") as fh:
             raw = json.load(fh)
@@ -157,6 +172,8 @@ def demo_key(request) -> str:
 
 def demo_for(request):
     """A captured response for this exact path and query string, or None."""
+    if not _demo_loaded:
+        load_demo()
     hit = _demo.get(demo_key(request))
     if not hit:
         return None
@@ -282,9 +299,10 @@ def fail(message: str, status: int = 400, code: str = "bad_request", **extra):
 
 @app.exception_handler(HydraError)
 async def hydra_down(request: Request, exc: HydraError):
-    """Two different 503s, because they mean different things to whoever is
-    looking at the console: the database is gone, or it is here but still
-    paging the store in and timing out its own 30-second query limit."""
+    """Two different answers, because they mean different things to whoever is
+    looking at the console: the database is here but still paging the store in
+    (transient — 503 and come back), or it is gone (a failed dependency — 424,
+    and the OSV-backed half of the product is still working)."""
     detail = str(exc)[:400]
     # A refused connection is never "warming". Before this check, a graph that
     # was not listening at all reported `graph_warming` with "this clears on its
@@ -302,8 +320,13 @@ async def hydra_down(request: Request, exc: HydraError):
                          "traversals. This clears on its own."),
              "warmup": {k: v for k, v in _warm.items() if k != "event"},
              "detail": detail,
-             "hint": "retry in a few seconds; GET /api/health tracks the state"},
-            status_code=503)
+             "hint": "retry in a few seconds; GET /api/health tracks the state",
+             "retry_after_s": 10},
+            # 503 is right *here* and nowhere else in this handler: warming is
+            # genuinely transient and retrying genuinely works, which is what
+            # 503 plus Retry-After means.
+            status_code=503,
+            headers={"Retry-After": "10"})
     # A graph endpoint with no graph is a clear, typed 503 — never a 500, and
     # never an empty result, which would read as "nothing depends on this".
     # Everything OSV-backed (audit, intel, fix, lockfile scanning) needs no
@@ -322,7 +345,20 @@ async def hydra_down(request: Request, exc: HydraError):
          "hint": ("docker compose up -d hydradb" if local else
                   "check the hydradb service and that HYDRA_URL matches the "
                   "port it is listening on; GET /api/health reports both")},
-        status_code=503)
+        # 424 Failed Dependency, not 503 Service Unavailable. This service is
+        # up and most of it works — audit, intel, fix and lockfile scanning
+        # need no graph at all. 503 says "come back later, nothing works here",
+        # which is both untrue and, on a platform that reads status codes,
+        # actively harmful: a 5xx from an endpoint is one signal away from a
+        # health check that takes the whole site out of rotation.
+        status_code=424)
+
+
+def hydra_admin_url() -> str:
+    """Where readiness lives. Separate from HYDRA_URL because they are separate
+    ports — and on Render, separate numbers."""
+    from hydra import HYDRA_ADMIN_URL
+    return HYDRA_ADMIN_URL
 
 
 def known(name: str):
@@ -668,9 +704,11 @@ def _warm_supervisor() -> None:
 
 @app.on_event("startup")
 def _start_background_threads():
-    n = load_demo()
+    # Only DEMO_MODE needs them up front; otherwise they load on first use.
+    n = load_demo() if DEMO_MODE else "lazy"
     apimeta.log("startup", demo_mode=DEMO_MODE, fixtures=n,
-                rate_limit=RATE_LIMIT)
+                rate_limit=RATE_LIMIT,
+                hydra_url=HYDRA_URL, hydra_admin_url=hydra_admin_url())
     threading.Thread(target=_warm_supervisor, daemon=True, name="warm").start()
     threading.Thread(target=_probe_writable, daemon=True, name="writable").start()
     if LIVE_FEED and not DEMO_MODE:
@@ -810,20 +848,44 @@ def api_health():
     # because bouncing the process changes nothing about any of them and only
     # takes the working half of the product offline with it.
     sidecar_state = out["components"].get("sidecar") or {}
-    unrecoverable = (not sidecar_state.get("up", False)
-                     and sidecar_state.get("backend") == "sqlite")
-    out["restart_recommended"] = unrecoverable
+
+    # `restart_recommended` is advice, and it is NOT wired to the status code.
+    #
+    # It was, and that took the whole site down. A web service with no
+    # DATABASE_URL falls back to an empty SQLite file, reports "no such table:
+    # meta", and was judged unrecoverable — so /api/health answered 503, Render
+    # read that as unhealthy, stopped routing, and served 502 to every visitor.
+    # The app was fine. The landing page, the docs, the OSV-backed audit, intel
+    # and remediation were all working, and none of them needed the store that
+    # was missing.
+    #
+    # Restarting fixes none of these: a missing environment variable, an
+    # unreachable graph, an OSV outage. Every one of them survives a restart
+    # unchanged, and the restart costs the working half of the product.
+    out["restart_recommended"] = (
+        not sidecar_state.get("up", False)
+        and sidecar_state.get("backend") == "sqlite")
+    down = [name for name, c in out["components"].items()
+            if isinstance(c, dict) and c.get("up") is False]
     out["degraded_reason"] = (
         None if out["status"] == "ok"
-        else "; ".join(
-            f"{name} unavailable"
-            for name, c in out["components"].items()
-            if isinstance(c, dict) and c.get("up") is False) or out["status"])
+        else ("; ".join(f"{n} unreachable" for n in down) or out["status"]))
+    out["still_working"] = sorted(
+        name for name, c in out["components"].items()
+        if isinstance(c, dict) and c.get("up") is True)
 
-    # 200 while this process can answer at all. Liveness is "should I be
-    # restarted", not "is every dependency healthy" — and the body says exactly
-    # which parts are working, so nothing is hidden by the status code.
-    return JSONResponse(out, status_code=503 if unrecoverable else 200)
+    # 200, always, if we got far enough to compose this.
+    #
+    # Liveness asks one question: is this process able to serve? A process that
+    # can assemble this response and hand it back demonstrably is. Every
+    # component that is not working says so in the body — `status`,
+    # `degraded_reason`, and each component's own `up` — so nothing is hidden;
+    # it is simply not smuggled into a status code that a platform will act on
+    # by killing the service.
+    #
+    # If the process genuinely cannot serve, it will not answer at all, and the
+    # health check times out — which is the signal a restart should act on.
+    return JSONResponse(out, status_code=200)
 
 
 @app.get("/api/blast")

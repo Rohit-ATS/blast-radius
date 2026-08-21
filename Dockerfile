@@ -42,7 +42,13 @@ COPY fixtures/ ./fixtures/
 # so a fresh worker has something to crawl before anyone visits the site.
 COPY seeds.txt seeds_expanded.txt ./
 COPY deploy/app-entrypoint.sh /usr/local/bin/app-entrypoint.sh
-RUN chmod +x /usr/local/bin/app-entrypoint.sh
+# Strip CR before chmod. A checkout on Windows can hand these over with
+# CRLF endings, and Linux then reads the trailing  as part of the
+# interpreter path — the container dies with
+#     exec /usr/local/bin/...: no such file or directory
+# naming a file that is plainly there. .gitattributes pins LF in the repo;
+# this makes the image correct regardless of how the file arrived.
+RUN sed -i 's/$//' /usr/local/bin/app-entrypoint.sh && chmod +x /usr/local/bin/app-entrypoint.sh
 
 # Nothing in here needs root at runtime.
 RUN useradd --create-home --uid 10001 blast \

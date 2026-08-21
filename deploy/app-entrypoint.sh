@@ -20,20 +20,36 @@ log() { echo "[entrypoint] $*"; }
 wait_for_graph() {
     [ -n "${HYDRA_URL:-}" ] || return 0
     tries="${GRAPH_WAIT_TRIES:-30}"
+    admin="${HYDRA_ADMIN_URL:-}"
     i=0
+
+    log "graph query API : ${HYDRA_URL}"
+    log "graph admin API : ${admin:-<unset — falling back to a query-port probe>}"
+
     while [ "$i" -lt "$tries" ]; do
-        # Any HTTP status means the listener is up, which is the only question
-        # being asked here. An unauthenticated probe of the query port is
-        # *supposed* to be refused — demanding a 2xx (curl -f) made a correctly
-        # secured graph look like a dead one, and the app waited out its whole
-        # timeout beside a perfectly healthy database.
-        code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${HYDRA_URL}/" 2>/dev/null || echo 000)"
-        if [ "$code" != "000" ]; then
-            log "graph listening at ${HYDRA_URL} (HTTP ${code})"
-            return 0
+        # Readiness lives on the ADMIN port (/readyz), not the query port. They
+        # are different ports and on Render different numbers entirely: the
+        # query API takes $PORT (10000) while admin stays 9090. Probing /readyz
+        # on the query port returns 404 forever against a healthy database.
+        if [ -n "$admin" ]; then
+            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${admin}/readyz" 2>/dev/null || echo 000)"
+            if [ "$code" -ge 200 ] 2>/dev/null && [ "$code" -lt 400 ] 2>/dev/null; then
+                log "graph ready: ${admin}/readyz -> ${code}"
+                return 0
+            fi
+        else
+            # No admin URL configured. Fall back to asking whether anything at
+            # all answers on the query port — any status proves a listener,
+            # since an unauthenticated probe is *supposed* to be refused.
+            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${HYDRA_URL}/" 2>/dev/null || echo 000)"
+            if [ "$code" != "000" ]; then
+                log "graph listening at ${HYDRA_URL} (HTTP ${code})"
+                return 0
+            fi
         fi
+
         i=$((i + 1))
-        log "waiting for ${HYDRA_URL} (${i}/${tries})"
+        log "waiting for the graph (${i}/${tries}) last status: ${code}"
         sleep 4
     done
     log "graph still unreachable after ${tries} attempts; starting anyway so the"
@@ -43,12 +59,16 @@ wait_for_graph() {
 case "$ROLE" in
   web)
     wait_for_graph
-    # Two workers, not four: the box is small and each one holds its own
-    # HydraDB connection pool and SQLite handles. The timeout is generous
-    # because a depth-5 traversal over this graph legitimately takes seconds.
+    # ONE worker by default. Each gunicorn worker is a full copy of the app —
+    # interpreter, fixtures, Supabase client, connection pool — and two of them
+    # exceeded a 512Mi instance and were OOM-killed in a loop. This work is
+    # I/O-bound on the graph and on Postgres, which a single uvicorn worker
+    # already overlaps through async; the second process bought concurrency
+    # this workload was not short of, at twice the memory. The timeout is
+    # generous because a depth-5 traversal legitimately takes seconds.
     exec gunicorn server:app \
         --worker-class uvicorn.workers.UvicornWorker \
-        --workers "${WEB_CONCURRENCY:-2}" \
+        --workers "${WEB_CONCURRENCY:-1}" \
         --bind "0.0.0.0:${PORT}" \
         --timeout "${WEB_TIMEOUT:-120}" \
         --graceful-timeout 30 \
