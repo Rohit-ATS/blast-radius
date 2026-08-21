@@ -18,3 +18,4 @@ __pycache__/
 seeds_expanded.txt
 bench.log
 .claude/
+watch.db

@@ -10,8 +10,10 @@ Run:  py server.py            (http://127.0.0.1:8000)
 
 import argparse
 import asyncio
+import functools
 import json
 import os
+import queue
 import sqlite3
 import threading
 import time
@@ -28,8 +30,10 @@ import blast
 import chains
 import feed as feedmod
 import intel
+import live as livemod
 import lockfiles
 import scan
+import watch as watchmod
 from hydra import Hydra, HydraError, pkg_id
 from ingest import DEPS_DB, SIDECAR_SCHEMA
 
@@ -91,6 +95,16 @@ NPM_TOTAL = 4_311_957
 # determinism matters more than liveness.
 LIVE_FEED = os.environ.get("LIVE_FEED", "1") == "1"
 _feed = feedmod.Feed(hydra=hydra, blast_mod=blast)
+
+# Continuous multi-ecosystem ingestion. This is what keeps the graph current;
+# without it a blast radius is computed against whenever the last batch crawl
+# happened to stop. Off in DEMO_MODE, where a recording has to be deterministic.
+LIVE_INGEST = os.environ.get("LIVE_INGEST", "1") == "1"
+_live = livemod.LiveIngest(hydra=hydra) if LIVE_INGEST else None
+
+# Registered projects and their alerts. Created either way: the endpoints must
+# answer honestly rather than 500 when ingestion is off.
+_registry = watchmod.Registry(hydra=hydra)
 
 # Demo safety. DEMO_MODE=1 serves captured real responses for the preset
 # incidents, so a recording is deterministic and instant. Independently of that
@@ -478,6 +492,13 @@ def _start_background_threads():
     threading.Thread(target=_probe_writable, daemon=True, name="writable").start()
     if LIVE_FEED and not DEMO_MODE:
         _feed.start()
+    if _live is not None and not DEMO_MODE:
+        # Every package written into the graph is offered to the alert router,
+        # which decides — by traversal — whose problem it is.
+        _live.subscribe(_registry.route_async)
+        _live.start()
+        apimeta.log("live_ingest_started",
+                    ecosystems=[a.name for a in _live.adapters])
     threading.Thread(target=_refresh_graph_counts, daemon=True,
                      name="graph-counts").start()
 
@@ -889,6 +910,188 @@ def api_search(q: str = Query("", max_length=214),
 # --------------------------------------------------------------------------
 # static console — same origin, same port, no build step
 # --------------------------------------------------------------------------
+
+# ==========================================================================
+# Live ingestion and project monitoring
+#
+# These are the endpoints a real project integrates against: register your
+# lockfile once, then either receive webhooks or hold open an SSE stream. The
+# routing behind them is a HydraDB traversal from the package that just
+# published to the projects that install it — see watch.py.
+# ==========================================================================
+
+@app.get("/api/live/status")
+def api_live_status():
+    """What the ingestion daemon is actually doing, per registry.
+
+    This is deliberately unflattering: an ecosystem that is backed off, erroring
+    or stopped says so, with the last error and the seconds since its last
+    successful poll. A monitoring product whose own status page is optimistic is
+    not a monitoring product.
+    """
+    if _live is None:
+        return {"ok": True, "running": False,
+                "reason": "live ingestion disabled (LIVE_INGEST=0 or DEMO_MODE)",
+                "ecosystems": [], "ecosystems_live": 0, "ecosystems_total": 0}
+    return {"ok": True, **_live.status()}
+
+
+@app.get("/api/live/events")
+def api_live_events(limit: int = Query(40, ge=1, le=200),
+                    ecosystem: str = Query("", max_length=20)):
+    """Packages written into the graph in the last few minutes, newest first."""
+    if _live is None:
+        return {"ok": True, "events": [], "running": False}
+    events = _live.recent(limit=200)
+    if ecosystem:
+        events = [e for e in events if e["ecosystem"] == ecosystem]
+    return {"ok": True, "running": True, "events": events[:limit],
+            "counts_by_ecosystem": _live.status()["ecosystems"]}
+
+
+@app.post("/api/watch/register")
+async def api_watch_register(request: Request,
+                             name: str = Query(..., min_length=1, max_length=120),
+                             ecosystem: str = Query("", max_length=20),
+                             filename: str = Query("", max_length=120),
+                             webhook: str = Query("", max_length=500),
+                             depth: int = Query(0, ge=0, le=4)):
+    """Register a project from its lockfile or manifest.
+
+    The body is the raw file. Everything it resolves becomes an edge into the
+    graph, so a publish anywhere upstream routes here without a subscriber
+    table. The returned token is shown once and is required by every other
+    endpoint for this project — it is not recoverable, and it is not stored in
+    a form we can read back to you.
+    """
+    raw = (await request.body()).decode("utf-8", "replace")
+    if not raw.strip():
+        return fail("send the lockfile or manifest as the request body.",
+                    code="empty_body")
+    if webhook and not webhook.startswith(("http://", "https://")):
+        return fail("webhook must be an http(s) URL.", code="bad_webhook")
+
+    try:
+        resolved, kind, eco, precision = lockfiles.parse_project(
+            raw, filename=filename, ecosystem=ecosystem or None)
+    except lockfiles.LockfileError as exc:
+        return fail(str(exc), code="unparseable_manifest")
+
+    if not resolved:
+        return fail("no dependencies found in that file.", code="no_dependencies")
+
+    try:
+        proj = _registry.register(name, resolved, eco, precision=precision,
+                                  webhook=webhook or None,
+                                  depth=depth or None)
+    except ValueError as exc:
+        return fail(str(exc), code="invalid_project")
+
+    apimeta.log("project_registered", project=proj["project_id"],
+                ecosystem=eco, deps=proj["watching"], precision=precision)
+    return {
+        "ok": True,
+        **proj,
+        "source_kind": kind,
+        "how_to_poll": f"/api/watch/{proj['project_id']}/alerts?token=…",
+        "how_to_stream": f"/api/watch/{proj['project_id']}/stream?token=…",
+        "note": ("exact: your lockfile is the resolved tree, so depth 1 is a "
+                 "complete answer" if precision == "exact" else
+                 "inferred: a manifest names only direct dependencies, so the "
+                 "rest is reached by traversing the crawled graph"),
+    }
+
+
+def _auth(pid: str, token: str):
+    return _registry.authenticate(pid, token or "")
+
+
+@app.get("/api/watch/{pid}")
+def api_watch_status(pid: str, token: str = Query("", max_length=200)):
+    row = _auth(pid, token)
+    if not row:
+        return fail("unknown project or bad token.", status=403, code="forbidden")
+    return {"ok": True, **_registry.project_status(row)}
+
+
+@app.get("/api/watch/{pid}/alerts")
+def api_watch_alerts(pid: str, token: str = Query("", max_length=200),
+                     since: int = Query(0, ge=0),
+                     limit: int = Query(50, ge=1, le=500),
+                     min_severity: str = Query(
+                         "info", pattern="^(info|medium|high|critical)$")):
+    """Alerts for this project, newest first.
+
+    `since` is the highest alert id you have already handled, which makes this
+    safe to poll on a schedule: you get exactly what is new, and nothing twice.
+    """
+    row = _auth(pid, token)
+    if not row:
+        return fail("unknown project or bad token.", status=403, code="forbidden")
+    alerts = _registry.alerts(pid, since=since, limit=limit,
+                              min_severity=min_severity)
+    return {"ok": True, "project_id": pid, "alerts": alerts,
+            "count": len(alerts),
+            "cursor": alerts[0]["id"] if alerts else since}
+
+
+@app.post("/api/watch/{pid}/ack/{alert_id}")
+def api_watch_ack(pid: str, alert_id: int, token: str = Query("", max_length=200)):
+    row = _auth(pid, token)
+    if not row:
+        return fail("unknown project or bad token.", status=403, code="forbidden")
+    return {"ok": True, "acked": _registry.ack(pid, alert_id)}
+
+
+@app.delete("/api/watch/{pid}")
+def api_watch_delete(pid: str, token: str = Query("", max_length=200)):
+    if not _registry.unregister(pid, token or ""):
+        return fail("unknown project or bad token.", status=403, code="forbidden")
+    apimeta.log("project_unregistered", project=pid)
+    return {"ok": True, "unregistered": pid}
+
+
+@app.get("/api/watch/{pid}/stream")
+async def api_watch_stream(pid: str, token: str = Query("", max_length=200)):
+    """Server-sent events: one message per alert, as it is routed.
+
+    A heartbeat every 15 seconds keeps proxies from closing an idle connection
+    and lets the client tell "nothing has happened" apart from "the stream
+    died", which are very different things to a system you are trusting to
+    wake you up.
+    """
+    row = _auth(pid, token)
+    if not row:
+        return fail("unknown project or bad token.", status=403, code="forbidden")
+
+    q = _registry.listen(pid)
+    loop = asyncio.get_running_loop()
+
+    async def gen():
+        try:
+            yield ("event: ready\ndata: " + json.dumps({
+                "project_id": pid, "watching": row["dep_count"],
+                "precision": row["precision"]}) + "\n\n")
+            while True:
+                try:
+                    alert = await loop.run_in_executor(
+                        None, functools.partial(q.get, True, 15.0))
+                    yield "event: alert\ndata: " + json.dumps(alert) + "\n\n"
+                except queue.Empty:
+                    yield (": heartbeat " + str(int(time.time())) + "\n\n")
+        finally:
+            _registry.unlisten(pid, q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/watch")
+def api_watch_stats():
+    """Aggregate monitoring numbers — no project details, no token required."""
+    return {"ok": True, **_registry.stats()}
+
 
 @app.get("/")
 def index():

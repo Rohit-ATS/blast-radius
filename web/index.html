@@ -4,247 +4,329 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Blast Radius — npm supply-chain incident response</title>
-<meta name="description" content="When an npm package is compromised, find out who is transitively exposed, whose semver ranges would actually have pulled it, and whether your lockfile is hit. Open source, MIT licensed.">
+<meta name="description" content="When an npm package is compromised, find out who is transitively exposed, whose semver ranges would actually have pulled it, and whether your own lockfile is hit. Open source, MIT licensed.">
 <link rel="stylesheet" href="/style.css">
-<link rel="stylesheet" href="/theme.css">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='15' fill='none' stroke='%232f6bff' stroke-width='1' opacity='.28'/><circle cx='16' cy='16' r='10.5' fill='none' stroke='%232f6bff' stroke-width='1.5' opacity='.55'/><circle cx='16' cy='16' r='5' fill='%23c0392b'/></svg>">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='15' fill='none' stroke='%232f6bff' stroke-width='1' opacity='.28'/><circle cx='16' cy='16' r='10.5' fill='none' stroke='%232f6bff' stroke-width='1.5' opacity='.55'/><circle cx='16' cy='16' r='5' fill='%23d63a2f'/></svg>">
 </head>
 <body>
-<div class="dots" aria-hidden="true"></div>
 
-<!-- ============================================================== icon defs -->
-<svg class="spritesheet" aria-hidden="true" focusable="false">
-  <defs>
-    <!-- the product mark: concentric blast rings around a compromised centre -->
-    <symbol id="i-logo" viewBox="0 0 32 32">
-      <circle cx="16" cy="16" r="15" fill="none" stroke="currentColor" stroke-width="1" opacity=".22"/>
-      <circle cx="16" cy="16" r="10.5" fill="none" stroke="currentColor" stroke-width="1.6" opacity=".5"/>
-      <circle cx="16" cy="16" r="5.6" fill="currentColor" opacity=".92"/>
-      <circle cx="26.4" cy="9.2" r="2" fill="currentColor" opacity=".45"/>
-      <circle cx="7"    cy="24"  r="1.7" fill="currentColor" opacity=".35"/>
-    </symbol>
+<!-- ========================================================== icon library -->
+<svg class="spritesheet" aria-hidden="true" focusable="false"><defs>
+  <symbol id="i-logo" viewBox="0 0 32 32">
+    <circle cx="16" cy="16" r="15" fill="none" stroke="currentColor" stroke-width="1" opacity=".22"/>
+    <circle cx="16" cy="16" r="10.5" fill="none" stroke="currentColor" stroke-width="1.7" opacity=".5"/>
+    <circle cx="16" cy="16" r="5.6" fill="currentColor"/>
+  </symbol>
+  <symbol id="i-npm" viewBox="0 0 24 24">
+    <rect width="24" height="24" rx="2.6" fill="currentColor"/>
+    <path d="M5 6.2h14v11.6h-7V8.9H9.6v8.9H5z" fill="#fff"/>
+  </symbol>
+  <symbol id="i-github" viewBox="0 0 24 24">
+    <path fill="currentColor" d="M12 .5a11.5 11.5 0 0 0-3.64 22.42c.58.1.79-.25.79-.55v-2.1c-3.2.7-3.88-1.37-3.88-1.37-.53-1.34-1.29-1.7-1.29-1.7-1.06-.72.08-.7.08-.7 1.17.08 1.78 1.2 1.78 1.2 1.04 1.79 2.74 1.27 3.4.97.11-.76.41-1.28.74-1.57-2.55-.29-5.24-1.28-5.24-5.7 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.8 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.24 2.76.12 3.05.74.81 1.19 1.84 1.19 3.1 0 4.43-2.7 5.4-5.26 5.69.42.36.79 1.08.79 2.18v3.23c0 .3.21.66.8.55A11.5 11.5 0 0 0 12 .5Z"/>
+  </symbol>
+  <symbol id="i-radius" viewBox="0 0 24 24">
+    <circle cx="12" cy="12" r="2.7" fill="currentColor"/>
+    <circle cx="12" cy="12" r="6.5" fill="none" stroke="currentColor" stroke-width="1.6" opacity=".6"/>
+    <circle cx="12" cy="12" r="10.3" fill="none" stroke="currentColor" stroke-width="1.3" opacity=".3"/>
+  </symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24">
+    <rect x="4.2" y="10.2" width="15.6" height="11" rx="2.6" fill="none" stroke="currentColor" stroke-width="1.7"/>
+    <path fill="none" stroke="currentColor" stroke-width="1.7" d="M8 10.2V7.6a4 4 0 0 1 8 0v2.6"/>
+    <circle cx="12" cy="15.6" r="1.5" fill="currentColor"/>
+  </symbol>
+  <symbol id="i-pulse" viewBox="0 0 24 24">
+    <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+          d="M2 13h4.2l2.4-7 3.6 14 2.6-8.4 1.7 3.4H22"/>
+  </symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24">
+    <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"
+          d="M12 2.6 20 5.6v6.1c0 4.6-3.2 8.3-8 9.7-4.8-1.4-8-5.1-8-9.7V5.6Z"/>
+    <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m8.4 12.1 2.5 2.5 4.7-4.9"/>
+  </symbol>
+  <symbol id="i-graph" viewBox="0 0 24 24">
+    <path fill="none" stroke="currentColor" stroke-width="1.5" d="M6.6 7.6 12 5.2m5.4 2.4L12 5.2M6.6 8.4l3.1 7.2m4.6 0 3.1-7.2"/>
+    <circle cx="12" cy="4" r="2.3" fill="currentColor"/>
+    <circle cx="5.4" cy="8.6" r="2.1" fill="currentColor" opacity=".72"/>
+    <circle cx="18.6" cy="8.6" r="2.1" fill="currentColor" opacity=".72"/>
+    <circle cx="8.4" cy="18.4" r="2.1" fill="currentColor" opacity=".46"/>
+    <circle cx="15.6" cy="18.4" r="2.1" fill="currentColor" opacity=".46"/>
+  </symbol>
+  <symbol id="i-trend" viewBox="0 0 24 24">
+    <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M3 17.5 9.5 11l4 4L21 7.5"/>
+    <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M15.5 7.5H21v5.5"/>
+  </symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24">
+    <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.7"/>
+    <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M12 7v5.3l3.4 2"/>
+  </symbol>
+  <symbol id="i-check" viewBox="0 0 24 24">
+    <circle cx="12" cy="12" r="9.4" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".5"/>
+    <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m8 12.3 2.7 2.7L16.2 9"/>
+  </symbol>
+  <symbol id="i-search" viewBox="0 0 24 24">
+    <circle cx="10.8" cy="10.8" r="6.6" fill="none" stroke="currentColor" stroke-width="1.8"/>
+    <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="m15.8 15.8 4.2 4.2"/>
+  </symbol>
+  <symbol id="i-doc" viewBox="0 0 24 24">
+    <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M6 2.8h8l4.2 4.2v14.2H6Z"/>
+    <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M14 2.8V7h4.2"/>
+    <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" d="M9 12h6M9 16h6"/>
+  </symbol>
+  <symbol id="i-book" viewBox="0 0 24 24">
+    <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M3.4 4.6h6.2A2.4 2.4 0 0 1 12 7v13a2 2 0 0 0-2-1.6H3.4Z"/>
+    <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M20.6 4.6h-6.2A2.4 2.4 0 0 0 12 7v13a2 2 0 0 1 2-1.6h6.6Z"/>
+  </symbol>
+  <symbol id="i-bolt" viewBox="0 0 24 24"><path fill="currentColor" d="M13.4 2 5 13.6h5.3L9.6 22 19 10.2h-5.6Z"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24">
+    <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M12 3.2 22 20.4H2Z"/>
+    <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M12 9.8v4.4"/>
+    <circle cx="12" cy="17.2" r="1.1" fill="currentColor"/>
+  </symbol>
+  <symbol id="i-at" viewBox="0 0 24 24">
+    <circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="1.6"/>
+    <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" d="M16 8v5.4a2.6 2.6 0 0 0 5.2 0V12A9.2 9.2 0 1 0 15 20.7"/>
+  </symbol>
+  <symbol id="i-cube" viewBox="0 0 24 24">
+    <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" d="M12 2.8 20.5 7v10L12 21.2 3.5 17V7Z"/>
+    <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" d="M3.5 7 12 11.4 20.5 7M12 11.4v9.8"/>
+  </symbol>
+  <symbol id="i-db" viewBox="0 0 24 24">
+    <ellipse cx="12" cy="6" rx="7.6" ry="3.1" fill="none" stroke="currentColor" stroke-width="1.6"/>
+    <path fill="none" stroke="currentColor" stroke-width="1.6" d="M4.4 6v12c0 1.7 3.4 3.1 7.6 3.1s7.6-1.4 7.6-3.1V6M4.4 12c0 1.7 3.4 3.1 7.6 3.1s7.6-1.4 7.6-3.1"/>
+  </symbol>
+  <symbol id="i-yarn" viewBox="0 0 24 24">
+    <circle cx="12" cy="12" r="9.2" fill="none" stroke="currentColor" stroke-width="1.7"/>
+    <path fill="currentColor" d="M7.4 12.6c2.8-.8 4.3-2.4 4.7-4.8 1 1.7 1.1 3.3.5 5 1.7-.5 3.1-.2 4.2 1-2 .6-3.7 1.7-5 3.4-1.7-1.7-3.2-3.2-4.4-4.6Z"/>
+  </symbol>
+  <symbol id="i-pnpm" viewBox="0 0 24 24">
+    <g fill="currentColor">
+      <rect x="2" y="2" width="6" height="6" rx="1.2"/><rect x="9" y="2" width="6" height="6" rx="1.2"/><rect x="16" y="2" width="6" height="6" rx="1.2"/>
+      <rect x="2" y="9" width="6" height="6" rx="1.2" opacity=".5"/><rect x="9" y="9" width="6" height="6" rx="1.2"/><rect x="16" y="9" width="6" height="6" rx="1.2" opacity=".5"/>
+      <rect x="9" y="16" width="6" height="6" rx="1.2" opacity=".3"/><rect x="16" y="16" width="6" height="6" rx="1.2" opacity=".5"/>
+    </g>
+  </symbol>
+  <symbol id="i-osv" viewBox="0 0 24 24">
+    <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M12 2.6 20.4 7.3v9.4L12 21.4 3.6 16.7V7.3Z"/>
+    <circle cx="12" cy="12" r="3.4" fill="currentColor"/>
+  </symbol>
+</defs></svg>
 
-    <symbol id="i-github" viewBox="0 0 24 24">
-      <path fill="currentColor" d="M12 .5a11.5 11.5 0 0 0-3.64 22.42c.58.1.79-.25.79-.55v-2.1c-3.2.7-3.88-1.37-3.88-1.37-.53-1.34-1.29-1.7-1.29-1.7-1.06-.72.08-.7.08-.7 1.17.08 1.78 1.2 1.78 1.2 1.04 1.79 2.74 1.27 3.4.97.11-.76.41-1.28.74-1.57-2.55-.29-5.24-1.28-5.24-5.7 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.8 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.24 2.76.12 3.05.74.81 1.19 1.84 1.19 3.1 0 4.43-2.7 5.4-5.26 5.69.42.36.79 1.08.79 2.18v3.23c0 .3.21.66.8.55A11.5 11.5 0 0 0 12 .5Z"/>
-    </symbol>
-
-    <symbol id="i-radius" viewBox="0 0 24 24">
-      <circle cx="12" cy="12" r="2.6" fill="currentColor"/>
-      <circle cx="12" cy="12" r="6.4" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".55"/>
-      <circle cx="12" cy="12" r="10.2" fill="none" stroke="currentColor" stroke-width="1.3" opacity=".28"/>
-    </symbol>
-    <symbol id="i-pulse" viewBox="0 0 24 24">
-      <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"
-            d="M2 13h4.2l2.4-7 3.6 14 2.6-8.4 1.7 3.4H22"/>
-    </symbol>
-    <symbol id="i-graph" viewBox="0 0 24 24">
-      <path fill="none" stroke="currentColor" stroke-width="1.5" d="M6.6 7.6 12 5.2m5.4 2.4L12 5.2M6.6 8.4l3.1 7.2m4.6 0 3.1-7.2M9.9 17.4h4.2"/>
-      <circle cx="12" cy="4" r="2.3" fill="currentColor"/>
-      <circle cx="5.4" cy="8.6" r="2.1" fill="currentColor" opacity=".7"/>
-      <circle cx="18.6" cy="8.6" r="2.1" fill="currentColor" opacity=".7"/>
-      <circle cx="8.4" cy="18.4" r="2.1" fill="currentColor" opacity=".45"/>
-      <circle cx="15.6" cy="18.4" r="2.1" fill="currentColor" opacity=".45"/>
-    </symbol>
-    <symbol id="i-shield" viewBox="0 0 24 24">
-      <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"
-            d="M12 2.6 20 5.6v6.1c0 4.6-3.2 8.3-8 9.7-4.8-1.4-8-5.1-8-9.7V5.6Z"/>
-      <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"
-            d="m8.4 12.1 2.5 2.5 4.7-4.9"/>
-    </symbol>
-    <symbol id="i-lock" viewBox="0 0 24 24">
-      <rect x="4.2" y="10.2" width="15.6" height="11" rx="2.4" fill="none" stroke="currentColor" stroke-width="1.6"/>
-      <path fill="none" stroke="currentColor" stroke-width="1.6" d="M8 10.2V7.6a4 4 0 0 1 8 0v2.6"/>
-      <circle cx="12" cy="15.6" r="1.5" fill="currentColor"/>
-    </symbol>
-    <symbol id="i-bolt" viewBox="0 0 24 24">
-      <path fill="currentColor" d="M13.4 2 5 13.6h5.3L9.6 22 19 10.2h-5.6Z"/>
-    </symbol>
-    <symbol id="i-check" viewBox="0 0 24 24">
-      <circle cx="12" cy="12" r="9.4" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".45"/>
-      <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"
-            d="m8 12.3 2.7 2.7L16.2 9"/>
-    </symbol>
-
-    <!-- ecosystem marks -->
-    <symbol id="m-npm" viewBox="0 0 64 24">
-      <rect x="0" y="3" width="18" height="18" fill="currentColor"/>
-      <path d="M4.5 7.5h9v12h-3v-9h-3v9h-3z" fill="#fff"/>
-      <text x="23" y="18" font-family="ui-monospace, monospace" font-size="15" font-weight="600" fill="currentColor">npm</text>
-    </symbol>
-    <symbol id="m-node" viewBox="0 0 72 24">
-      <path d="M9 3.4 1.6 7.6v8.8L9 20.6l7.4-4.2V7.6Z" fill="none" stroke="currentColor" stroke-width="1.6"/>
-      <path d="M9 8.6v6.8m-2.6-1.4c0 1 .9 1.6 2.6 1.6s2.6-.6 2.6-1.5c0-2-5-1.2-5-3.2 0-.9.9-1.5 2.4-1.5 1.5 0 2.4.5 2.5 1.4"
-            fill="none" stroke="currentColor" stroke-width="1.4"/>
-      <text x="21" y="18" font-family="ui-monospace, monospace" font-size="15" font-weight="600" fill="currentColor">node</text>
-    </symbol>
-    <symbol id="m-yarn" viewBox="0 0 66 24">
-      <circle cx="10" cy="12" r="8.4" fill="none" stroke="currentColor" stroke-width="1.6"/>
-      <path d="M5.6 12.4c2.6-.7 4-2.2 4.4-4.4.9 1.5 1 3 .4 4.6 1.6-.5 2.9-.2 3.9.9-1.9.6-3.4 1.6-4.6 3.1-1.6-1.5-3-2.9-4.1-4.2Z"
-            fill="currentColor"/>
-      <text x="23" y="18" font-family="ui-monospace, monospace" font-size="15" font-weight="600" fill="currentColor">yarn</text>
-    </symbol>
-    <symbol id="m-pnpm" viewBox="0 0 72 24">
-      <g fill="currentColor">
-        <rect x="1" y="3.4" width="5" height="5" rx="1"/><rect x="7.6" y="3.4" width="5" height="5" rx="1"/><rect x="14.2" y="3.4" width="5" height="5" rx="1"/>
-        <rect x="1" y="9.6" width="5" height="5" rx="1" opacity=".55"/><rect x="7.6" y="9.6" width="5" height="5" rx="1"/><rect x="14.2" y="9.6" width="5" height="5" rx="1" opacity=".55"/>
-        <rect x="7.6" y="15.8" width="5" height="5" rx="1" opacity=".3"/><rect x="14.2" y="15.8" width="5" height="5" rx="1" opacity=".55"/>
-      </g>
-      <text x="24" y="18" font-family="ui-monospace, monospace" font-size="15" font-weight="600" fill="currentColor">pnpm</text>
-    </symbol>
-    <symbol id="m-osv" viewBox="0 0 66 24">
-      <path d="M10 3.6 17 7.4v9.2L10 20.4 3 16.6V7.4Z" fill="none" stroke="currentColor" stroke-width="1.6"/>
-      <circle cx="10" cy="12" r="3" fill="currentColor"/>
-      <text x="22" y="18" font-family="ui-monospace, monospace" font-size="15" font-weight="600" fill="currentColor">osv</text>
-    </symbol>
-    <symbol id="m-sqlite" viewBox="0 0 84 24">
-      <ellipse cx="9" cy="6.6" rx="6.6" ry="2.8" fill="none" stroke="currentColor" stroke-width="1.5"/>
-      <path d="M2.4 6.6v10.8c0 1.6 3 2.8 6.6 2.8s6.6-1.2 6.6-2.8V6.6M2.4 12c0 1.6 3 2.8 6.6 2.8s6.6-1.2 6.6-2.8"
-            fill="none" stroke="currentColor" stroke-width="1.5"/>
-      <text x="20" y="18" font-family="ui-monospace, monospace" font-size="15" font-weight="600" fill="currentColor">sqlite</text>
-    </symbol>
-    <symbol id="m-hydra" viewBox="0 0 84 24">
-      <g fill="none" stroke="currentColor" stroke-width="1.5">
-        <path d="M4 19.4V9.6a4 4 0 0 1 8 0v9.8M4 14.4h8"/>
-        <circle cx="8" cy="5" r="1.9" fill="currentColor" stroke="none"/>
-      </g>
-      <text x="17" y="18" font-family="ui-monospace, monospace" font-size="15" font-weight="600" fill="currentColor">hydradb</text>
-    </symbol>
-  </defs>
-</svg>
-
-<!-- ================================================================= topbar -->
-<header class="topbar">
-  <a class="brand" href="#top">
-    <span class="brandmark"><svg viewBox="0 0 32 32"><use href="#i-logo"/></svg></span>
-    <span class="brandword">Blast&nbsp;Radius</span>
-  </a>
-
-  <nav class="nav">
-    <a href="#lockfile">Lockfile check</a>
-    <a href="#live">Live feed</a>
-    <a href="#explorer">Explorer</a>
-    <a href="#status">Status</a>
-    <a href="#pricing">Open source</a>
-  </nav>
-
-  <div class="topactions">
-    <div class="livestats" id="livestats" aria-live="polite">
-      <span class="pulse" id="pulse" aria-hidden="true"></span>
-      <span id="statline">connecting to hydradb…</span>
-    </div>
-    <button type="button" class="mini" id="resetall" title="clear everything and start over">Reset</button>
-    <a class="btn ghost" href="https://github.com/Rohit-ATS/blast-radius" target="_blank" rel="noopener">
-      <svg class="ico" viewBox="0 0 24 24"><use href="#i-github"/></svg> GitHub
+<!-- ================================================================ header -->
+<header class="hdr">
+  <div class="wrap">
+    <a class="logo" href="#top">
+      <span class="mark"><svg viewBox="0 0 32 32"><use href="#i-logo"/></svg></span>
+      <span class="word">Blast Radius</span>
     </a>
-    <a class="btn primary" href="#queryform">Run a check</a>
+
+    <nav class="hnav">
+      <a href="#console">Console</a>
+      <a href="#resolution">Resolution</a>
+      <a href="#lockfile">Lockfile</a>
+      <a href="#analytics">Analytics</a>
+      <a href="#pricing">Pricing</a>
+    </nav>
+
+    <div class="hcta">
+      <div class="hstat" id="livestats" aria-live="polite">
+        <span class="pulse" id="pulse" aria-hidden="true"></span>
+        <span id="statline">connecting to hydradb…</span>
+      </div>
+      <button type="button" class="btn ghost-sm" id="resetall">Reset</button>
+      <a class="btn btn-primary" href="#console">Run a check</a>
+    </div>
   </div>
 </header>
 
 <main id="top">
 
-  <!-- ================================================================= hero -->
-  <section class="hero rails">
-    <!-- Pinned to the viewport edges, not to the centre, so the wordmark and
-         the input keep a clear column at every width the scatter is shown at. -->
-    <div class="scatter" id="scatter" aria-hidden="true">
-
-      <div class="win" style="left:20px; top:404px; width:288px" data-rot="-1.6">
-        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">depth histogram</span></div>
-        <div class="body" id="peek-hist"><div class="skel">querying graph…</div></div>
-        <div class="cap">depth-histogram.log</div>
-      </div>
-
-      <div class="win r" style="right:20px; top:330px; width:292px" data-rot="1.4">
-        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">maintainer pivot</span></div>
-        <div class="body" id="peek-maint"><div class="skel">querying sidecar…</div></div>
-        <div class="cap">maintainer-pivot.json</div>
-      </div>
-
-      <div class="win r" style="right:64px; top:632px; width:232px" data-rot="-1.1">
-        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">graph</span></div>
-        <div class="body" id="peek-graph"><div class="skel">counting…</div></div>
-        <div class="cap">graph-stats.txt</div>
-      </div>
-
-      <div class="sticker glasspill" style="left:34px; top:224px" data-rot="-3">
-        <svg class="ico" viewBox="0 0 24 24"><use href="#i-radius"/></svg>
-        <span>5 hops deep, one traversal</span>
-      </div>
-      <div class="sticker glasspill" style="right:34px; top:196px" data-rot="3">
-        <svg class="ico" viewBox="0 0 24 24"><use href="#i-lock"/></svg>
-        <span>Nothing is stored</span>
-      </div>
-    </div>
-
-    <a class="announce" href="#live">
-      <span class="announcedot" aria-hidden="true"></span>
-      Live npm publish feed, checked against the graph as it lands
-      <span class="announcearrow" aria-hidden="true">→</span>
+<!-- ================================================================== hero -->
+<section class="hero rails grid-bg">
+  <div class="wrap">
+    <a class="pill-note" href="#live">
+      <svg class="npm-sq" viewBox="0 0 24 24" style="color:#cb3837"><use href="#i-npm"/></svg>
+      Live npm publish feed now streaming
     </a>
 
-    <h1 class="wordmark">
+    <h1>
       Know your blast radius in
-      <span class="wordmarkline">
-        <svg class="npmglyph" viewBox="0 0 24 24" aria-hidden="true">
-          <rect width="24" height="24" rx="2.4" fill="currentColor"/>
-          <path d="M5 6.2h14v11.6h-7V8.9H9.6v8.9H5z" fill="#fff"/>
-        </svg>
-        <span class="npmword">npm</span>
+      <span class="brandline">
+        <svg class="npm-sq" viewBox="0 0 24 24"><use href="#i-npm"/></svg>
+        <span>npm</span>
       </span>
     </h1>
-    <p class="tagline">
-      When a package is compromised, find out who is transitively exposed, whose semver
-      ranges would actually have pulled it, and whether your own lockfile is hit.
+
+    <p class="sub">
+      When a package is compromised, find out who is transitively exposed, whose
+      semver ranges would actually have pulled it, and whether your own lockfile is hit
     </p>
 
-    <form class="query" id="queryform" autocomplete="off">
-      <div class="pill">
-        <label class="f grow">
-          <span>Package</span>
-          <input id="pkg" name="pkg" placeholder="debug" spellcheck="false" required>
-        </label>
-        <span class="sep" aria-hidden="true"></span>
-        <label class="f ver">
-          <span>Bad version</span>
-          <input id="ver" name="ver" placeholder="4.4.2" spellcheck="false">
-        </label>
-        <button type="submit" id="go">Check blast radius</button>
-      </div>
-      <div class="suggest" id="suggest" hidden></div>
-    </form>
-
-    <div class="chips" id="chips">
-      <span class="chiplabel">Real incidents:</span>
-      <button class="chip" data-pkg="debug" data-ver="4.4.2">debug@4.4.2 <small>qix account takeover · sep 2025</small></button>
-      <button class="chip" data-pkg="event-stream" data-ver="3.3.6">event-stream@3.3.6 <small>flatmap-stream backdoor · nov 2018</small></button>
-      <button class="chip" data-pkg="ua-parser-js" data-ver="0.7.29">ua-parser-js@0.7.29 <small>cryptominer · oct 2021</small></button>
+    <div class="hero-cta">
+      <a class="btn" href="https://github.com/Rohit-ATS/blast-radius" target="_blank" rel="noopener">
+        <svg viewBox="0 0 24 24"><use href="#i-github"/></svg> View source
+      </a>
+      <a class="btn btn-primary" href="#console">Run a check</a>
     </div>
 
-    <div class="logostrip">
-      <p class="striplabel">Reads every lockfile format, checks every source</p>
-      <div class="strip">
-        <svg class="mark" viewBox="0 0 64 24"><use href="#m-npm"/></svg>
-        <svg class="mark" viewBox="0 0 66 24"><use href="#m-yarn"/></svg>
-        <svg class="mark" viewBox="0 0 72 24"><use href="#m-pnpm"/></svg>
-        <svg class="mark" viewBox="0 0 72 24"><use href="#m-node"/></svg>
-        <svg class="mark" viewBox="0 0 66 24"><use href="#m-osv"/></svg>
-        <svg class="mark" viewBox="0 0 84 24"><use href="#m-hydra"/></svg>
-        <svg class="mark" viewBox="0 0 84 24"><use href="#m-sqlite"/></svg>
+    <div class="works">
+      <p>Works with every lockfile and advisory source</p>
+      <div class="works-row">
+        <a href="https://registry.npmjs.org"><svg viewBox="0 0 24 24" style="color:#cb3837"><use href="#i-npm"/></svg> npm</a>
+        <a href="#lockfile"><svg viewBox="0 0 24 24" style="color:#2c8ebb"><use href="#i-yarn"/></svg> yarn</a>
+        <a href="#lockfile"><svg viewBox="0 0 24 24" style="color:#f9ad00"><use href="#i-pnpm"/></svg> pnpm</a>
+        <a href="https://osv.dev"><svg viewBox="0 0 24 24" style="color:#4285f4"><use href="#i-osv"/></svg> osv.dev</a>
+        <a href="https://github.com/hydra-db/hydradb"><svg viewBox="0 0 24 24" style="color:#0f9b8e"><use href="#i-cube"/></svg> HydraDB</a>
       </div>
     </div>
-  </section>
+  </div>
+</section>
 
-  <!-- ============================================================== results -->
-  <section class="results rails" id="results" hidden>
+<!-- ============================================== 2 · the shift + bar chart -->
+<section class="sec rails" id="shift">
+  <div class="wrap two">
+    <div>
+      <h2 class="h-sec">Compromises are shifting <span class="mut">from disclosed CVEs to a single publish</span></h2>
+      <p class="lede" style="margin-top:26px">
+        A vulnerability gets an identifier, a patch and a week of lead time. A hijacked
+        maintainer account gets a version number and instant global distribution —
+        <b>every install that resolves the range picks it up within minutes.</b>
+      </p>
+      <p class="lede">
+        Tracking reachability tells you who is actually in range, five levels down,
+        before anyone opens an advisory.
+      </p>
+
+      <blockquote class="quote">
+        <p id="shiftquote">Every bar is one live traversal against the graph running behind this page — no stored figures.</p>
+        <span class="by">— measured on page load</span>
+        <span class="src"><a href="/api/blast?name=debug&amp;depth=5">GET /api/blast</a></span>
+      </blockquote>
+    </div>
+
+    <div class="panel">
+      <div class="panel-hd">
+        <h3>Blast radius of real incidents</h3>
+        <span class="chip-trend" id="shifttag"><svg viewBox="0 0 24 24"><use href="#i-trend"/></svg> measuring…</span>
+      </div>
+      <p class="panel-sub">Showing packages transitively exposed, to depth 5, across the crawled graph</p>
+      <div class="bars" id="cmpchart"><div class="skel">querying the graph…</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================ 3 · the console (dashboard) -->
+<section class="sec-tight rails" id="console">
+  <div class="wrap">
+    <div class="head-split">
+      <h2 class="h-sec">The console for your npm <span class="mut">incident response and exposure audit</span></h2>
+      <p class="lede">
+        Answer the five questions an incident actually raises, against one graph and one
+        sidecar, with <b>every figure</b> coming back from a live query.
+      </p>
+    </div>
+
+    <div class="console-card">
+      <nav class="side">
+        <h4>Console</h4>
+        <a class="on" href="#console"><svg viewBox="0 0 24 24"><use href="#i-radius"/></svg> Blast radius</a>
+        <a href="#resolution"><svg viewBox="0 0 24 24"><use href="#i-trend"/></svg> Resolution</a>
+        <a href="#lockfile"><svg viewBox="0 0 24 24"><use href="#i-lock"/></svg> Lockfile</a>
+        <a href="#live"><svg viewBox="0 0 24 24"><use href="#i-pulse"/></svg> Live feed</a>
+        <a href="#audit"><svg viewBox="0 0 24 24"><use href="#i-shield"/></svg> Malware audit <span class="new">OSV</span></a>
+      </nav>
+
+      <div class="dash">
+        <div class="dash-hd">
+          <span class="avatar"><svg viewBox="0 0 24 24"><use href="#i-radius"/></svg></span>
+          <h3 id="dashtitle">debug@4.4.2 exposure</h3>
+        </div>
+        <p class="dash-sub">Measure how far a compromised package reaches through the dependency graph</p>
+
+        <div class="kpis">
+          <div class="kpi tint"><div class="k">Packages exposed</div><div class="v" id="k-exposed">—</div><div class="d" id="k-exposed-d">depth 5 closure</div></div>
+          <div class="kpi"><div class="k">Graph queries</div><div class="v" id="k-queries">—</div><div class="d">run in parallel</div></div>
+          <div class="kpi good"><div class="k">Answer time</div><div class="v" id="k-latency">—</div><div class="d">one traversal</div></div>
+        </div>
+
+        <p class="dash-label">Incident</p>
+        <div class="prompts" id="chips">
+          <span class="chiplabel" hidden>incidents</span>
+          <button class="prompt chip on" data-pkg="debug" data-ver="4.4.2">debug@4.4.2</button>
+          <button class="prompt chip" data-pkg="event-stream" data-ver="3.3.6">event-stream@3.3.6</button>
+          <button class="prompt chip" data-pkg="ua-parser-js" data-ver="0.7.29">ua-parser-js@0.7.29</button>
+        </div>
+
+        <form class="query" id="queryform" autocomplete="off" style="margin-top:16px">
+          <div class="pill">
+            <label class="f grow">
+              <span>Package</span>
+              <input id="pkg" name="pkg" placeholder="debug" spellcheck="false" required>
+            </label>
+            <span class="sep" aria-hidden="true"></span>
+            <label class="f ver">
+              <span>Bad version</span>
+              <input id="ver" name="ver" placeholder="4.4.2" spellcheck="false">
+            </label>
+            <button type="submit" id="go">Check</button>
+          </div>
+          <div class="suggest" id="suggest" hidden></div>
+        </form>
+
+        <div class="tbl-wrap">
+          <table class="tbl">
+            <thead>
+              <tr>
+                <th><span><svg viewBox="0 0 24 24"><use href="#i-cube"/></svg> Package</span></th>
+                <th><span><svg viewBox="0 0 24 24"><use href="#i-radius"/></svg> Depth</span></th>
+                <th><span><svg viewBox="0 0 24 24"><use href="#i-graph"/></svg> Reached via</span></th>
+                <th><span><svg viewBox="0 0 24 24"><use href="#i-at"/></svg> Dependents</span></th>
+                <th><span><svg viewBox="0 0 24 24"><use href="#i-trend"/></svg> Reach</span></th>
+              </tr>
+            </thead>
+            <tbody id="dashrows">
+              <tr><td class="empty" colspan="5">walking the graph…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="four">
+      <div>
+        <h4><svg viewBox="0 0 24 24"><use href="#i-radius"/></svg> Blast radius</h4>
+        <p>Transitive closure from the compromised package out to depth five, drawn as
+          concentric rings and returned as one traversal from a known vertex.</p>
+      </div>
+      <div>
+        <h4><svg viewBox="0 0 24 24"><use href="#i-lock"/></svg> Lockfile</h4>
+        <p>Drop a real package-lock.json and get the exact dependency path that reaches
+          you. Read in the browser, posted once, never stored.</p>
+      </div>
+      <div>
+        <h4><svg viewBox="0 0 24 24"><use href="#i-pulse"/></svg> Live feed</h4>
+        <p>Every npm publish as it lands, scored against the graph, so a package
+          thousands already depend on surfaces the moment it moves.</p>
+      </div>
+      <div>
+        <h4><svg viewBox="0 0 24 24"><use href="#i-shield"/></svg> Malware audit</h4>
+        <p>Your whole tree checked against osv.dev, including MAL- identifiers for
+          confirmed malicious packages, with a copy-paste fix.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================ full results (after a query) -->
+<section class="sec-tight rails" id="results" hidden>
+  <div class="wrap">
     <div class="verdictline" id="verdictline"></div>
-
     <div class="latencyblock">
       <div class="latency" id="latency">—</div>
       <div class="latencysub" id="latencysub"></div>
     </div>
 
     <div class="resultgrid">
-      <div class="win span2" style="--w:100%">
+      <div class="win span2">
         <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">blast radius by depth</span></div>
         <div class="body"><div class="hist" id="hist"></div></div>
         <div class="cap">depth-histogram.log</div>
@@ -287,8 +369,7 @@
         </div>
         <div class="body nopad">
           <div class="mapwrap">
-            <svg id="map" viewBox="0 0 760 760" role="img"
-                 aria-label="radial map of the packages exposed by this compromise"></svg>
+            <svg id="map" viewBox="0 0 760 760" role="img" aria-label="radial map of the packages exposed by this compromise"></svg>
             <div class="maptip" id="maptip" hidden></div>
             <div class="maplegend" id="maplegend"></div>
           </div>
@@ -296,93 +377,113 @@
         <div class="cap">blast-map.svg — click any package to pivot the whole console onto it</div>
       </div>
     </div>
-  </section>
+  </div>
+</section>
 
-  <!-- ============================================== the shift (live compare) -->
-  <section class="shift rails" id="shift">
-    <div class="split2">
-      <div class="splitleft">
-        <h2 class="sech">Attacks moved <span class="mut">from disclosed CVEs to a single npm publish</span></h2>
-        <p class="para">
-          A vulnerability gets a CVE, a patch, and a week of lead time. A hijacked
-          maintainer account gets a version number and instant global distribution —
-          <b>every install that resolves the range picks it up within minutes</b>.
-        </p>
-        <p class="para">
-          The only question that matters in that hour is reachability: who pulls this,
-          and who pulls them, five levels down. The chart is that number, computed live
-          for three real compromises — <b>no stored figures, no estimates</b>.
-        </p>
-        <blockquote class="pull">
-          <p id="shiftquote">Every bar is one traversal against the graph running behind this page.</p>
-          <cite>Measured on load · <a href="/api/blast?pkg=debug&amp;ver=4.4.2&amp;depth=5">/api/blast</a></cite>
-        </blockquote>
-      </div>
-
-      <div class="splitright">
-        <div class="panel">
-          <div class="panelhead">
-            <h3>Blast radius of real incidents <span class="trendtag" id="shifttag">measuring…</span></h3>
-            <p>Packages transitively exposed, depth 5, computed against the live graph</p>
-          </div>
-          <div class="cmpchart" id="cmpchart">
-            <div class="cmprow skel">querying the graph…</div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ============================================================= features -->
-  <section class="platform rails" id="platform">
-    <div class="sechead">
-      <h2 class="sech">The console for your npm <span class="mut">incident response and exposure audit</span></h2>
-      <p class="para">
-        Five questions, answered against one graph and one sidecar, in the order you
-        actually ask them during an incident. Everything below runs on live data.
+<!-- ================================= 4 · resolution + incident timeline duo -->
+<section class="sec rails" id="resolution">
+  <div class="wrap">
+    <div class="head-split">
+      <h2 class="h-sec">Separate who is exposed <span class="mut">from who was going to install it</span></h2>
+      <p class="lede">
+        Listing a package is not the same as resolving the bad version. Every declared
+        range in the graph is evaluated against the compromised version, so the number
+        you act on is <b>the real one</b>, not the scarier one.
       </p>
     </div>
 
-    <div class="featgrid">
-      <a class="feat" href="#queryform">
-        <span class="featico"><svg viewBox="0 0 24 24"><use href="#i-radius"/></svg></span>
-        <h4>Blast radius</h4>
-        <p>Transitive closure from the compromised package out to depth five, plus the
-          semver split that says who would truly have resolved the bad version.</p>
-      </a>
-      <a class="feat" href="#lockfile">
-        <span class="featico"><svg viewBox="0 0 24 24"><use href="#i-lock"/></svg></span>
-        <h4>Lockfile check</h4>
-        <p>Drop a real <code>package-lock.json</code> — v1, v2 and v3 — and get the exact
-          dependency path that reaches you. Read in the browser, posted once, never stored.</p>
-      </a>
-      <a class="feat" href="#live">
-        <span class="featico"><svg viewBox="0 0 24 24"><use href="#i-pulse"/></svg></span>
-        <h4>Live publish feed</h4>
-        <p>Every npm publish as it lands, scored against the graph. A first version with
-          nothing downstream is noise; a package thousands already depend on is the moment.</p>
-      </a>
-      <a class="feat" href="#audit">
-        <span class="featico"><svg viewBox="0 0 24 24"><use href="#i-shield"/></svg></span>
-        <h4>Malware audit</h4>
-        <p>Your whole tree checked against osv.dev, including <code>MAL-</code> identifiers
-          for confirmed malicious packages, with a copy-paste fix for what it finds.</p>
-      </a>
-    </div>
-  </section>
+    <div class="duo">
+      <div class="duo-card">
+        <div class="inner">
+          <h5>Semver resolution</h5>
+          <p class="note">Which declared ranges would have admitted the bad version</p>
 
-  <!-- ============================================================= lockfile -->
-  <section class="lockfile rails" id="lockfile">
-    <div class="sechead center">
-      <h2 class="sech">Is <em>my</em> app <span class="mut">affected?</span></h2>
-      <p class="para">Drop a real package-lock.json. It is read in your browser, posted once,
-        and never stored. The check runs against the package in the box above.</p>
+          <div class="meter" id="res-meter"><i class="m1" style="width:0"></i><i class="m2" style="width:0"></i></div>
+          <div class="pair">
+            <div class="bad"><div class="n" id="res-bad">—</div><div class="t">Would have pulled it</div></div>
+            <div class="pin"><div class="n" id="res-pin">—</div><div class="t">Shielded by a pin</div></div>
+          </div>
+
+          <div class="range-row">
+            <div class="range-col">
+              <span class="who"><svg viewBox="0 0 24 24" style="color:#cb3837"><use href="#i-npm"/></svg> In range</span>
+              <div class="tags" id="res-hot"><span class="tag">…</span></div>
+            </div>
+            <div class="range-col">
+              <span class="who"><svg viewBox="0 0 24 24" style="color:#4285f4"><use href="#i-osv"/></svg> Pinned</span>
+              <div class="tags" id="res-safe"><span class="tag">…</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="duo-foot">
+          <h4><svg viewBox="0 0 24 24"><use href="#i-search"/></svg> Range resolution</h4>
+          <p>Topology lives in the graph, predicates live in a SQLite sidecar — which is
+            why "would have pulled it" versus "shielded by a pin" is a number this thing
+            can actually produce.</p>
+        </div>
+      </div>
+
+      <div class="duo-card">
+        <div class="inner">
+          <h5>Incident timeline</h5>
+          <p class="note">What the console did for the selected incident, in order</p>
+          <div class="tl" id="timeline">
+            <div class="tl-row"><span class="tl-ico"><svg viewBox="0 0 24 24"><use href="#i-clock"/></svg></span>
+              <div><div class="tl-when">waiting</div><div class="tl-what">Run a check to populate the timeline</div></div></div>
+          </div>
+        </div>
+
+        <div class="duo-foot">
+          <h4><svg viewBox="0 0 24 24"><use href="#i-bolt"/></svg> Measured, not claimed</h4>
+          <p>Each step carries the latency the server reported for it, so the timeline is
+            an audit trail of the answer rather than an illustration of one.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================================== 5 · split — reach field + live publish -->
+<section class="sec-tight rails" id="reach">
+  <div class="wrap">
+    <div class="split">
+      <div>
+        <span class="eyebrow"><svg viewBox="0 0 24 24"><use href="#i-radius"/></svg> Reachability</span>
+        <h3>See the whole exposed set <span class="mut">as one field</span></h3>
+        <div class="field" id="reachfield">
+          <svg viewBox="0 0 620 300" aria-hidden="true"></svg>
+          <div class="float"><b id="reachnum">—</b> <span id="reachtxt">packages in range</span></div>
+        </div>
+      </div>
+
+      <div>
+        <span class="eyebrow"><svg viewBox="0 0 24 24"><use href="#i-pulse"/></svg> Live publishes</span>
+        <h3>Score every npm publish <span class="mut">the moment it lands</span></h3>
+        <div class="chat">
+          <div class="when" id="pub-when">waiting for the registry…</div>
+          <div class="bubble" id="pub-q">Listening to replicate.npmjs.com for the next publish.</div>
+          <div class="who"><svg viewBox="0 0 24 24"><use href="#i-logo"/></svg> Blast Radius</div>
+          <div class="bubble me" id="pub-a">Each one is checked against the graph as it arrives.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ 6 · lockfile -->
+<section class="sec rails" id="lockfile">
+  <div class="wrap">
+    <div class="head-center">
+      <h2 class="h-sec">Is <span class="mut">my app affected?</span></h2>
+      <p class="lede" style="margin-top:18px">Drop a real package-lock.json. It is read in your browser, posted once,
+        and never stored. The check runs against the incident selected above.</p>
     </div>
 
     <div class="drop" id="drop" tabindex="0" role="button" aria-label="drop your package-lock.json here">
       <div class="dropinner">
         <div class="dropicon" aria-hidden="true">
-          <svg viewBox="0 0 40 48" width="40" height="48"><path d="M6 2h20l10 10v34H6Z" fill="#eff4ff" stroke="#c3d2ee" stroke-width="1.6"/><path d="M26 2v10h10" fill="none" stroke="#c3d2ee" stroke-width="1.6"/><path d="M20 20v16M13 29l7 7 7-7" fill="none" stroke="#2f6bff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <svg viewBox="0 0 40 48" width="40" height="48"><path d="M6 2h20l10 10v34H6Z" fill="#eef3ff" stroke="#c3d2ee" stroke-width="1.6"/><path d="M26 2v10h10" fill="none" stroke="#c3d2ee" stroke-width="1.6"/><path d="M20 20v16M13 29l7 7 7-7" fill="none" stroke="#2f6bff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </div>
         <div class="droptext">Drop your <b>package-lock.json</b></div>
         <div class="dropsub">or <button type="button" class="linkbtn" id="pick">choose a file</button> · v1, v2 and v3 all work</div>
@@ -390,7 +491,7 @@
       <input type="file" id="file" accept=".json,application/json" hidden>
     </div>
 
-    <div class="lockresult" id="lockresult" hidden>
+    <div class="lockresult" id="lockresult" hidden style="margin-top:26px">
       <div class="verdict" id="verdict"></div>
       <div class="win">
         <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">how it reaches you</span></div>
@@ -398,16 +499,76 @@
         <div class="cap">lockfile-scan.txt</div>
       </div>
     </div>
-  </section>
+  </div>
+</section>
 
-  <!-- ============================================================ live feed -->
-  <section class="live rails" id="live">
-    <div class="sechead">
-      <h2 class="sech">npm, <span class="mut">right now</span></h2>
-      <p class="para">Every package published to npm in the last few minutes, checked against the
-        graph as it arrives. Most publishes are somebody's first version with nothing
-        downstream — the ones worth watching are the packages thousands of things already
-        depend on, because that is the moment a supply-chain attack goes live.</p>
+<!-- =============================================== 7 · market band + curves -->
+<section class="sec-tight rails" id="analytics">
+  <div class="wrap">
+    <div class="two two-top">
+      <div>
+        <h2 class="h-sec">The graph behind it, <span class="mut">counted right now</span></h2>
+        <p class="lede" style="margin-top:24px">
+          Crawled from the npm registry, reversed into <code>REQUIRED_BY</code> edges and
+          held in HydraDB with a SQLite sidecar alongside. <b>Reload and the numbers move</b>,
+          because the crawler is still going.
+        </p>
+      </div>
+      <blockquote class="quote">
+        <p>At this graph size a recursive CTE over the sidecar beats the graph engine by
+          3–13×, and both return the identical count on every row. That result is in the
+          repository too — including the row that says a 27k-vertex graph does not need a
+          graph database.</p>
+        <span class="by">— BENCHMARKS.md</span>
+        <span class="src"><a href="https://github.com/Rohit-ATS/blast-radius/blob/main/BENCHMARKS.md">github.com/Rohit-ATS/blast-radius</a></span>
+      </blockquote>
+    </div>
+
+    <div class="band">
+      <div class="band-grid">
+        <div class="band-cell">
+          <div class="k">Packages in graph</div>
+          <div class="v" id="b-pkgs">—</div>
+          <div class="who"><svg viewBox="0 0 24 24" style="color:#cb3837"><use href="#i-npm"/></svg> npm</div>
+        </div>
+        <div class="band-cell">
+          <div class="k">Dependency edges</div>
+          <div class="v" id="b-edges">—</div>
+          <div class="who"><svg viewBox="0 0 24 24" style="color:#0f9b8e"><use href="#i-cube"/></svg> HydraDB</div>
+        </div>
+        <div class="band-cell">
+          <div class="k">Registry documents</div>
+          <div class="v" id="b-crawled">—</div>
+          <div class="who"><svg viewBox="0 0 24 24" style="color:#2f6bff"><use href="#i-db"/></svg> sidecar</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="wrap" style="margin-top:70px">
+    <div class="chart-card">
+      <div class="chart-hd">
+        <span class="eyebrow"><svg viewBox="0 0 24 24"><use href="#i-trend"/></svg> Depth analytics</span>
+        <h3>Watch exposure compound <span class="mut">with every hop</span></h3>
+      </div>
+      <div class="curve" id="curve">
+        <div class="curve-legend" id="curvelegend"></div>
+        <svg viewBox="0 0 1000 380" preserveAspectRatio="none" aria-label="cumulative packages exposed by dependency depth"></svg>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- =============================================================== 8 · feed -->
+<section class="sec rails" id="live">
+  <div class="wrap">
+    <div class="head-split">
+      <h2 class="h-sec">npm, <span class="mut">right now</span></h2>
+      <p class="lede">
+        Most publishes are somebody's first version with nothing downstream. The ones
+        worth watching are the packages <b>thousands of things already depend on</b>,
+        because that is the moment a supply-chain attack goes live.
+      </p>
     </div>
 
     <div class="win">
@@ -419,15 +580,19 @@
       <div class="body nopad"><div class="ticker" id="ticker"></div></div>
       <div class="cap">npm-changes.log — polled from replicate.npmjs.com every few seconds</div>
     </div>
-  </section>
+  </div>
+</section>
 
-  <!-- ============================================================= explorer -->
-  <section class="explorer rails" id="explorer">
-    <div class="sechead">
-      <h2 class="sech">Walk the graph <span class="mut">yourself</span></h2>
-      <p class="para">Every node here is a real vertex in HydraDB. Click one and the browser
-        asks the database what is adjacent to it — packages, the people who publish them,
-        and the advisories filed against them, all in one graph.</p>
+<!-- =========================================================== 9 · explorer -->
+<section class="sec-tight rails" id="explorer">
+  <div class="wrap">
+    <div class="head-split">
+      <h2 class="h-sec">Walk the graph <span class="mut">yourself</span></h2>
+      <p class="lede">
+        Every node is a real vertex in HydraDB. Click one and the browser asks the
+        database what is adjacent to it — packages, the people who publish them, and the
+        advisories filed against them, all in one graph.
+      </p>
     </div>
 
     <div class="win">
@@ -443,8 +608,7 @@
       </div>
       <div class="body nopad">
         <div class="graphwrap">
-          <svg id="graph" viewBox="0 0 1000 620" role="img"
-               aria-label="interactive view of the hydradb graph"></svg>
+          <svg id="graph" viewBox="0 0 1000 620" role="img" aria-label="interactive view of the hydradb graph"></svg>
           <div class="maptip" id="graphtip" hidden></div>
           <div class="graphlegend" id="graphlegend"></div>
           <div class="graphstat" id="graphstat"></div>
@@ -452,35 +616,34 @@
       </div>
       <div class="cap">hydradb-explorer — click a node to expand it, drag to rearrange</div>
     </div>
-  </section>
+  </div>
+</section>
 
-  <!-- ================================================================ audit -->
-  <section class="audit rails" id="audit">
-    <div class="sechead center">
-      <h2 class="sech">Is anything in my project <em>already</em> <span class="mut">malicious?</span></h2>
-      <p class="para">The check above answers "am I exposed to <i>this</i> incident". This one
-        answers the question you have before anyone tells you there is an incident. Every
-        package in your lockfile is checked against
-        <a href="https://osv.dev">osv.dev</a> — Google's open source vulnerabilities
-        database, the canonical feed for npm advisories, including <code>MAL-</code>
-        identifiers for <b>confirmed malicious packages</b>. No graph coverage needed:
-        your lockfile is your tree.</p>
+<!-- ============================================================== 10 · audit -->
+<section class="sec rails" id="audit">
+  <div class="wrap">
+    <div class="head-center">
+      <h2 class="h-sec">Is anything in my project <span class="mut">already malicious?</span></h2>
+      <p class="lede" style="margin-top:18px">
+        The check above answers "am I exposed to <i>this</i> incident". This one answers
+        the question you have before anyone tells you there is an incident — every package
+        in your lockfile against <a href="https://osv.dev" style="border-bottom:1px solid #e6e9ef">osv.dev</a>,
+        including <code>MAL-</code> identifiers for confirmed malicious packages.
+      </p>
     </div>
 
-    <div class="drop" id="auditdrop" tabindex="0" role="button"
-         aria-label="drop a package-lock.json to scan for known malware">
+    <div class="drop" id="auditdrop" tabindex="0" role="button" aria-label="drop a package-lock.json to scan for known malware">
       <div class="dropinner">
         <div class="dropicon" aria-hidden="true">
-          <svg viewBox="0 0 40 48" width="40" height="48"><path d="M6 2h20l10 10v34H6Z" fill="#eff4ff" stroke="#c3d2ee" stroke-width="1.6"/><path d="M26 2v10h10" fill="none" stroke="#c3d2ee" stroke-width="1.6"/><circle cx="20" cy="30" r="7" fill="none" stroke="#2f6bff" stroke-width="2"/><path d="M25 35l6 6" stroke="#2f6bff" stroke-width="2" stroke-linecap="round"/></svg>
+          <svg viewBox="0 0 40 48" width="40" height="48"><path d="M6 2h20l10 10v34H6Z" fill="#eef3ff" stroke="#c3d2ee" stroke-width="1.6"/><path d="M26 2v10h10" fill="none" stroke="#c3d2ee" stroke-width="1.6"/><circle cx="20" cy="30" r="7" fill="none" stroke="#2f6bff" stroke-width="2"/><path d="M25 35l6 6" stroke="#2f6bff" stroke-width="2" stroke-linecap="round"/></svg>
         </div>
         <div class="droptext">Scan my <b>package-lock.json</b> for known malware</div>
-        <div class="dropsub">or <button type="button" class="linkbtn" id="auditpick">choose a file</button> ·
-          checked live against osv.dev · nothing is stored</div>
+        <div class="dropsub">or <button type="button" class="linkbtn" id="auditpick">choose a file</button> · checked live against osv.dev · nothing is stored</div>
       </div>
       <input type="file" id="auditfile" accept=".json,application/json" hidden>
     </div>
 
-    <div class="auditresult" id="auditresult" hidden>
+    <div class="auditresult" id="auditresult" hidden style="margin-top:26px">
       <div class="verdict" id="auditverdict"></div>
       <div class="win">
         <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">what is in your tree</span></div>
@@ -488,206 +651,147 @@
         <div class="cap">osv-audit.json</div>
       </div>
     </div>
-  </section>
+  </div>
+</section>
 
-  <!-- ========================================================== stats band -->
-  <section class="band rails" id="band">
-    <div class="bandhead">
-      <h2 class="sech">The graph behind it, <span class="mut">measured right now</span></h2>
-      <p class="para">Counted by the running instance when this page loaded — reload it and
-        the numbers move, because the crawler is still going.</p>
-    </div>
-    <div class="bandgrid" id="bandgrid">
-      <div class="bandcell"><div class="bandk">Packages in graph</div><div class="bandv" id="b-pkgs">—</div><div class="bandd">vertices</div></div>
-      <div class="bandcell"><div class="bandk">Dependency edges</div><div class="bandv" id="b-edges">—</div><div class="bandd">REQUIRED_BY</div></div>
-      <div class="bandcell"><div class="bandk">Crawled from npm</div><div class="bandv" id="b-crawled">—</div><div class="bandd">registry documents</div></div>
-      <div class="bandcell"><div class="bandk">Stats query</div><div class="bandv" id="b-latency">—</div><div class="bandd">this request</div></div>
-    </div>
-  </section>
-
-  <!-- =============================================================== status -->
-  <section class="sys rails" id="status">
-    <div class="sechead center">
-      <h2 class="sech">The system, <span class="mut">right now</span></h2>
-      <p class="para">Pushed over server-sent events, not polled. This is the same
-        health check <code>verify.py</code> and <code>chaos.py</code> assert against.</p>
+<!-- ============================================================= 11 · status -->
+<section class="sec-tight rails" id="status">
+  <div class="wrap">
+    <div class="head-center">
+      <h2 class="h-sec">The system, <span class="mut">right now</span></h2>
+      <p class="lede" style="margin-top:18px">Pushed over server-sent events, not polled. This is the same health
+        check <code>verify.py</code> and <code>chaos.py</code> assert against.</p>
     </div>
     <div class="syscards" id="syscards"></div>
     <p class="sysnote" id="sysnote"></p>
-  </section>
+  </div>
+</section>
 
-  <!-- ========================================================== how it works -->
-  <section class="how rails" id="how">
-    <div class="sechead">
-      <h2 class="sech">How it <span class="mut">works</span></h2>
-      <p class="para">Three design decisions carry this whole thing. Each one is a constraint
-        of HydraDB 0.1.0 turned into the reason the answer arrives in one traversal.</p>
-    </div>
-    <div class="howgrid">
-      <div class="win">
-        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">why a graph, not a vector</span></div>
-        <div class="body prose">
-          <p>"Which packages are similar to <code>event-stream</code>" is a vector question.
-             Nobody asks it during an incident.</p>
-          <p>The real question is <b>reachability</b>: who pulls this, and who pulls them,
-             five levels down. That is a transitive closure over a directed graph — the one
-             shape an embedding index cannot answer at all.</p>
-          <p>HydraDB answers it as one traversal from one known vertex. We also built the
-             same closure as a recursive CTE over the SQLite sidecar and timed both. At this
-             graph size <b>SQLite is 3–13× faster</b>, and both engines return the identical
-             count on every row. <code>BENCHMARKS.md</code> has the table, including the
-             row that says a 27k-vertex graph does not need a graph database.</p>
-        </div>
-        <div class="cap">why-a-graph.md</div>
-      </div>
-
-      <div class="win">
-        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">the reversed edge</span></div>
-        <div class="body prose">
-          <p>Edges are stored backwards on purpose:</p>
-          <pre>(dependency)-[:REQUIRED_BY]->(dependent)</pre>
-          <p>HydraDB 0.1.0 will only run a variable-length <code>MATCH</code> when the
-             <b>source id is fixed</b>. In an incident, the one thing you know for certain is
-             which package was compromised.</p>
-          <p>Reversing the edge at write time makes that package the source, so the blast
-             radius is one traversal from a known id instead of a scan of the graph.</p>
-        </div>
-        <div class="cap">reversed-edges.md</div>
-      </div>
-
-      <div class="win">
-        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">two stores, two shapes</span></div>
-        <div class="body prose">
-          <p>HydraDB 0.1.0 cannot filter on edge properties mid-traversal, so a declared
-             semver range cannot live on the edge and still be usable.</p>
-          <p><b>Topology</b> — who depends on whom — lives in the graph.
-             <b>Predicates</b> — does <code>^4.1.0</code> admit <code>4.4.2</code>, who else does
-             this maintainer publish — live in a SQLite sidecar.</p>
-          <p>That split is why "would have pulled it" vs "shielded by a pin" is a number
-             this thing can actually produce, instead of the much scarier and much less
-             true count of everyone who merely lists the package.</p>
-        </div>
-        <div class="cap">two-layer-design.md</div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ============================================================== pricing -->
-  <section class="pricing rails" id="pricing">
-    <div class="sechead">
-      <h2 class="sech">Free forever, <span class="mut">because it is yours</span></h2>
-      <p class="para">There is no paid tier and no account. Blast Radius is MIT licensed —
-        clone it, run it against your own registry mirror, lift the semver resolver into
-        your own tooling, ship it inside a commercial product. No attribution theatre,
-        no per-seat maths.</p>
+<!-- ============================================================ 12 · pricing -->
+<section class="sec rails" id="pricing">
+  <div class="wrap">
+    <div class="head-split">
+      <h2 class="h-sec">Start measuring your exposure <span class="mut">in npm</span></h2>
+      <p class="lede">
+        There is no paid tier and no account. Blast Radius is <b>MIT licensed</b> — clone
+        it, run it against your own registry mirror, lift the semver resolver into your
+        own tooling, ship it inside a commercial product.
+      </p>
     </div>
 
-    <div class="planwrap">
+    <div class="plans">
       <div class="plan">
-        <div class="planglow" aria-hidden="true"></div>
+        <div class="glow" aria-hidden="true"></div>
+        <span class="plan-tag"><svg viewBox="0 0 24 24"><use href="#i-github"/></svg> Open source</span>
+        <h3>MIT License</h3>
+        <p class="say">Every query, every endpoint, the crawler, the benchmarks and this page.
+          One repository, no hosted lock-in.</p>
 
-        <div class="planhead">
-          <span class="planbadge"><svg class="ico" viewBox="0 0 24 24"><use href="#i-github"/></svg> Open source</span>
-          <h3>MIT License</h3>
-          <p class="plansub">Every query, every endpoint, the crawler, the benchmarks and this
-            page. One repository, no hosted lock-in.</p>
+        <div class="price">
+          <span class="n">$0</span>
+          <span class="u">/ forever</span>
+          <span class="x">self-host in one <code>docker compose up</code></span>
         </div>
 
-        <div class="planprice">
-          <span class="pricenum">$0</span>
-          <span class="priceunit">/ forever</span>
-          <span class="pricenote">self-host in one <code>docker compose up</code></span>
-        </div>
-
-        <ul class="planlist">
-          <li><svg class="ico" viewBox="0 0 24 24"><use href="#i-check"/></svg> Unlimited blast-radius queries</li>
-          <li><svg class="ico" viewBox="0 0 24 24"><use href="#i-check"/></svg> Unlimited lockfile and OSV malware scans</li>
-          <li><svg class="ico" viewBox="0 0 24 24"><use href="#i-check"/></svg> Full JSON API — every panel on this page is an endpoint</li>
-          <li><svg class="ico" viewBox="0 0 24 24"><use href="#i-check"/></svg> The npm crawler and the graph builder</li>
-          <li><svg class="ico" viewBox="0 0 24 24"><use href="#i-check"/></svg> Semver resolution engine, reusable on its own</li>
-          <li><svg class="ico" viewBox="0 0 24 24"><use href="#i-check"/></svg> Benchmark harness — HydraDB vs. the SQLite sidecar</li>
-          <li><svg class="ico" viewBox="0 0 24 24"><use href="#i-check"/></svg> Commercial use, modification and redistribution</li>
-          <li><svg class="ico" viewBox="0 0 24 24"><use href="#i-check"/></svg> No telemetry, no account, nothing stored</li>
+        <ul>
+          <li><svg viewBox="0 0 24 24"><use href="#i-check"/></svg> Unlimited blast-radius queries</li>
+          <li><svg viewBox="0 0 24 24"><use href="#i-check"/></svg> Unlimited lockfile and OSV scans</li>
+          <li><svg viewBox="0 0 24 24"><use href="#i-check"/></svg> Full JSON API — every panel is an endpoint</li>
+          <li><svg viewBox="0 0 24 24"><use href="#i-check"/></svg> The npm crawler and graph builder</li>
+          <li><svg viewBox="0 0 24 24"><use href="#i-check"/></svg> Semver resolver, reusable on its own</li>
+          <li><svg viewBox="0 0 24 24"><use href="#i-check"/></svg> Benchmark harness against the sidecar</li>
+          <li><svg viewBox="0 0 24 24"><use href="#i-check"/></svg> Commercial use and redistribution</li>
+          <li><svg viewBox="0 0 24 24"><use href="#i-check"/></svg> No telemetry, no account, nothing stored</li>
         </ul>
 
-        <div class="planactions">
-          <a class="btn primary lg" href="https://github.com/Rohit-ATS/blast-radius" target="_blank" rel="noopener">
-            <svg class="ico" viewBox="0 0 24 24"><use href="#i-github"/></svg> Get it on GitHub
+        <div class="plan-cta">
+          <a class="btn btn-primary btn-lg" href="https://github.com/Rohit-ATS/blast-radius" target="_blank" rel="noopener">
+            <svg viewBox="0 0 24 24"><use href="#i-github"/></svg> Get it on GitHub
           </a>
-          <a class="btn ghost lg" href="https://github.com/Rohit-ATS/blast-radius/blob/main/LICENSE" target="_blank" rel="noopener">
-            Read the MIT license
+          <a class="btn btn-lg" href="https://github.com/Rohit-ATS/blast-radius/blob/main/LICENSE" target="_blank" rel="noopener">
+            Read the license
           </a>
         </div>
 
-        <div class="planclone">
+        <div class="clone">
           <code>git clone https://github.com/Rohit-ATS/blast-radius.git</code>
-          <button type="button" class="copybtn" id="clonecopy"
-                  data-clip="git clone https://github.com/Rohit-ATS/blast-radius.git">Copy</button>
+          <button type="button" class="copybtn" data-clip="git clone https://github.com/Rohit-ATS/blast-radius.git">Copy</button>
         </div>
       </div>
 
-      <aside class="planaside">
-        <a class="asidecard" href="https://github.com/Rohit-ATS/blast-radius#readme" target="_blank" rel="noopener">
-          <h4>Read the README</h4>
-          <p>The whole design, the constraints it was built around, and what the numbers mean.</p>
+      <aside class="plan-side">
+        <a class="side-card" href="https://github.com/Rohit-ATS/blast-radius#readme" target="_blank" rel="noopener">
+          <h4><svg viewBox="0 0 24 24"><use href="#i-book"/></svg> README</h4>
+          <p>The design, the constraints it was built around, and what each number means.</p>
         </a>
-        <a class="asidecard" href="https://github.com/Rohit-ATS/blast-radius/blob/main/BENCHMARKS.md" target="_blank" rel="noopener">
-          <h4>BENCHMARKS.md</h4>
-          <p>HydraDB against a recursive CTE on the same closure, both engines agreeing row for row.</p>
+        <a class="side-card" href="https://github.com/Rohit-ATS/blast-radius/blob/main/BENCHMARKS.md" target="_blank" rel="noopener">
+          <h4><svg viewBox="0 0 24 24"><use href="#i-trend"/></svg> BENCHMARKS.md</h4>
+          <p>HydraDB against a recursive CTE on the same closure, agreeing row for row.</p>
         </a>
-        <a class="asidecard" href="/api/docs">
-          <h4>API reference</h4>
-          <p>Every panel here is a documented JSON endpoint you can call from your own tooling.</p>
+        <a class="side-card" href="/api/docs">
+          <h4><svg viewBox="0 0 24 24"><use href="#i-doc"/></svg> API reference</h4>
+          <p>Every panel here is a documented JSON endpoint you can call yourself.</p>
         </a>
-        <a class="asidecard" href="https://github.com/Rohit-ATS/blast-radius/issues" target="_blank" rel="noopener">
-          <h4>Issues &amp; contributions</h4>
+        <a class="side-card" href="https://github.com/Rohit-ATS/blast-radius/issues" target="_blank" rel="noopener">
+          <h4><svg viewBox="0 0 24 24"><use href="#i-alert"/></svg> Issues</h4>
           <p>Bugs, coverage gaps and pull requests — all in the open.</p>
         </a>
       </aside>
     </div>
-  </section>
+  </div>
+</section>
+
+<!-- app.js warms three "peek" panels on load — the same graph, sidecar and
+     count queries that fill the console card above. The card is the surface
+     now, so the original targets stay here as sinks rather than being torn
+     out of app.js, which this page does not own. -->
+<div hidden aria-hidden="true">
+  <div id="peek-hist"></div>
+  <div id="peek-maint"></div>
+  <div id="peek-graph"></div>
+</div>
 
 </main>
 
-<!-- ================================================================= footer -->
-<footer>
-  <div class="footinner">
-    <a class="brand big" href="#top">
-      <span class="brandmark"><svg viewBox="0 0 32 32"><use href="#i-logo"/></svg></span>
-      <span class="brandword">Blast&nbsp;Radius</span>
+<!-- ================================================================ footer -->
+<footer class="ftr">
+  <div class="wrap">
+    <a class="logo" href="#top">
+      <span class="mark"><svg viewBox="0 0 32 32"><use href="#i-logo"/></svg></span>
+      <span class="word">Blast Radius</span>
     </a>
 
-    <nav class="footnav">
+    <nav class="fnav">
       <a href="#top">Home</a>
-      <a href="#lockfile">Lockfile check</a>
+      <a href="#console">Console</a>
+      <a href="#resolution">Resolution</a>
+      <a href="#lockfile">Lockfile</a>
       <a href="#live">Live feed</a>
       <a href="#explorer">Explorer</a>
       <a href="#status">Status</a>
-      <a href="#how">How it works</a>
-      <a href="#pricing">Open source</a>
+      <a href="#pricing">Pricing</a>
       <a href="/api/docs">API</a>
     </nav>
 
-    <div class="footsocial">
-      <a href="https://github.com/Rohit-ATS/blast-radius" target="_blank" rel="noopener"
-         aria-label="Blast Radius on GitHub" title="Blast Radius on GitHub">
+    <div class="fsoc">
+      <a href="https://github.com/Rohit-ATS/blast-radius" target="_blank" rel="noopener" aria-label="Blast Radius on GitHub" title="Blast Radius on GitHub">
         <svg viewBox="0 0 24 24"><use href="#i-github"/></svg>
+      </a>
+      <a href="https://github.com/hydra-db/hydradb" target="_blank" rel="noopener" aria-label="HydraDB" title="Built on HydraDB">
+        <svg viewBox="0 0 24 24"><use href="#i-cube"/></svg>
       </a>
       <a href="/api/health" aria-label="Live health endpoint" title="Live health endpoint">
         <svg viewBox="0 0 24 24"><use href="#i-pulse"/></svg>
       </a>
-      <a href="https://github.com/hydra-db/hydradb" target="_blank" rel="noopener"
-         aria-label="HydraDB" title="Built on HydraDB">
-        <svg viewBox="0 0 24 24"><use href="#i-graph"/></svg>
-      </a>
     </div>
 
-    <p class="footnote">
-      MIT licensed · built on <a href="https://github.com/hydra-db/hydradb">HydraDB</a> in one day for Hack Hydra ·
+    <p class="fnote">
+      © 2025 Blast Radius · MIT licensed · built on
+      <a href="https://github.com/hydra-db/hydradb">HydraDB</a> ·
       package data from the <a href="https://registry.npmjs.org">npm registry</a> ·
-      advisories from <a href="https://osv.dev">osv.dev</a>
+      advisories from <a href="https://osv.dev">osv.dev</a> ·
+      <a href="https://github.com/Rohit-ATS/blast-radius">github.com/Rohit-ATS/blast-radius</a>
     </p>
-    <p class="footcopy">© 2025 Blast Radius · <a href="https://github.com/Rohit-ATS/blast-radius">github.com/Rohit-ATS/blast-radius</a></p>
   </div>
 </footer>
 

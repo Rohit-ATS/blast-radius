@@ -148,17 +148,23 @@ def _severity(vuln: dict) -> str:
     return str(db) if db else ""
 
 
-def osv_query(name: str, version: str | None = None, timeout: float = 15.0) -> dict:
+def osv_query(name: str, version: str | None = None, timeout: float = 15.0,
+              ecosystem: str = "npm") -> dict:
     """Advisories affecting this package (optionally this exact version).
 
     Without a version OSV returns everything ever filed against the package;
     with one it returns only what actually affects that release, which is the
     difference between alarming and true.
+
+    `ecosystem` is OSV's spelling — "npm", "PyPI", "crates.io", "Go", "Maven" —
+    and it is part of the identity, not a filter: PyPI's `requests` and npm's
+    `requests` are unrelated packages, and asking the wrong one produces a
+    confident advisory for software the project does not have installed.
     """
-    key = f"osv:{name}@{version or '*'}"
+    key = f"osv:{ecosystem}:{name}@{version or '*'}"
 
     def fetch():
-        body: dict = {"package": {"name": name, "ecosystem": "npm"}}
+        body: dict = {"package": {"name": name, "ecosystem": ecosystem}}
         if version:
             body["version"] = version
         try:
