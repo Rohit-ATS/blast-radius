@@ -47,21 +47,18 @@ services:
                               # crawl for a long time at ~130k edges today
 
     envVars:
-      # THE PORT THE REST OF THE BLUEPRINT DIALS.
+      # Deliberately NOT set.
       #
-      # Render injects $PORT into every service and, left alone, picks 10000.
-      # The entrypoint faithfully translates that into
-      # GRAPH_HTTP_ADDR=0.0.0.0:10000 — so HydraDB listened on 10000 while the
-      # web and worker services dialled http://hydradb:8443 and got connection
-      # refused. The entrypoint was right, the URL was right, and they were
-      # right about different numbers.
+      # An earlier revision pinned PORT=8443 to keep the number this project
+      # has used since day one. Render assigns $PORT itself and the override
+      # did not take: the service came up on 10000, while every peer was still
+      # dialling 8443 and getting nothing. Two numbers, both looking correct in
+      # isolation, in different files.
       #
-      # Setting PORT explicitly is the documented way to tell Render which port
-      # a service listens on, so pinning it here makes all three agree and
-      # keeps 8443 — the port this project has used everywhere since day one —
-      # true in the URL, in the code and on the wire.
-      - key: PORT
-        value: "8443"
+      # So the blueprint no longer states a port at all. The entrypoint reads
+      # whatever Render assigns and maps it onto GRAPH_HTTP_ADDR, and it logs
+      # the address peers must dial so the two halves can be compared in one
+      # place. The peers below carry the real value.
 
       # The shared secret. Generate with `openssl rand -hex 32` and paste the
       # SAME value into the web and worker services' HYDRA_TOKEN.
@@ -130,8 +127,18 @@ services:
     envVars:
       # Reachable only inside Render's private network. There is no public
       # route to this host.
+      # The graph listens on two ports and they are not interchangeable:
+      # queries on $PORT (Render assigned 10000), readiness on 9090. A probe
+      # aimed at the wrong one returns 404 against a perfectly healthy database.
+      #
+      # The hostname carries Render's own suffix. If the service is ever
+      # recreated the suffix changes, so this is the one pair of values to
+      # re-check after any blueprint rebuild — the entrypoint logs the address
+      # it is actually serving on to make that a one-line comparison.
       - key: HYDRA_URL
-        value: http://hydradb:8443
+        value: http://hydradb-l2lg:10000
+      - key: HYDRA_ADMIN_URL
+        value: http://hydradb-l2lg:9090
       - key: HYDRA_TOKEN
         sync: false           # must equal hydradb's GRAPH_AUTH_TOKEN
 
@@ -142,6 +149,16 @@ services:
         value: "1"            # Render terminates TLS; the cookie must say Secure
 
       # Accounts. Leave blank to use the local password store.
+      # The predicate store: semver ranges and maintainers, in Supabase
+      # Postgres. Without it the process falls back to a local SQLite file no
+      # crawler has ever written to, every dependent lookup runs against an
+      # empty database, and health reports the store down. Use the POOLER
+      # endpoint (aws-0-<region>.pooler.supabase.com:6543) — the direct
+      # db.<ref>.supabase.co endpoint holds a real backend per connection and
+      # resolves on fewer networks. Keep its region matched to this blueprint's.
+      - key: DATABASE_URL
+        sync: false
+
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_ANON_KEY
@@ -166,8 +183,14 @@ services:
       # same checkpoint file.
       - key: LIVE_INGEST
         value: "0"
+      # One worker. Two gunicorn workers are two full copies of the app —
+      # interpreter, fixtures, Supabase client, connection pool — and on a
+      # 512Mi Starter instance that was an OOM kill loop rather than a
+      # throughput gain. The work here is I/O-bound on the graph and Postgres,
+      # which one uvicorn worker already overlaps via async; a second process
+      # buys concurrency this workload was not short of.
       - key: WEB_CONCURRENCY
-        value: "2"
+        value: "1"
       - key: LOG_FORMAT
         value: json
 
@@ -186,8 +209,18 @@ services:
     branch: main
 
     envVars:
+      # The graph listens on two ports and they are not interchangeable:
+      # queries on $PORT (Render assigned 10000), readiness on 9090. A probe
+      # aimed at the wrong one returns 404 against a perfectly healthy database.
+      #
+      # The hostname carries Render's own suffix. If the service is ever
+      # recreated the suffix changes, so this is the one pair of values to
+      # re-check after any blueprint rebuild — the entrypoint logs the address
+      # it is actually serving on to make that a one-line comparison.
       - key: HYDRA_URL
-        value: http://hydradb:8443
+        value: http://hydradb-l2lg:10000
+      - key: HYDRA_ADMIN_URL
+        value: http://hydradb-l2lg:9090
       - key: HYDRA_TOKEN
         sync: false           # same value again
 
@@ -204,6 +237,16 @@ services:
       # small disk here if gapless replay matters to you.
       - key: WORKER_STATE_DIR
         value: /app/state
+
+      # The predicate store: semver ranges and maintainers, in Supabase
+      # Postgres. Without it the process falls back to a local SQLite file no
+      # crawler has ever written to, every dependent lookup runs against an
+      # empty database, and health reports the store down. Use the POOLER
+      # endpoint (aws-0-<region>.pooler.supabase.com:6543) — the direct
+      # db.<ref>.supabase.co endpoint holds a real backend per connection and
+      # resolves on fewer networks. Keep its region matched to this blueprint's.
+      - key: DATABASE_URL
+        sync: false
 
       - key: SUPABASE_URL
         sync: false
