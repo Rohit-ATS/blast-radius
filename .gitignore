@@ -19,3 +19,20 @@ seeds_expanded.txt
 bench.log
 .claude/
 watch.db
+
+# platform state — accounts, keys, monitors, alerts
+accounts.db
+accounts.db-shm
+accounts.db-wal
+
+# secrets — copy .env.example to .env and fill it in
+.env
+.env.local
+
+# SQLite side files, for every database this project grows. Listing each one by
+# name has already failed once: the -shm and -wal here were git added first and
+# ignored second, and .gitignore does not apply to anything already in the
+# index, so they stayed staged and would have been committed.
+*.db-shm
+*.db-wal
+*.db-journal
