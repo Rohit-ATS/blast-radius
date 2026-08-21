@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
 
+import accounts
 import apimeta
 import blast
 import chains
@@ -32,6 +33,7 @@ import feed as feedmod
 import intel
 import live as livemod
 import lockfiles
+import platform_api
 import scan
 import watch as watchmod
 from hydra import Hydra, HydraError, pkg_id
@@ -235,6 +237,9 @@ def not_yet(name: str, ms: float):
 
 apimeta.setup_logging()
 _cache = apimeta.Cache()
+
+# Concurrent identical traversals share one walk. See api_blast.
+_flight = apimeta.SingleFlight()
 _limiter = apimeta.RateLimiter(limit=RATE_LIMIT, window=60.0)
 
 # Which store actually answered each path, so a response can say so rather than
@@ -574,6 +579,7 @@ def api_health():
 
     out["uptime_s"] = apimeta.uptime_seconds()
     out["cache"] = _cache.stats()
+    out["single_flight"] = _flight.stats()
     out["rate_limit"] = {"per_minute": RATE_LIMIT}
 
     measured = _graph_cache.get("value")
@@ -589,13 +595,27 @@ def api_health():
 def api_blast(name: str = Query(..., min_length=1, max_length=214),
               depth: int = Query(5, ge=1, le=blast.MAX_DEPTH),
               limit: int = Query(5000, ge=1, le=200_000)):
-    """Who is transitively exposed, and at what depth."""
+    """Who is transitively exposed, and at what depth.
+
+    The traversal is single-flighted. A hub package takes seconds to walk, and
+    the requests that arrive for it arrive together — the console polling, a
+    demo audience clicking the same preset, a load check. Without coalescing,
+    N concurrent requests become N concurrent traversals and HydraDB returns
+    503 to all of them; with it they share one walk.
+    """
     ok, ms_lookup = known(name)
     if not ok:
         return not_yet(name, ms_lookup)
-    result, ms = blast.blast_radius(hydra, name, depth, limit)
+
+    key = f"blast:{name}:{depth}:{limit}"
+    (result, ms), shared = _flight.run(
+        key, lambda: blast.blast_radius(hydra, name, depth, limit))
     return {**result, "name": name, "vertex_id": pkg_id(name),
-            "latency_ms": round(ms, 1), "lookup_ms": round(ms_lookup, 1)}
+            "latency_ms": round(ms, 1), "lookup_ms": round(ms_lookup, 1),
+            # A follower waited for somebody else's traversal, so its latency
+            # is that traversal's, not its own work. Saying so keeps the number
+            # honest instead of implying this request was mysteriously fast.
+            "coalesced": shared}
 
 
 @app.get("/api/resolve")
@@ -1099,6 +1119,69 @@ def index():
     if not os.path.exists(path):
         return fail("web/index.html is missing", status=500)
     return FileResponse(path)
+
+
+def _page(filename: str):
+    path = os.path.join(WEB, filename)
+    if not os.path.exists(path):
+        return fail(f"web/{filename} is missing", status=500)
+    return FileResponse(path)
+
+
+# Clean URLs for the dedicated pages. Each is a full page in its own right, not
+# a modal over the landing page.
+@app.get("/check")
+def page_check():
+    return _page("check.html")
+
+
+@app.get("/developers")
+def page_developers():
+    return _page("developers.html")
+
+
+@app.get("/dashboard")
+def page_dashboard():
+    return _page("dashboard.html")
+
+
+@app.get("/signin")
+def page_signin():
+    return _page("signin.html")
+
+
+# --------------------------------------------------------------------------
+# platform: accounts, API keys, monitors, alerts
+# --------------------------------------------------------------------------
+# The v1 handlers are injected rather than imported so platform_api never
+# reaches back into this module.
+
+def _measure_blast(package: str) -> dict:
+    """What the 24-hour watch calls. Deliberately the same code path the API
+    serves, so an alert can never disagree with the endpoint."""
+    ok, _ms = known(package)
+    if not ok:
+        raise RuntimeError(f"{package} is not in the crawled graph yet")
+    result, ms = blast.blast_radius(hydra, package, 5, 5000)
+    return {**result, "latency_ms": round(ms, 1)}
+
+
+platform_api.mount(app, {
+    "blast": api_blast,
+    "resolve": api_resolve,
+    "maintainers": api_maintainers,
+    "typosquats": api_typosquats,
+    "subgraph": api_subgraph,
+    "lockfile": api_lockfile,
+    "audit": api_audit,
+    "measure": _measure_blast,
+})
+
+
+@app.on_event("startup")
+def _start_monitor_worker():
+    accounts.start_worker(_measure_blast, log=apimeta.log)
+    apimeta.log("platform_ready", **accounts.stats())
 
 
 if os.path.isdir(WEB):
