@@ -10,6 +10,11 @@ fastapi>=0.110           # the API
 uvicorn[standard]>=0.29  # ASGI server for it
 pyyaml>=6.0              # yarn-berry and pnpm lockfiles are YAML
 
+psycopg[binary,pool]>=3.1 # the predicate store in production; SQLite locally
+                          # (binary: no local libpq build. pool: a new
+                          #  connection per request over the internet is
+                          #  ~100ms of handshakes before a row moves.)
+
 # --- development ---------------------------------------------------------
 pytest>=8.0              # py -m pytest tests
 playwright>=1.44         # browser layer of the suite; needs a local Chrome

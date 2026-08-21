@@ -112,7 +112,16 @@ def test_a_key_minted_in_the_dashboard_works_on_the_public_api(api_key):
     assert r.ok, r.text
     body = r.json()
     assert body["key"]["id"] == api_key["id"]
-    assert body["limits"]["rate_limited"] is False
+
+    # A key raises the ceiling; it does not remove it. This asserted the
+    # exemption until Phase 4 replaced it — a leaked key with no ceiling drains
+    # the upstream quota for everyone, which makes a trusted key the more
+    # dangerous case rather than the safer one.
+    limits = body["limits"]
+    assert limits["rate_limited"] is True
+    assert limits["minute_limit"] >= 1000, "the ceiling should be generous"
+    assert limits["day_limit"] >= 10_000
+    assert 0 <= limits["minute_used"] <= limits["minute_limit"]
 
 
 def test_the_public_api_returns_the_same_answer_as_the_console(api_key):
