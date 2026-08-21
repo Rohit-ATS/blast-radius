@@ -16,9 +16,35 @@ from typing import Any, Iterable
 import requests
 
 HYDRA_URL = os.environ.get("HYDRA_URL", "http://127.0.0.1:8443")
-HYDRA_TOKEN = os.environ.get("HYDRA_TOKEN", "local-development-token-32-bytes")
 HYDRA_GRAPH = os.environ.get("HYDRA_GRAPH", "default")
 HYDRA_CELL = os.environ.get("HYDRA_CELL", "cell-0")
+
+# The well-known token from the local compose file. It is a placeholder, not a
+# secret, and it is in the public repo because a reader needs it to run this
+# locally in one command.
+DEV_TOKEN = "local-development-token-32-bytes"
+
+# Which is exactly why it must never silently become the production token. A
+# default that works everywhere is a default nobody notices, right up until the
+# graph is on the internet with a password that is printed in the README. So the
+# fallback is allowed only when HydraDB is on this machine; anywhere else, an
+# unset HYDRA_TOKEN is a startup failure rather than a quiet downgrade.
+_LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+_is_local = any(h in HYDRA_URL for h in _LOCAL_HOSTS)
+
+HYDRA_TOKEN = os.environ.get("HYDRA_TOKEN") or ""
+if not HYDRA_TOKEN:
+    if _is_local:
+        HYDRA_TOKEN = DEV_TOKEN
+    else:
+        raise RuntimeError(
+            f"HYDRA_TOKEN is not set and HYDRA_URL ({HYDRA_URL}) is not local. "
+            "Refusing to fall back to the development token, which is public. "
+            "Generate one with `openssl rand -hex 32` and set it as a secret.")
+elif HYDRA_TOKEN == DEV_TOKEN and not _is_local:
+    raise RuntimeError(
+        "HYDRA_TOKEN is the public development token but HydraDB is remote. "
+        "Generate a real one with `openssl rand -hex 32`.")
 
 
 class HydraError(RuntimeError):
