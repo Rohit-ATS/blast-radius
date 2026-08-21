@@ -155,13 +155,18 @@ async function loadPeeks() {
 let suggestTimer = null, suggestIndex = -1;
 
 function closeSuggest() {
-  $('#suggest').hidden = true;
-  $('#suggest').innerHTML = '';
+  // Called from the query handlers and the reset button, both of which are
+  // shared by pages that may not carry the autocomplete box.
+  const box = $('#suggest');
+  if (!box) return;
+  box.hidden = true;
+  box.innerHTML = '';
   suggestIndex = -1;
 }
 
 function wireSuggest() {
   const input = $('#pkg'), box = $('#suggest');
+  if (!input || !box) return;
 
   input.addEventListener('input', () => {
     clearTimeout(suggestTimer);
@@ -398,6 +403,9 @@ async function scanLockfile(text, filename) {
     } else {
       sub = `none of the ${num(r.resolved_count)} packages in <b>${esc(filename)}</b> reach ${esc(r.compromised)} within depth ${DEPTH}.`;
     }
+    if (r.paths_complete === false) {
+      sub += ` <span style="color:var(--ink-3)">(from your lockfile alone — dependency paths unavailable)</span>`;
+    }
     verdict.innerHTML = `<div class="word">${r.verdict}</div><div class="sub">${sub}</div>`;
 
     if (r.paths.length) {
@@ -407,6 +415,13 @@ async function scanLockfile(text, filename) {
         return `<div class="pathrow">${hops.join('<span class="arrow">→</span>')}
                   <span style="color:var(--ink-3)"> · ${p.depth} hop${p.depth === 1 ? '' : 's'}</span></div>`;
       }).join('') + `</div>`;
+    } else if (r.paths_complete === false) {
+      // Never print "no path reaches it" when we did not look. The verdict is
+      // still sound — a lockfile records every package the install resolved —
+      // but the paths that explain it are missing, and saying otherwise would
+      // turn an outage into a false all-clear.
+      detail.innerHTML = `<div class="note">scanned ${num(r.resolved_count)} resolved packages
+        from your lockfile. ${esc(r.degraded || 'dependency paths are unavailable right now.')}</div>`;
     } else {
       detail.innerHTML = `<div class="note">no path from your direct dependencies reaches
         ${esc(r.compromised)} within depth ${DEPTH}. scanned ${num(r.resolved_count)} resolved packages
@@ -422,6 +437,7 @@ async function scanLockfile(text, filename) {
 
 function wireLockfile() {
   const drop = $('#drop'), file = $('#file');
+  if (!drop || !file) return;
 
   const read = f => {
     if (!f) return;
@@ -456,21 +472,41 @@ function boot() {
   wireFeed();
   expandNode('debug', 'package', true);
 
-  $('#queryform').addEventListener('submit', e => {
-    e.preventDefault();
-    closeSuggest();
-    const name = $('#pkg').value.trim();
-    if (!name) return $('#pkg').focus();
-    runQuery(name, $('#ver').value.trim());
-  });
+  // This file runs on two pages that do not share their markup. /check has the
+  // results panel; the landing page has the same search box and incident chips
+  // but nowhere to render an answer. Asking whether the results panel exists is
+  // what tells them apart — and on the landing page a query hands off to the
+  // console rather than calling runQuery and writing into elements that are not
+  // there.
+  const hasResults = !!$('#results') && !!$('#latency');
+  const ask = (name, ver) => {
+    if (hasResults) return runQuery(name, ver);
+    const q = new URLSearchParams({ pkg: name });
+    if (ver) q.set('v', ver);
+    location.href = '/check?' + q;
+  };
 
-  $('#chips').addEventListener('click', e => {
-    const chip = e.target.closest('.chip');
-    if (!chip) return;
-    $('#pkg').value = chip.dataset.pkg;
-    $('#ver').value = chip.dataset.ver || '';
-    runQuery(chip.dataset.pkg, chip.dataset.ver || '');
-  });
+  const form = $('#queryform');
+  if (form) {
+    form.addEventListener('submit', e => {
+      e.preventDefault();
+      closeSuggest();
+      const name = $('#pkg').value.trim();
+      if (!name) return $('#pkg').focus();
+      ask(name, $('#ver').value.trim());
+    });
+  }
+
+  const chips = $('#chips');
+  if (chips) {
+    chips.addEventListener('click', e => {
+      const chip = e.target.closest('.chip');
+      if (!chip) return;
+      $('#pkg').value = chip.dataset.pkg;
+      $('#ver').value = chip.dataset.ver || '';
+      ask(chip.dataset.pkg, chip.dataset.ver || '');
+    });
+  }
 
   wireEvents();
   loadPeeks();
@@ -478,15 +514,17 @@ function boot() {
   // One control that puts the page back to a cold start. Recording a video
   // means running the same flow repeatedly, and reloading loses the warm
   // caches that make the second take fast.
-  $('#resetall').addEventListener('click', () => {
-    $('#results').hidden = true;
-    $('#auditresult').hidden = true;
-    $('#lockresult').hidden = true;
-    $('#pkg').value = '';
-    $('#ver').value = '';
-    $('#verdictline').innerHTML = '';
-    $('#latency').textContent = '—';
-    $('#latencysub').textContent = '';
+  const reset = $('#resetall');
+  if (reset) reset.addEventListener('click', () => {
+    // Most of these exist only on /check. The header button is shared, so each
+    // one is cleared only if this page actually has it.
+    ['#results', '#auditresult', '#lockresult'].forEach(sel => {
+      const el = $(sel); if (el) el.hidden = true;
+    });
+    ['#pkg', '#ver'].forEach(sel => { const el = $(sel); if (el) el.value = ''; });
+    const vl = $('#verdictline'); if (vl) vl.innerHTML = '';
+    const lat = $('#latency'); if (lat) lat.textContent = '—';
+    const ls = $('#latencysub'); if (ls) ls.textContent = '';
     ['#hist', '#victims', '#semver', '#maint', '#typos', '#auditfindings',
      '#lockdetail'].forEach(sel => { const el = $(sel); if (el) el.innerHTML = ''; });
     closeSuggest();
@@ -500,7 +538,7 @@ function boot() {
   // reflected in the URL and every URL restores the query.
   const params = new URLSearchParams(location.search);
   const pkg = (params.get('pkg') || '').trim();
-  if (pkg) {
+  if (pkg && $('#pkg') && hasResults) {
     $('#pkg').value = pkg;
     $('#ver').value = (params.get('v') || '').trim();
     runQuery(pkg, $('#ver').value);
@@ -661,6 +699,7 @@ function renderMap(data) {
 
 function wireMap() {
   const svg = $('#map'), tip = $('#maptip');
+  if (!svg) return;
 
   svg.addEventListener('mousemove', e => {
     const g = e.target.closest('.node');
@@ -995,6 +1034,7 @@ async function runAudit(text, filename) {
 
 function wireAudit() {
   const drop = $('#auditdrop'), file = $('#auditfile');
+  if (!drop || !file) return;
   const read = f => {
     if (!f) return;
     const reader = new FileReader();
@@ -1186,6 +1226,7 @@ async function expandNode(name, kind, seed = false) {
 
 function wireGraph() {
   const svg = $('#graph'), tip = $('#graphtip');
+  if (!svg) return;
 
   const toSvg = e => {
     const box = svg.getBoundingClientRect();
@@ -1331,6 +1372,7 @@ async function pollFeed() {
 }
 
 function wireFeed() {
+  if (!$('#ticker')) return;
   pollFeed();
   // The SSE stream pushes publishes as they land; this is the floor under it
   // so the panel still fills if the stream never opened.
