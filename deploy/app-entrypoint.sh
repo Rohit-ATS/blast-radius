@@ -100,6 +100,24 @@ start_graph() {
         log "FATAL: HYDRA_TOKEN is unset; the graph would start unauthenticated"
         exit 78
     fi
+    # We are the graph, so the app talks to loopback — whatever the environment
+    # says.
+    #
+    # This is not defensive tidiness. Render does not delete an environment
+    # variable when it disappears from render.yaml; it keeps whatever was set
+    # before. So a service that used to point at a separate graph service still
+    # carries HYDRA_URL=http://hydradb-l2lg:10000 after the blueprint stops
+    # mentioning it, that stale value overrides the image's own ENV, and the app
+    # spends its life dialling a service that was deleted — reporting "the
+    # dependency graph is unavailable" while the graph runs inside its own
+    # container. Overriding here makes the deployment correct without anyone
+    # having to remember to clean up the dashboard.
+    if [ -n "${HYDRA_URL:-}" ] && [ "${HYDRA_URL}" != "http://127.0.0.1:${GRAPH_PORT}" ]; then
+        log "ignoring inherited HYDRA_URL=${HYDRA_URL} — the graph is in this container"
+    fi
+    export HYDRA_URL="http://127.0.0.1:${GRAPH_PORT}"
+    export HYDRA_ADMIN_URL="http://127.0.0.1:${GRAPH_ADMIN_PORT}"
+
     log "starting graph node on ${GRAPH_HTTP_ADDR} (admin ${GRAPH_ADMIN_ADDR})"
     /usr/local/bin/graph-node &
     GRAPH_PID=$!

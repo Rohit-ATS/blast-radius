@@ -49,7 +49,7 @@ EDGE_BATCH = 1_000
 # A bounded rebuild spends its edges most-depended-upon first, which is the
 # right instinct — during an incident people ask about packages a lot of things
 # depend on — but applied alone it is precisely wrong for this tool. Measured at
-# REHYDRATE_MAX_EDGES=55000, the cut lands at 28 dependents, and every package
+# REHYDRATE_MAX_EDGES=48000, the cut lands at 38 dependents, and every package
 # below that line has *no* edges at all. Look at what that excludes:
 #
 #     debug           746 dependents    in
@@ -67,10 +67,10 @@ EDGE_BATCH = 1_000
 # systematically evicts exactly the packages this tool was built to answer for.
 #
 # So they are pinned, and their whole reverse closure is pinned with them — see
-# PIN_MAX_EDGES. Measured against the 55,000-edge budget, holding every one of
-# the evicted packages complete to depth 5 costs 1,000 edges, under 2% of the
-# budget. Which is the whole point: being unpopular is what put them below the
-# cut, and it is the same thing that makes them nearly free to keep.
+# PIN_MAX_EDGES. Measured against the 48,000-edge budget, holding every one of
+# the evicted packages complete costs 1,000 edges, about 2% of the budget. Which
+# is the whole point: being unpopular is what put them below the cut, and it is
+# the same thing that makes them nearly free to keep.
 #
 # REHYDRATE_PIN (comma-separated) adds to this list; set it when an incident
 # breaks and the package is not yet here.
@@ -125,11 +125,12 @@ def pinned_packages() -> list[str]:
 # completely, and the popular ones are left to the budget that mostly covers
 # them already.
 #
-# Verified against the sidecar at REHYDRATE_MAX_EDGES=55000. Every package the
-# ranking evicted now answers exactly, and the walk stops inside debug:
+# Verified against the sidecar at REHYDRATE_MAX_EDGES=48000, comparing each
+# against its true closure. Every package the ranking evicted answers exactly,
+# and the walk stops inside debug:
 #
 #     coa 3, node-ipc 1, faker 2, event-stream 26, rc 61,
-#     eslint-scope 260, ua-parser-js 83, colors 162     — all exact
+#     eslint-scope 260, ua-parser-js 84, colors 163     — all exact
 #     debug, chalk                                      — left to the budget
 #
 # `debug` and `chalk` stay partial on a bounded instance, and /api/blast says so

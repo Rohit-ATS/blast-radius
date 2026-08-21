@@ -147,18 +147,34 @@ services:
 
       # How much of the graph to rebuild at boot, in edges.
       #
-      # graph-node's resident size tracks the graph. Measured in the real
-      # container: the full 137,688-edge set settles at ~812MiB, and 55,000
-      # edges at ~303MiB, which leaves comfortable room for the app inside a
-      # 512MiB Starter instance. Raise this on a larger plan — 2GB fits the
-      # whole graph with room to spare.
+      # This was 55,000, chosen from the resident size of an *idle* container,
+      # and idle is the wrong thing to measure. Under concurrent audits and
+      # depth-8 traversals the same container ran at 485MiB of 512MiB — 95%,
+      # and 27MiB from the kill — and the full test suite duly tipped it over:
+      # the cgroup took graph-node six minutes in, OOMKilled=true, exactly the
+      # process whose death used to leave the site up and unable to answer.
+      #
+      # Measured in the real container, same load in every row:
+      #
+      #     edges     idle      under load
+      #     40,000    221MiB    252MiB   49%
+      #     48,000    327MiB    352MiB   69%
+      #     56,000    376MiB    485MiB   95%   <- OOM under the test suite
+      #
+      # The jump is in the traversal working set, not the resident graph, which
+      # is why measuring at idle hid it. 48,000 leaves ~160MiB of headroom.
+      #
+      # Raise it on a larger plan — 2GB fits the whole 137,688-edge set, and
+      # unsetting it entirely rebuilds the complete graph, at which point no
+      # answer carries a coverage caveat.
       #
       # Edges load most-depended-upon first, so what a bounded graph keeps is
-      # the packages anyone actually asks about during an incident. Any package
-      # whose dependents were not all loaded is reported as incomplete on the
-      # response rather than answered with a smaller number.
+      # the packages anyone actually asks about during an incident — plus the
+      # pinned incident set, which popularity ranking would otherwise drop
+      # entirely. Anything the rebuild could not hold complete is reported as a
+      # floor on the response rather than answered with a smaller number.
       - key: REHYDRATE_MAX_EDGES
-        value: "55000"
+        value: "48000"
 
       # Sizes the graph node's caches to the instance. See app-entrypoint.sh:
       # its defaults assume it owns the machine and allocate a 1GiB cache.
