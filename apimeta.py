@@ -80,6 +80,13 @@ class Cache:
             self._bump(key, "misses")
         return None, False
 
+    def drop(self, key: str) -> None:
+        """Forget one entry. Used for values worth computing but not worth
+        keeping — see intel.npm_doc, where a single package document can be
+        larger than everything else in here put together."""
+        with self._lock:
+            self._data.pop(key, None)
+
     def put(self, key: str, value):
         with self._lock:
             self._data[key] = (time.time(), value)

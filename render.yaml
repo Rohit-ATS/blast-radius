@@ -122,28 +122,19 @@ services:
 
       # The web process serves; the worker crawls. Both would fight over the
       # same checkpoint file.
-      # Off on a 512MiB instance, and this is a measured limit rather than a
-      # cautious guess. With the crawler running in-process the web process
-      # reached 496MiB on its own — it holds the visited set and the frontier
-      # queue in memory — and the kernel took graph-node instead, leaving a
-      # site that crawls diligently and cannot answer a single traversal.
-      #
-      # Nothing is lost by having it off here. The sidecar already holds the
-      # crawl (39,387 packages, 137,688 prod edges) and the graph is rebuilt
-      # from it at boot, so every answer is real crawled data. What stops is
-      # discovery of packages not yet seen.
-      #
-      # Set to "1" on a 2GB plan, where both fit, or run `docker run ... worker`
-      # elsewhere against the same DATABASE_URL to extend the crawl.
+      # On, at 512MiB, and it took real work to get there — see the commit.
+      # The registry pollers write straight into HydraDB, which is what the
+      # "five registries, right now" panel shows and what makes a watched
+      # project's alert fire. Measured with everything running: peak 376MiB.
       - key: LIVE_INGEST
-        value: "0"
+        value: "1"
 
-      # Same reason, same measurement. The npm _changes tail held the web
-      # process at 378MiB, which again left no room for the graph. The live
-      # ticker is the most decorative thing on the site and the traversals are
-      # the point of it, so the ticker is what goes.
+      # The publish ticker. It enriches each publish through the registry, and
+      # the reason that used to cost 378MiB was a cache holding whole npm
+      # packuments — documents that are individually megabytes, in a cache
+      # bounded by entry count. Capped and no longer retained, so it fits.
       - key: LIVE_FEED
-        value: "0"
+        value: "1"
 
       # How much of the graph to rebuild at boot, in edges.
       #
@@ -173,8 +164,14 @@ services:
       # pinned incident set, which popularity ranking would otherwise drop
       # entirely. Anything the rebuild could not hold complete is reported as a
       # floor on the response rather than answered with a smaller number.
+      # Lowered from 48,000 because the registry pollers now share this
+      # instance and the graph has to leave them room. This is measured, not
+      # rounded: at 55,000 edges with ingestion running, the container peaked at
+      # 500MiB and graph-node was OOM-killed within minutes; at 28,000 it peaks
+      # at 376MiB and holds. The traversals a bounded graph cannot fully answer
+      # say so on the response rather than returning a smaller number.
       - key: REHYDRATE_MAX_EDGES
-        value: "48000"
+        value: "28000"
 
       # Sizes the graph node's caches to the instance. See app-entrypoint.sh:
       # its defaults assume it owns the machine and allocate a 1GiB cache.

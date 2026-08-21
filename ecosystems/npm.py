@@ -7,6 +7,7 @@ from blast for callers that predate the adapter layer.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from functools import lru_cache
@@ -104,12 +105,46 @@ class NpmAdapter(Adapter):
         self._session.headers.update({"User-Agent": self.user_agent})
         self._seq = None
 
+    # A packument carries every version's full metadata, and for a long-lived
+    # popular package that is tens of megabytes which json.loads then turns into
+    # a far larger Python object. Fetching a few of those at once took the web
+    # process from 99MiB to 277MiB in bursts and, on a 512MiB instance shared
+    # with the graph, was what eventually got graph-node OOM-killed.
+    #
+    # Beyond this size the abbreviated document is used instead. It is the
+    # registry's own install-time format: same dependency data, no maintainers
+    # and no publish times. Losing those on a handful of giant packages is worth
+    # keeping the process alive; losing them on every package is not, which is
+    # why this is a cap rather than a switch to abbreviated everywhere.
+    MAX_DOC_BYTES = 6 * 1024 * 1024
+    ABBREVIATED = "application/vnd.npm.install-v1+json"
+
+    def _get_capped(self, url: str, accept: str | None = None):
+        headers = {"Accept": accept} if accept else None
+        with self._session.get(url, timeout=30, stream=True,
+                               headers=headers) as r:
+            if r.status_code != 200:
+                return None, False
+            chunks, size = [], 0
+            for chunk in r.iter_content(65536):
+                size += len(chunk)
+                if size > self.MAX_DOC_BYTES:
+                    return None, True          # too big; caller retries abbreviated
+                chunks.append(chunk)
+        return b"".join(chunks), False
+
     def fetch_package(self, name: str) -> dict | None:
         """Full doc carries maintainers and publish times. Slim is smaller but
-        drops both, and the maintainer pivot is a headline feature."""
+        drops both, and the maintainer pivot is a headline feature — so the full
+        one is tried first and only oversized packages fall back."""
+        url = f"{REGISTRY}/{quote(name, safe='@')}"
         try:
-            r = self._session.get(f"{REGISTRY}/{quote(name, safe='@')}", timeout=30)
-            return r.json() if r.status_code == 200 else None
+            body, too_big = self._get_capped(url)
+            if too_big:
+                body, _ = self._get_capped(url, accept=self.ABBREVIATED)
+            if not body:
+                return None
+            return json.loads(body)
         except Exception:
             return None
 

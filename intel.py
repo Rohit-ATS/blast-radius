@@ -56,19 +56,84 @@ def _cached(key: str, produce, ttl: float = TTL):
 # npm registry
 # --------------------------------------------------------------------------
 
+# A packument holds every version's full metadata. For a long-lived popular
+# package that is tens of megabytes of JSON, and json.loads turns it into a
+# considerably larger Python object.
+#
+# Two things made that expensive rather than merely large. The download was
+# unbounded, so one giant package could allocate hundreds of megabytes in a
+# single call; and the result was cached whole for an hour, so every package
+# the live feed enriched stayed resident. With the feed running, the web
+# process climbed to 378MiB in bursts, and on an instance shared with the graph
+# that is what got graph-node OOM-killed.
+#
+# So the download is capped, oversized packages fall back to the registry's
+# abbreviated format, and callers that only need a summary cache the summary
+# rather than the document it came from.
+MAX_DOC_BYTES = 6 * 1024 * 1024
+# Documents above this are used and discarded rather than cached.
+CACHEABLE_DOC_BYTES = 512 * 1024
+ABBREVIATED = "application/vnd.npm.install-v1+json"
+
+
+def _fetch_capped(url: str, timeout: float, accept: str | None = None):
+    """(body, was_too_big). Streams so an oversized doc is never materialised."""
+    headers = {"Accept": accept} if accept else None
+    with _session.get(url, timeout=timeout, stream=True, headers=headers) as r:
+        if r.status_code != 200:
+            return None, False
+        chunks, size = [], 0
+        for chunk in r.iter_content(65536):
+            size += len(chunk)
+            if size > MAX_DOC_BYTES:
+                return None, True
+            chunks.append(chunk)
+    return b"".join(chunks), False
+
+
 def npm_doc(name: str, timeout: float = 12.0) -> dict | None:
     """The full registry document, or None if npm does not have this name."""
     def fetch():
+        url = f"{REGISTRY}/{quote(name, safe='@')}"
         try:
-            r = _session.get(f"{REGISTRY}/{quote(name, safe='@')}", timeout=timeout)
-            return r.json() if r.status_code == 200 else None
+            body, too_big = _fetch_capped(url, timeout)
+            if too_big:
+                body, _ = _fetch_capped(url, timeout, accept=ABBREVIATED)
+            if not body:
+                return None
+            doc = json.loads(body)
+            # Marked so the cache can decline to keep it. The cache bounds
+            # itself by entry count, which is the wrong unit here: 4,000 entries
+            # is a sensible ceiling for advisories and summaries and an unbounded
+            # one for documents that are individually megabytes.
+            if len(body) > CACHEABLE_DOC_BYTES:
+                doc = dict(doc)
+                doc["_oversized"] = True
+            return doc
         except Exception:
             return None
-    return _cached(f"registry:doc:{name}", fetch, apimeta.TTL_REGISTRY)
+
+    doc = _cached(f"registry:doc:{name}", fetch, apimeta.TTL_REGISTRY)
+    if isinstance(doc, dict) and doc.get("_oversized"):
+        # Kept out of the cache so a run of large packages cannot accumulate.
+        # Re-fetching one of these is far cheaper than holding all of them.
+        apimeta.CACHE.drop(f"registry:doc:{name}")
+    return doc
 
 
 def npm_summary(name: str) -> dict | None:
-    """What the console needs about a package that may not be in the graph."""
+    """What the console needs about a package that may not be in the graph.
+
+    Cached on its own key. It is a few hundred bytes, where the document behind
+    it can be megabytes, and the live feed calls this for every publish it puts
+    on screen — caching the document instead meant the ticker's memory grew with
+    the number of distinct packages npm happened to publish that hour.
+    """
+    return _cached(f"registry:summary:{name}", lambda: _npm_summary(name),
+                   apimeta.TTL_REGISTRY)
+
+
+def _npm_summary(name: str) -> dict | None:
     doc = npm_doc(name)
     if not doc or not doc.get("name"):
         return None

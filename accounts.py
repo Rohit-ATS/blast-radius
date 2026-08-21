@@ -782,7 +782,16 @@ def record_delivery(webhook_id: str, ok: bool, detail: str) -> None:
             "failures = failures + ?, "
             "consecutive = CASE WHEN ? THEN 0 ELSE consecutive + 1 END "
             "WHERE id = ?",
-            (_now(), 1 if ok else 0, detail[:200], 0 if ok else 1, 1 if ok else 0, webhook_id))
+            # That fifth parameter is a real bool, and it has to be. SQLite has
+            # no boolean type and treats 1 as true, so `1 if ok else 0` worked
+            # there and read as deliberate. Postgres types the parameter as
+            # smallint and refuses:
+            #     DatatypeMismatch: argument of CASE/WHEN must be type boolean
+            # which made every *failed* delivery answer 500 — the one path this
+            # function exists to record. The columns either side really are
+            # integers (see the schema), so only this one changes.
+            (_now(), 1 if ok else 0, detail[:200], 0 if ok else 1,
+             bool(ok), webhook_id))
         conn.execute(
             "UPDATE webhooks SET active = 0 WHERE id = ? AND consecutive >= ?",
             (webhook_id, notify.DISABLE_AFTER))
