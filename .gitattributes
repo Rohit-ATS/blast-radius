@@ -1,0 +1,21 @@
+# Line endings.
+#
+# Git on Windows converts LF to CRLF in the working tree. That is harmless for
+# Python, and fatal for a shell script that is about to become a container
+# entrypoint: Linux reads the trailing \r as part of the interpreter path and
+# the container dies with
+#
+#     exec /usr/local/bin/app-entrypoint.sh: no such file or directory
+#
+# which points at a file that plainly exists. These files are LF, everywhere,
+# regardless of who checks them out.
+*.sh            text eol=lf
+Dockerfile      text eol=lf
+Dockerfile.*    text eol=lf
+*.yaml          text eol=lf
+*.yml           text eol=lf
+.dockerignore   text eol=lf
+
+# Binary assets Git should never try to normalise.
+*.png binary
+*.db  binary
