@@ -98,7 +98,7 @@ services:
   - type: web
     name: blast-radius-web
     runtime: docker
-    plan: standard            # revisit after measuring; see DEPLOY.md
+    plan: starter            # revisit after measuring; see DEPLOY.md
     region: oregon
     dockerfilePath: ./Dockerfile
     dockerContext: .
@@ -161,7 +161,7 @@ services:
   - type: worker
     name: blast-radius-worker
     runtime: docker
-    plan: standard
+    plan: starter
     region: oregon
     dockerfilePath: ./Dockerfile
     dockerContext: .
