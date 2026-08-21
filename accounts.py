@@ -164,17 +164,45 @@ _ready = False
 
 def db() -> sqlite3.Connection:
     """One connection per call. WAL, so the monitor worker and request threads
-    never block each other."""
+    never block each other.
+
+    The `_init_lock` only serialises threads inside one process. Under gunicorn
+    there are several processes, and on a cold deploy they all boot at the same
+    instant against a database file that does not exist yet — so they all run
+    `executescript(SCHEMA)` concurrently and one of them loses:
+
+        sqlite3.OperationalError: database is locked
+        Application startup failed. Exiting.
+
+    Found by running the real container with two workers; it would have failed
+    identically on the first Render deploy. `busy_timeout` makes a writer wait
+    for the lock instead of failing instantly, and the retry covers the window
+    before WAL mode is established. The schema is all `IF NOT EXISTS`, so
+    several processes applying it at once is harmless once they can take turns.
+    """
     global _ready
-    conn = sqlite3.connect(ACCOUNTS_DB, timeout=10, check_same_thread=False)
+    conn = sqlite3.connect(ACCOUNTS_DB, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
+
     if not _ready:
         with _init_lock:
             if not _ready:
-                conn.executescript(SCHEMA)
-                conn.commit()
-                _ready = True
+                for attempt in range(6):
+                    try:
+                        conn.executescript(SCHEMA)
+                        conn.commit()
+                        _ready = True
+                        break
+                    except sqlite3.OperationalError as exc:
+                        if "locked" not in str(exc) and "busy" not in str(exc):
+                            raise
+                        time.sleep(0.4 * (attempt + 1))
+                else:
+                    raise sqlite3.OperationalError(
+                        f"{ACCOUNTS_DB} stayed locked while applying the schema; "
+                        "another process may be holding a long write transaction")
     return conn
 
 

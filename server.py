@@ -212,12 +212,25 @@ def known(name: str):
 
 
 def not_yet(name: str, ms: float):
-    with db() as conn:
-        row = conn.execute("SELECT crawled FROM packages WHERE name = ?",
-                           (name,)).fetchone()
-        crawled = conn.execute(
-            "SELECT count(*) FROM packages WHERE crawled = 1").fetchone()[0]
-        meta = dict(conn.execute("SELECT key, value FROM meta"))
+    try:
+        with db() as conn:
+            row = conn.execute("SELECT crawled FROM packages WHERE name = ?",
+                               (name,)).fetchone()
+            crawled = conn.execute(
+                "SELECT count(*) FROM packages WHERE crawled = 1").fetchone()[0]
+            meta = dict(conn.execute("SELECT key, value FROM meta"))
+    except sqlite3.Error as exc:
+        # An instance whose sidecar has not been built yet — a fresh deploy
+        # before the crawler's first write. Saying "no such table: packages"
+        # tells the caller nothing they can act on, and a bare 500 tells them
+        # even less. This is the one honest answer: we have no coverage yet.
+        return fail(
+            f"this instance has no dependency graph yet, so nothing can be said "
+            f"about '{name}'. The crawler populates it continuously; try again "
+            f"shortly.",
+            status=503, code="graph_empty",
+            package=name, detail=str(exc)[:120],
+            lookup_ms=round(ms, 1))
     seen = row is not None
     with db() as conn2:
         running = blast.quick_stats(conn2)["crawl"]["running"]
@@ -634,8 +647,31 @@ def api_health():
         {"taken": True, "age_s": round(time.time() - _graph_cache["at"], 1), **measured}
         if measured else {"taken": False})
 
-    code = {"ok": 200, "warming": 503, "degraded": 503, "down": 503}[out["status"]]
-    return JSONResponse(out, status_code=code)
+    # A liveness check answers one question: should this process be restarted?
+    #
+    # It must not answer "is every dependency healthy", because a platform that
+    # restarts on a red check will then kill a perfectly good app every time
+    # HydraDB, OSV or the network hiccups — and killing it fixes none of those.
+    # That is how a single dependency outage becomes a restart loop across the
+    # whole deployment.
+    #
+    # So: a reachable process that can serve pages and report its own state is
+    # 200 with an honest `status`. The body still says exactly what is wrong,
+    # and /api/stats and the console still show it. Only an unrecoverable
+    # local fault — the process cannot read its own sidecar at all — is a 503,
+    # because that is the case a restart can actually resolve.
+    #
+    # `restart_recommended` is the machine-readable version of that judgement.
+    unrecoverable = not (out["components"].get("sidecar") or {}).get("up", False)
+    out["restart_recommended"] = unrecoverable
+    out["degraded_reason"] = (
+        None if out["status"] == "ok"
+        else "; ".join(
+            f"{name} unavailable"
+            for name, c in out["components"].items()
+            if isinstance(c, dict) and c.get("up") is False) or out["status"])
+
+    return JSONResponse(out, status_code=503 if unrecoverable else 200)
 
 
 @app.get("/api/blast")
