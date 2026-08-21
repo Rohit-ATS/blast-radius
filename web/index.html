@@ -811,6 +811,11 @@
 </footer>
 
 <script src="/shell.js"></script>
+<!-- The console engine: the explorer, the publish ticker, the lockfile
+     and audit drop zones on this page are all driven from here. Moving
+     the console to /check removed this include but left the sections
+     behind, so every one of them rendered as an empty box. -->
+<script src="/app.js"></script>
 <script src="/landing.js"></script>
 <script src="/live.js"></script>
 </body>
