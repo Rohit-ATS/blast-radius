@@ -375,6 +375,6 @@ window.BR = (() => {
   }
 
   return { q, qq, fmt, esc, api, ago, when, mount, toast, copy, wireCopy,
-           loadSession, requireSession, paintHeader, REPO,
+           loadSession, requireSession, paintHeader, liveCounter, stickyHeader, REPO,
            get session() { return session; } };
 })();

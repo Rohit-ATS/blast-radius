@@ -1,26 +1,136 @@
+<div align="center">
+
+<img src="docs/images/logo.svg" width="88" alt="Blast Radius">
+
 # Blast Radius
 
-**npm supply-chain incident response, built on a graph.**
-Hack Hydra submission — HydraDB 0.1.0.
+**When an npm package is compromised, find out who is actually exposed —
+before anyone opens an advisory.**
 
-When a package is compromised, four questions matter, and none of them is
+[![tests](https://img.shields.io/badge/tests-381%20passing-17835a?style=flat-square)](#verifying-it)
+[![license](https://img.shields.io/badge/license-MIT-2f6bff?style=flat-square)](LICENSE)
+[![API](https://img.shields.io/badge/API-free%2C%20no%20rate%20limit-2f6bff?style=flat-square)](#the-api)
+[![built on](https://img.shields.io/badge/built%20on-HydraDB%200.1.0-0f9b8e?style=flat-square)](https://github.com/hydra-db/hydradb)
+[![no build step](https://img.shields.io/badge/frontend-no%20build%20step-5c6472?style=flat-square)](web/)
+
+</div>
+
+---
+
+Four questions matter during a supply-chain incident, and none of them is
 "which packages are similar to this one":
 
-1. **Who is transitively exposed?** Everything that pulls it, five levels down.
-2. **Whose semver range would *actually* have pulled the poison?** Listing a
-   dependency is not the same as resolving to the bad version.
-3. **Is anything in my project already malicious?** Checked live against the
-   advisory database, for any project — no crawl coverage required.
-4. **How do I fix it?** The safe version, the `overrides` block, and a brief a
-   coding agent can act on.
+|   | Question | Answered by |
+| - | -------- | ----------- |
+| **1** | **Who is transitively exposed?** Everything that pulls it, five levels down. | one traversal from a known vertex |
+| **2** | **Whose semver range would _actually_ have pulled the poison?** Listing a dependency is not the same as resolving to the bad version. | every declared range, evaluated |
+| **3** | **Is anything in my project already malicious?** | live against osv.dev, no crawl coverage needed |
+| **4** | **How do I fix it?** | the safe version, an `overrides` block, a brief an agent can act on |
 
 ```bash
 docker compose up -d          # HydraDB
+cp .env.example .env          # optional: Supabase, SMTP — see SETUP.md
+py setup_check.py             # verifies every credential against the real service
 py server.py                  # http://127.0.0.1:8000
-py cli.py audit ./package-lock.json
 ```
 
-![The Blast Radius console](docs/images/hero.png)
+![The Blast Radius landing page](docs/images/hero.png)
+
+---
+
+## What you get
+
+Five surfaces, one port, no build step. Every number on every one of them
+comes back from a query that was actually run.
+
+| Route | What it is |
+| ----- | ---------- |
+| `/` | The story, with a live incident chart measured on page load |
+| `/check` | **The console** — blast radius, semver split, lockfile check, OSV audit, graph explorer, publish feed |
+| `/developers` | **The API** — key vault, quickstarts, a playground that sends real authenticated calls, the full reference |
+| `/dashboard` | **Your account** — monitors, alerts, keys, notifications, security log, all live over SSE |
+| `/signin` | Sign in / create an account |
+
+### The console
+
+Name a package and a bad version. This walks the graph five hops out, resolves
+every declared range against that version, and tells you which of the two
+numbers actually matters.
+
+![The console](docs/images/check.png)
+
+<table>
+<tr>
+<td width="50%"><img src="docs/images/blast-map.png" alt="The blast radius, drawn"></td>
+<td width="50%"><img src="docs/images/latency.png" alt="Measured latency"></td>
+</tr>
+<tr>
+<td><b>The radius, drawn.</b> Concentric rings by depth, red attenuating outward. Click any package to pivot the whole console onto it.</td>
+<td><b>Measured, not claimed.</b> Every panel carries the latency of the query that produced it.</td>
+</tr>
+</table>
+
+### The API
+
+Free, no rate limit, no quota, no card. The same code path the console runs,
+behind a stable `/api/v1` contract.
+
+![The API page](docs/images/api.png)
+
+```bash
+curl -H 'Authorization: Bearer brk_live_...' \
+  'http://localhost:8000/api/v1/blast?name=debug&depth=5'
+```
+
+```json
+{ "total": 3834, "depth": 5, "queries": 6,
+  "histogram": [{ "depth": 1, "packages": 744 }, ...],
+  "latency_ms": 1492.0, "source": "hydradb", "ok": true }
+```
+
+The reference is generated from the same table the router reads, so it cannot
+drift — and it is served three ways so an agent can consume it directly:
+
+| | |
+| --- | --- |
+| `/api/docs.json` | the reference as data |
+| `/api/docs.md` | Markdown, written to paste into an AI agent's context |
+| `/api/docs.txt` | plain text |
+| `/api/docs` | OpenAPI / Swagger UI |
+
+**Keys are never stored.** What is persisted is a SHA-256 digest and a short
+non-secret prefix; a copy of the database yields nothing usable. The plaintext
+is shown once, at creation, and lives only in the creating tab's memory.
+
+### 24/7 monitoring
+
+Register a package and this instance keeps measuring it. When its blast radius
+moves, an alert reaches your dashboard, your webhooks, and your inbox.
+
+![The dashboard](docs/images/dashboard.png)
+
+```bash
+curl -X POST http://localhost:8000/api/v1/monitors \
+  -H 'Authorization: Bearer brk_live_...' \
+  -H 'Content-Type: application/json' \
+  -d '{"package":"debug"}'
+```
+
+Deliveries are signed the way Stripe and GitHub sign theirs:
+
+```
+X-BlastRadius-Signature: t=1787270000,v1=9f86d081884c7d65...
+```
+
+HMAC-SHA256 over `<t>.<raw body>`. The timestamp is inside the signed material,
+so a captured payload cannot be replayed. Three attempts with backoff; an
+endpoint that fails twenty times in a row is disabled rather than retried
+forever.
+
+Accounts are local by default (PBKDF2-HMAC-SHA256, 310k rounds) or **Supabase**
+— two lines in `.env`, nothing else changes. See **[SETUP.md](SETUP.md)** for
+exactly where each credential goes, and **[PLATFORM.md](PLATFORM.md)** for how
+the platform layer is built.
 
 ---
 
@@ -57,7 +167,9 @@ maintainer gets phished.
 (:Package)-[:SIMILAR_TO]->(:Package)             270
 ```
 
-27,076 packages · 1,617 maintainers · 136 advisories · ~102,000 edges.
+37,237 packages · 128,228 dependency edges, and still growing — the crawler
+runs continuously, so these are a snapshot rather than a fixed size.
+`/api/stats` is the live count.
 
 Ids are namespaced through `nid()` — `nid("maint:qix")`,
 `nid("adv:MAL-2025-46974")` — so three entity kinds share one integer id space
@@ -448,16 +560,50 @@ The console works while the crawl is still running: a package not yet reached
 returns an explicit `not_in_graph` with current progress, never an empty result
 that looks like safety.
 
+### Accounts, keys and alerts
+
+Optional, and off until you configure it. Copy the template and fill in what
+you want:
+
+```powershell
+copy .env.example .env
+py setup_check.py                 # opens a connection to every service
+```
+
+`setup_check.py` never reads a setting and declares victory — it talks to
+Supabase, to the graph, to your SMTP host and to a webhook endpoint if you
+give it one. A green line means that thing worked, just now.
+
+```
+3 · authentication
+  PASS  Supabase reachable at https://xxxx.supabase.co
+  PASS  SUPABASE_ANON_KEY accepted by the project
+  PASS  email sign-up is enabled on the project
+```
+
+With an empty `.env` the whole product still runs, using local password auth
+and in-app alerts. **[SETUP.md](SETUP.md)** says which line each credential
+goes on.
+
 ## Verifying it
 
 ```powershell
-py -m pytest tests -q      # 117 tests
+py -m pytest tests -q      # 381 tests
+py setup_check.py          # every credential, against the real service
 py verify.py               # drives the live stack, per-endpoint success + latency
 py verify.py --soak 300    # sustained load, measured success rate
-py web_audit.py            # clicks all 39 controls, asserts each did something
+py web_audit.py            # clicks every control, asserts each did something
 py chaos.py                # stops HydraDB, proves the recovery
 py demo_check.py           # pre-recording gate: 21 checks
 ```
+
+`tests/test_integration.py` is the one that matters most: it walks the whole
+product over real HTTP — sign up, mint a key, call the public API, register a
+monitor and a webhook, wait for the watch to measure it, verify the HMAC on the
+delivered alert, read that same alert back through the dashboard *and* the API,
+then revoke the key and confirm the door shut. It has already earned its place
+twice, catching an endpoint that was documented but never routed, and a
+response envelope the `/api/v1` router silently did not inherit.
 
 `web_audit.py` earned its place by finding a real defect: the autocomplete
 dropdown was painting *underneath* the preset chips, so a click in the overlap
@@ -508,6 +654,24 @@ it runs in a bare CI container.
 
 ## API
 
+Two surfaces, deliberately.
+
+**`/api/v1/*`** is the public contract: key-authenticated, versioned, free and
+uncapped, and the one an integrator should build against. Full reference on
+`/developers` or at `/api/docs.md`.
+
+```
+GET  /api/v1/whoami        GET  /api/v1/blast         GET  /api/v1/resolve
+GET  /api/v1/maintainers   GET  /api/v1/typosquats    GET  /api/v1/subgraph
+POST /api/v1/lockfile      POST /api/v1/audit
+GET  /api/v1/monitors      POST /api/v1/monitors      DELETE /api/v1/monitors/{id}
+GET  /api/v1/alerts        GET  /api/v1/webhooks      POST   /api/v1/webhooks
+```
+
+**Everything below** is the console's own surface — unversioned, unauthenticated
+on loopback, and free to change as the console changes. Useful to read; not
+something to pin a build to.
+
 | endpoint | answers |
 |---|---|
 | `GET /api/health` | per-component liveness, uptime, cache, OSV reachability |
@@ -538,9 +702,10 @@ it runs in a bare CI container.
 | `DELETE /api/watch/{id}` | stop watching and drop the edges |
 | `GET /api/watch` | aggregate monitoring counters |
 
-Every response carries `latency_ms` measured around the real query, plus `ok`,
-`source`, `graph_coverage`, `cached` and `request_id`. Interactive docs at
-`/api/docs`.
+Every response on both surfaces carries `latency_ms` measured around the real
+query, plus `ok`, `source`, `graph_coverage`, `cached` and `request_id` — so one
+`if (!body.ok)` check works everywhere, and any answer can be traced back to a
+line in the log. Interactive docs at `/api/docs`.
 
 ## Walk the graph yourself
 

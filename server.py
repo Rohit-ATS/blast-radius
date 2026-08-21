@@ -18,6 +18,8 @@ import sqlite3
 import threading
 import time
 
+import config            # noqa: F401  — loads .env before anything reads it
+
 from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -29,10 +31,12 @@ import accounts
 import apimeta
 import blast
 import chains
+import constraints
 import feed as feedmod
 import intel
 import live as livemod
 import lockfiles
+import notify
 import platform_api
 import scan
 import watch as watchmod
@@ -107,6 +111,11 @@ _live = livemod.LiveIngest(hydra=hydra) if LIVE_INGEST else None
 # Registered projects and their alerts. Created either way: the endpoints must
 # answer honestly rather than 500 when ingestion is off.
 _registry = watchmod.Registry(hydra=hydra)
+
+# The constraints page re-derives HydraDB's limits against the running database.
+# Its routes live in their own module so this file does not grow a third
+# concern; see constraints.py.
+app.include_router(constraints.router)
 
 # Demo safety. DEMO_MODE=1 serves captured real responses for the preset
 # incidents, so a recording is deterministic and instant. Independently of that
@@ -253,6 +262,16 @@ _SOURCE = {
     "/api/lockfile": "hydradb",
     "/api/intel": "osv", "/api/audit": "osv", "/api/fix": "osv",
     "/api/typosquats": "registry", "/api/scan": "registry",
+
+    # /api/v1 is a façade over the handlers above, so each one reports the
+    # store its answer actually came from rather than a generic "v1".
+    "/api/v1/blast": "hydradb", "/api/v1/subgraph": "hydradb",
+    "/api/v1/lockfile": "hydradb",
+    "/api/v1/resolve": "sidecar", "/api/v1/maintainers": "sidecar",
+    "/api/v1/whoami": "accounts", "/api/v1/monitors": "accounts",
+    "/api/v1/alerts": "accounts", "/api/v1/webhooks": "accounts",
+    "/api/v1/audit": "osv",
+    "/api/v1/typosquats": "registry",
 }
 
 
@@ -275,9 +294,34 @@ def graph_coverage():
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["*"],
-    expose_headers=["X-Request-Id", "X-Response-Time-Ms"],
+    # DELETE is here because it is a real part of the contract: revoking a key,
+    # removing a monitor and removing a webhook are all DELETEs, and without it
+    # a cross-origin integrator can create things but never clean them up.
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"], allow_headers=["*"],
+    expose_headers=["X-Request-Id", "X-Response-Time-Ms", "Retry-After"],
 )
+
+# Paths the per-IP limiter never touches.
+#
+# `/api/v1/*` is the documented promise: no rate limit, no quota, no tier. Those
+# calls already require a key, and a request without one is rejected before any
+# work happens — so the limiter would only ever punish a legitimate integrator,
+# and it would punish a whole office behind one NAT address together.
+#
+# The two event streams are long-lived connections that reconnect on any
+# network blip; counting a reconnect against a per-minute budget turns a flaky
+# link into a lockout.
+UNLIMITED_PREFIXES = ("/api/v1/",)
+UNLIMITED_PATHS = ("/api/health", "/api/events", "/api/account/events",
+                   "/api/docs", "/api/docs.json", "/api/docs.md", "/api/docs.txt")
+
+
+def _rate_limited_path(path: str) -> bool:
+    if not path.startswith("/api/"):
+        return False
+    if path in UNLIMITED_PATHS or path.startswith(UNLIMITED_PREFIXES):
+        return False
+    return True
 
 
 @app.middleware("http")
@@ -288,8 +332,7 @@ async def envelope(request: Request, call_next):
     path = request.url.path
 
     client_ip = request.client.host if request.client else "?"
-    if (path.startswith("/api/") and client_ip not in LOOPBACK
-            and path not in ("/api/health", "/api/events")):
+    if _rate_limited_path(path) and client_ip not in LOOPBACK:
         ok, retry = _limiter.check(client_ip)
         if not ok:
             return JSONResponse(
@@ -506,6 +549,10 @@ def _start_background_threads():
                     ecosystems=[a.name for a in _live.adapters])
     threading.Thread(target=_refresh_graph_counts, daemon=True,
                      name="graph-counts").start()
+    # Take the first constraint sweep now: it takes about a minute, most of it
+    # one count(*) over a label, and a visitor should get a page rather than a
+    # spinner.
+    constraints.warm()
 
 
 @app.get("/api/stats")
@@ -1175,13 +1222,20 @@ platform_api.mount(app, {
     "lockfile": api_lockfile,
     "audit": api_audit,
     "measure": _measure_blast,
+    # so /api/v1 can carry the same envelope the console does
+    "coverage": graph_coverage,
+    "source_for": _SOURCE.get,
 })
 
 
 @app.on_event("startup")
-def _start_monitor_worker():
+def _start_platform_workers():
+    notify.start(log=apimeta.log)
     accounts.start_worker(_measure_blast, log=apimeta.log)
-    apimeta.log("platform_ready", **accounts.stats())
+    # Merged rather than double-splatted: both dicts carry `auth_provider`, and
+    # `f(**a, **b)` raises TypeError on the duplicate instead of letting the
+    # second win. This crashed startup, so the whole server refused to boot.
+    apimeta.log("platform_ready", **{**accounts.stats(), **config.describe()})
 
 
 if os.path.isdir(WEB):

@@ -410,6 +410,11 @@
 
   /* ================================================================= boot */
 
+  // This page renders its own header markup, so it drives the two shell
+  // behaviours that would otherwise come from BR.mount(): the session-aware
+  // buttons and the live graph counter.
+  if (window.BR) { window.BR.loadSession(); window.BR.liveCounter(); }
+
   copyables();
   stickyHeader();
   reveal();

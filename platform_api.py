@@ -12,6 +12,7 @@ console calls. It exists so that an integrator gets a stable contract
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import time
@@ -21,9 +22,11 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 import accounts
 import apidocs
+import config
+import notify
 
 COOKIE = "br_session"
-SECURE_COOKIES = os.environ.get("SECURE_COOKIES", "").lower() in ("1", "true", "yes")
+SECURE_COOKIES = config.SECURE_COOKIES
 
 router = APIRouter()
 
@@ -86,17 +89,65 @@ def _require_key(request: Request) -> dict:
     return key
 
 
+def _envelope(body: dict, request: Request | None) -> dict:
+    """The metadata every response in this project carries.
+
+    server.py does this for the console with a custom APIRoute class, but a
+    router binds its route class when its decorators run — long before
+    `mount()` could hand one over — so /api/v1 would silently answer without
+    `ok`, `source` or `request_id`. An integrator writing `if (!body.ok)` would
+    then see failures (which carry `ok`) but never successes (which would not).
+    Applying it here, where every route already passes through, keeps the two
+    surfaces answering in the same shape.
+    """
+    if not isinstance(body, dict):
+        return body
+
+    path = request.url.path if request else ""
+    body.setdefault("ok", True)
+    if request is not None:
+        body.setdefault("request_id", getattr(request.state, "request_id", None))
+
+    source_for = HANDLERS.get("source_for")
+    if source_for:
+        source = source_for(path)
+        if source:
+            body.setdefault("source", source)
+
+    coverage = HANDLERS.get("coverage")
+    if coverage and path.startswith("/api/v1/") and "total" in body:
+        try:
+            cov = coverage()
+            if cov:
+                body.setdefault("graph_coverage", cov)
+        except Exception:
+            pass                       # coverage is context, never a failure
+    return body
+
+
 def _guard(fn):
-    """Turn AuthError into the project's standard failure envelope."""
+    """Turn AuthError into the project's standard failure envelope, and put the
+    standard metadata on every success.
+
+    functools.wraps is load-bearing, not cosmetic: FastAPI builds each route's
+    parameter model by introspecting the callable it is handed. Without
+    __wrapped__ pointing back at the real function, every route would advertise
+    the wrapper's own `(*a, **kw)` and demand query parameters named `a` and
+    `kw`.
+    """
+    @functools.wraps(fn)
     async def wrapper(*a, **kw):
+        request = kw.get("request") or next(
+            (x for x in a if isinstance(x, Request)), None)
         try:
             result = fn(*a, **kw)
             if hasattr(result, "__await__"):
                 result = await result
-            return result
+            return _envelope(result, request) if isinstance(result, dict) else result
         except accounts.AuthError as exc:
-            return _fail(exc.message, exc.status, exc.code)
-    wrapper.__name__ = fn.__name__
+            return _fail(exc.message, exc.status, exc.code,
+                         request_id=getattr(request.state, "request_id", None)
+                         if request is not None else None)
     return wrapper
 
 
@@ -139,6 +190,17 @@ async def auth_logout(request: Request):
     res = JSONResponse({"ok": True})
     res.delete_cookie(COOKIE, path="/")
     return res
+
+
+@router.post("/api/auth/reset")
+@_guard
+async def auth_reset(request: Request):
+    body = await request.json()
+    base = config.PUBLIC_URL or _origin(request)
+    out = accounts.request_password_reset(body.get("email", ""), f"{base}/signin")
+    accounts.log_event(None, "password.reset_requested", body.get("email", "")[:120],
+                       *_client(request))
+    return {"ok": True, **out}
 
 
 @router.get("/api/auth/me")
@@ -285,6 +347,59 @@ def _check_now(monitor: dict) -> None:
 
 
 # --------------------------------------------------------------------------
+# webhooks — how an alert leaves the building
+# --------------------------------------------------------------------------
+
+@router.get("/api/webhooks")
+@_guard
+async def webhooks_list(request: Request):
+    acct = _require_account(request)
+    return {"ok": True, "webhooks": accounts.list_webhooks(acct["id"]),
+            "delivery": notify.status()}
+
+
+@router.post("/api/webhooks")
+@_guard
+async def webhooks_add(request: Request):
+    acct = _require_account(request)
+    body = await request.json()
+    ip, agent = _client(request)
+    hook = accounts.add_webhook(acct["id"], body.get("url", ""),
+                                body.get("label", ""), ip, agent)
+    return {"ok": True, "webhook": hook}
+
+
+@router.delete("/api/webhooks/{webhook_id}")
+@_guard
+async def webhooks_remove(request: Request, webhook_id: str):
+    acct = _require_account(request)
+    ip, agent = _client(request)
+    if not accounts.remove_webhook(acct["id"], webhook_id, ip, agent):
+        return _fail("no such webhook on this account.", 404, "not_found")
+    return {"ok": True}
+
+
+@router.post("/api/webhooks/{webhook_id}/test")
+@_guard
+async def webhooks_test(request: Request, webhook_id: str):
+    """Send a real signed delivery now, so an endpoint is proven before an
+    incident depends on it."""
+    acct = _require_account(request)
+    hook = accounts.get_webhook(webhook_id)
+    if not hook or hook["account_id"] != acct["id"]:
+        return _fail("no such webhook on this account.", 404, "not_found")
+
+    payload = {"type": "test", "id": f"test_{int(time.time())}",
+               "level": "info", "title": "Blast Radius test delivery",
+               "detail": "If you can read this, your endpoint is wired correctly.",
+               "data": {}, "created_at": time.time(), "account_id": acct["id"]}
+    ok, detail = notify._post(hook["url"], hook["secret"], payload)
+    accounts.record_delivery(hook["id"], ok, detail)
+    return {"ok": True, "delivered": ok, "detail": detail,
+            "webhook": accounts.get_webhook(webhook_id)}
+
+
+# --------------------------------------------------------------------------
 # docs
 # --------------------------------------------------------------------------
 
@@ -307,7 +422,16 @@ async def docs_txt(request: Request):
 
 @router.get("/api/platform-stats")
 async def platform_stats():
-    return {"ok": True, **accounts.stats()}
+    """What is actually configured and running. Safe to expose: it reports
+    whether a secret is set and valid, never the secret."""
+    ping = accounts.supabase_ping()
+    return {"ok": True, **accounts.stats(),
+            "config": config.describe(public=True),
+            # whether the credential works, not what it is or where it lives
+            "supabase": {"configured": ping.get("configured"),
+                         "reachable": ping.get("reachable"),
+                         "key_valid": ping.get("key_valid")},
+            "delivery": notify.status()}
 
 
 # --------------------------------------------------------------------------
@@ -436,6 +560,50 @@ async def v1_alerts(request: Request, limit: int = Query(50, ge=1, le=200)):
     return {"ok": True, "alerts": accounts.list_alerts(key["account_id"], limit)}
 
 
+@router.get("/api/v1/webhooks")
+@_guard
+async def v1_webhooks(request: Request):
+    key = _v1(request)
+    # The signing secret is deliberately withheld from a listing: it is shown
+    # once, at creation. A key that can read the list is not a reason to hand
+    # out every endpoint's ability to forge a delivery.
+    return {"ok": True, "webhooks": [
+        {k: v for k, v in hook.items() if k != "secret"}
+        for hook in accounts.list_webhooks(key["account_id"])]}
+
+
+@router.post("/api/v1/webhooks")
+@_guard
+async def v1_webhook_add(request: Request):
+    key = _v1(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    ip, agent = _client(request)
+    hook = accounts.add_webhook(key["account_id"], body.get("url", ""),
+                                body.get("label", ""), ip, agent)
+    return {"ok": True, "webhook": hook,
+            "warning": "this is the only time the signing secret is shown."}
+
+
+@router.delete("/api/v1/webhooks/{webhook_id}")
+@_guard
+async def v1_webhook_remove(request: Request, webhook_id: str):
+    key = _v1(request)
+    ip, agent = _client(request)
+    if not accounts.remove_webhook(key["account_id"], webhook_id, ip, agent):
+        return _fail("no such webhook on this account.", 404, "not_found")
+    return {"ok": True}
+
+
 def mount(app, handlers: dict) -> None:
+    """Attach the platform routes to the running app.
+
+    `handlers` also carries `coverage` and `source_for`, which `_guard` uses to
+    put the same envelope on /api/v1 responses that every console endpoint
+    already carries. See the note there for why it is not done with a route
+    class.
+    """
     HANDLERS.update(handlers)
     app.include_router(router)

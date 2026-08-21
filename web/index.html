@@ -125,6 +125,7 @@
       <a href="#lockfile">Lockfile</a>
       <a href="#monitor">Monitor</a>
       <a href="#analytics">Analytics</a>
+      <a href="/constraints">Findings</a>
       <a href="#pricing">Pricing</a>
     </nav>
 
@@ -317,70 +318,6 @@
   </div>
 </section>
 
-<!-- ============================================ full results (after a query) -->
-<section class="sec-tight rails" id="results" hidden>
-  <div class="wrap">
-    <div class="verdictline" id="verdictline"></div>
-    <div class="latencyblock">
-      <div class="latency" id="latency">—</div>
-      <div class="latencysub" id="latencysub"></div>
-    </div>
-
-    <div class="resultgrid">
-      <div class="win span2">
-        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">blast radius by depth</span></div>
-        <div class="body"><div class="hist" id="hist"></div></div>
-        <div class="cap">depth-histogram.log</div>
-      </div>
-
-      <div class="win">
-        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">would this range have pulled it?</span></div>
-        <div class="body" id="semver"></div>
-        <div class="cap">semver-resolution.txt</div>
-      </div>
-
-      <div class="win">
-        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">exposed packages</span></div>
-        <div class="body nopad"><div class="scroll" id="victims"></div></div>
-        <div class="cap">victims.list</div>
-      </div>
-
-      <div class="win">
-        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">what the attacker owns next</span></div>
-        <div class="body nopad"><div class="scroll" id="maint"></div></div>
-        <div class="cap">maintainer-pivot.json</div>
-      </div>
-
-      <div class="win">
-        <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">names one typo away</span></div>
-        <div class="body nopad"><div class="scroll" id="typos"></div></div>
-        <div class="cap">typosquat-ring.json</div>
-      </div>
-
-      <div class="win span2">
-        <div class="bar">
-          <i class="dot r"></i><i class="dot a"></i><i class="dot g"></i>
-          <span class="title">the blast radius, drawn</span>
-          <span class="barctl">
-            <button type="button" class="mini" data-mapdepth="1">1</button>
-            <button type="button" class="mini" data-mapdepth="2">2</button>
-            <button type="button" class="mini on" data-mapdepth="3">3</button>
-            <button type="button" class="mini" data-mapdepth="4">4</button>
-          </span>
-        </div>
-        <div class="body nopad">
-          <div class="mapwrap">
-            <svg id="map" viewBox="0 0 760 760" role="img" aria-label="radial map of the packages exposed by this compromise"></svg>
-            <div class="maptip" id="maptip" hidden></div>
-            <div class="maplegend" id="maplegend"></div>
-          </div>
-        </div>
-        <div class="cap">blast-map.svg — click any package to pivot the whole console onto it</div>
-      </div>
-    </div>
-  </div>
-</section>
-
 <!-- ================================= 4 · resolution + incident timeline duo -->
 <section class="sec rails" id="resolution">
   <div class="wrap">
@@ -452,7 +389,7 @@
       <div>
         <span class="eyebrow"><svg viewBox="0 0 24 24"><use href="#i-radius"/></svg> Reachability</span>
         <h3>See the whole exposed set <span class="mut">as one field</span></h3>
-        <div class="field" id="reachfield">
+        <div class="reach-field" id="reachfield">
           <svg viewBox="0 0 620 300" aria-hidden="true"></svg>
           <div class="float"><b id="reachnum">—</b> <span id="reachtxt">packages in range</span></div>
         </div>
@@ -873,7 +810,7 @@
   </div>
 </footer>
 
-<script src="/app.js"></script>
+<script src="/shell.js"></script>
 <script src="/landing.js"></script>
 <script src="/live.js"></script>
 </body>

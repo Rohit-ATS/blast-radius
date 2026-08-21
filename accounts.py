@@ -32,12 +32,15 @@ import sqlite3
 import threading
 import time
 
+import config
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ACCOUNTS_DB = os.environ.get("ACCOUNTS_DB", os.path.join(HERE, "accounts.db"))
 
-SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
-SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY") or ""
-SUPABASE_ON = bool(SUPABASE_URL and SUPABASE_ANON_KEY)
+SUPABASE_URL = config.SUPABASE_URL
+SUPABASE_ANON_KEY = config.SUPABASE_ANON_KEY
+SUPABASE_SERVICE_KEY = config.SUPABASE_SERVICE_KEY
+SUPABASE_ON = config.SUPABASE_ON
 
 KEY_PREFIX = "brk_live_"
 PBKDF2_ROUNDS = 310_000
@@ -136,6 +139,23 @@ CREATE TABLE IF NOT EXISTS audit (
   at          REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS audit_account ON audit(account_id, at DESC);
+
+CREATE TABLE IF NOT EXISTS webhooks (
+  id            TEXT PRIMARY KEY,
+  account_id    TEXT NOT NULL,
+  url           TEXT NOT NULL,
+  secret        TEXT NOT NULL,       -- shown to the owner; needed to verify
+  label         TEXT,
+  created_at    REAL NOT NULL,
+  last_at       REAL,
+  last_ok       INTEGER,
+  last_detail   TEXT,
+  deliveries    INTEGER NOT NULL DEFAULT 0,
+  failures      INTEGER NOT NULL DEFAULT 0,
+  consecutive   INTEGER NOT NULL DEFAULT 0,
+  active        INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS webhooks_account ON webhooks(account_id);
 """
 
 _init_lock = threading.Lock()
@@ -208,25 +228,96 @@ def security_log(account_id: str, limit: int = 60) -> list[dict]:
 # supabase (only used when configured)
 # --------------------------------------------------------------------------
 
-def _supabase(path: str, payload: dict) -> dict:
+def _gotrue(method: str, path: str, payload: dict | None = None,
+            token: str | None = None) -> tuple[int, dict]:
+    """One call to Supabase Auth. Returns (status, body) rather than raising,
+    because several non-2xx responses are ordinary outcomes here — a duplicate
+    signup, a wrong password, an unconfirmed email."""
     import requests
-    res = requests.post(
-        f"{SUPABASE_URL}/auth/v1{path}",
-        json=payload,
-        headers={"apikey": SUPABASE_ANON_KEY,
-                 "Content-Type": "application/json"},
-        timeout=15)
-    body = {}
+
+    headers = {"apikey": SUPABASE_ANON_KEY, "Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        res = requests.request(method, f"{SUPABASE_URL}/auth/v1{path}",
+                               json=payload, headers=headers, timeout=15)
+    except Exception as exc:
+        raise AuthError(
+            f"could not reach Supabase at {SUPABASE_URL} "
+            f"({exc.__class__.__name__}). Check SUPABASE_URL in .env.",
+            502, "supabase_unreachable")
+
+    body: dict = {}
     try:
         body = res.json()
     except Exception:
-        pass
-    if res.status_code >= 400:
-        raise AuthError(body.get("msg") or body.get("error_description")
-                        or body.get("message") or "supabase rejected the request",
-                        status=res.status_code if res.status_code < 500 else 502,
-                        code="supabase_error")
+        body = {"raw": res.text[:200]}
+    return res.status_code, body
+
+
+def _gotrue_error(status: int, body: dict) -> AuthError:
+    """Map GoTrue's vocabulary onto ours, so the browser sees one shape."""
+    msg = (body.get("msg") or body.get("error_description")
+           or body.get("message") or body.get("error") or "Supabase rejected the request")
+    low = str(msg).lower()
+
+    if status == 401 and "api key" in low:
+        return AuthError("SUPABASE_ANON_KEY is not valid for this project. "
+                         "Check Settings → API in the Supabase dashboard.",
+                         500, "supabase_misconfigured")
+    if "already registered" in low or "already exists" in low or status == 422 and "user" in low:
+        return AuthError("an account with that email already exists.", 409, "email_taken")
+    if "invalid login" in low or "invalid credentials" in low:
+        return AuthError("email or password is wrong.", 401, "bad_credentials")
+    if "email not confirmed" in low or "not confirmed" in low:
+        return AuthError("confirm your email address first — check your inbox for "
+                         "the link Supabase sent.", 403, "email_unconfirmed")
+    if "password" in low and ("short" in low or "least" in low):
+        return AuthError(str(msg), 400, "weak_password")
+    if "rate" in low or status == 429:
+        return AuthError("Supabase is rate limiting this project; try again shortly.",
+                         429, "supabase_rate_limited")
+    return AuthError(str(msg), status if 400 <= status < 500 else 502, "supabase_error")
+
+
+def supabase_user(token: str) -> dict:
+    """Confirm an access token really is who it claims to be.
+
+    The token comes back from GoTrue over TLS, but it is still a value this
+    process did not mint, so it is verified against the issuer rather than
+    decoded and trusted.
+    """
+    status, body = _gotrue("GET", "/user", token=token)
+    if status >= 400 or not body.get("id"):
+        raise _gotrue_error(status, body)
     return body
+
+
+def supabase_ping() -> dict:
+    """Used by setup_check.py and /api/platform-stats. Never raises."""
+    if not SUPABASE_ON:
+        return {"configured": False, "reachable": None,
+                "detail": "SUPABASE_URL / SUPABASE_ANON_KEY are not set; "
+                          "local password auth is in use."}
+    try:
+        status, body = _gotrue("GET", "/settings")
+    except AuthError as exc:
+        return {"configured": True, "reachable": False, "detail": exc.message}
+
+    if status == 401:
+        return {"configured": True, "reachable": True, "key_valid": False,
+                "detail": "the project answered but rejected SUPABASE_ANON_KEY."}
+    if status >= 400:
+        return {"configured": True, "reachable": True, "key_valid": False,
+                "detail": f"Supabase returned {status}."}
+
+    return {"configured": True, "reachable": True, "key_valid": True,
+            "url": SUPABASE_URL,
+            "email_signup_enabled": not body.get("disable_signup", False),
+            "autoconfirm": bool(body.get("mailer_autoconfirm", False)),
+            "external_providers": sorted(
+                k for k, v in (body.get("external") or {}).items() if v)}
 
 
 def _mirror(user: dict, email: str) -> str:
@@ -262,10 +353,27 @@ def signup(email: str, password: str, name: str = "", ip: str = "", agent: str =
     _validate(email, password)
 
     if SUPABASE_ON:
-        body = _supabase("/signup", {"email": email, "password": password,
-                                     "data": {"name": name}})
+        status, body = _gotrue("POST", "/signup",
+                               {"email": email, "password": password,
+                                "data": {"name": name}})
+        if status >= 400:
+            raise _gotrue_error(status, body)
+
+        # GoTrue answers in one of two shapes. With email confirmation off it
+        # returns a session and the account is immediately usable. With it on
+        # it returns only the user, and signing them in here would be a lie.
         user = body.get("user") or body
+        session = body.get("session") or (body if body.get("access_token") else None)
+        if not user.get("id"):
+            raise AuthError("Supabase accepted the sign-up but returned no user.",
+                            502, "supabase_error")
+
         uid = _mirror(user, email)
+        if not session:
+            log_event(uid, "account.created", f"{email} (awaiting confirmation)", ip, agent)
+            raise AuthError(
+                "Account created. Confirm your email address using the link "
+                "Supabase just sent, then sign in.", 202, "confirm_email")
     else:
         pw_hash, salt = hash_password(password)
         uid = _id("acct")
@@ -280,21 +388,32 @@ def signup(email: str, password: str, name: str = "", ip: str = "", agent: str =
             conn.commit()
 
     log_event(uid, "account.created", email, ip, agent)
-    # a first key so the account is useful the moment it exists
-    key = create_key(uid, "Default key", ip=ip, agent=agent)
+    # No key is minted here on purpose: a secret is only ever shown at the
+    # moment it is created, and that moment belongs to the dashboard where the
+    # owner can actually copy it.
     add_alert(uid, "info", "Welcome to Blast Radius",
-              "Your account is live and your first API key is ready. "
-              "Add a monitor to start the 24-hour watch.")
-    return {"account": get_account(uid), "first_key": key}
+              "Your account is live. Create an API key and add a monitor to "
+              "start the 24-hour watch.")
+    return {"account": get_account(uid)}
 
 
 def login(email: str, password: str, ip: str = "", agent: str = "") -> dict:
     email = (email or "").strip().lower()
     if SUPABASE_ON:
-        body = _supabase("/token?grant_type=password",
-                         {"email": email, "password": password})
-        user = body.get("user") or {}
-        uid = _mirror(user, email)
+        status, body = _gotrue("POST", "/token?grant_type=password",
+                               {"email": email, "password": password})
+        if status >= 400:
+            log_event(None, "login.failed", email, ip, agent)
+            raise _gotrue_error(status, body)
+
+        token = body.get("access_token")
+        if not token:
+            raise AuthError("Supabase accepted the credentials but issued no token.",
+                            502, "supabase_error")
+
+        # Verified against the issuer rather than decoded and trusted.
+        user = supabase_user(token)
+        uid = _mirror(user, user.get("email") or email)
     else:
         with db() as conn:
             row = conn.execute(
@@ -309,6 +428,26 @@ def login(email: str, password: str, ip: str = "", agent: str = "") -> dict:
 
     log_event(uid, "login.ok", email, ip, agent)
     return {"account": get_account(uid)}
+
+
+def request_password_reset(email: str, redirect_to: str = "") -> dict:
+    """Supabase sends the mail. Locally there is no mailer, and inventing a
+    reset flow that silently does nothing would be worse than saying so."""
+    email = (email or "").strip().lower()
+    if not SUPABASE_ON:
+        raise AuthError(
+            "password reset needs an email provider. Configure Supabase in .env, "
+            "or reset the password directly in accounts.db.", 501, "not_supported")
+
+    payload = {"email": email}
+    if redirect_to:
+        payload["redirect_to"] = redirect_to
+    status, body = _gotrue("POST", "/recover", payload)
+    if status >= 400:
+        raise _gotrue_error(status, body)
+    # GoTrue answers 200 whether or not the address exists, and so do we —
+    # a differing response is an account-enumeration oracle.
+    return {"sent": True}
 
 
 def get_account(account_id: str) -> dict | None:
@@ -479,6 +618,71 @@ def remove_monitor(account_id: str, monitor_id: str, ip: str = "", agent: str = 
     return bool(cur.rowcount)
 
 
+# --------------------------------------------------------------------------
+# webhooks
+# --------------------------------------------------------------------------
+
+def add_webhook(account_id: str, url: str, label: str = "",
+                ip: str = "", agent: str = "") -> dict:
+    url = (url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise AuthError("a webhook URL has to start with http:// or https://.",
+                        400, "bad_url")
+    wid = _id("wh")
+    secret = "whsec_" + secrets.token_urlsafe(32)
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO webhooks (id, account_id, url, secret, label, created_at) "
+            "VALUES (?,?,?,?,?,?)", (wid, account_id, url, secret, label or "", _now()))
+        conn.commit()
+    log_event(account_id, "webhook.added", url[:120], ip, agent)
+    return get_webhook(wid)
+
+
+def get_webhook(webhook_id: str) -> dict | None:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM webhooks WHERE id = ?", (webhook_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_webhooks(account_id: str, active_only: bool = False) -> list[dict]:
+    sql = "SELECT * FROM webhooks WHERE account_id = ?"
+    if active_only:
+        sql += " AND active = 1"
+    sql += " ORDER BY created_at DESC"
+    with db() as conn:
+        rows = conn.execute(sql, (account_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def remove_webhook(account_id: str, webhook_id: str, ip: str = "", agent: str = "") -> bool:
+    with db() as conn:
+        cur = conn.execute("DELETE FROM webhooks WHERE id = ? AND account_id = ?",
+                           (webhook_id, account_id))
+        conn.commit()
+    if cur.rowcount:
+        log_event(account_id, "webhook.removed", webhook_id, ip, agent)
+    return bool(cur.rowcount)
+
+
+def record_delivery(webhook_id: str, ok: bool, detail: str) -> None:
+    """An endpoint that has failed this many times in a row is parked rather
+    than retried forever — see notify.DISABLE_AFTER."""
+    import notify
+    with db() as conn:
+        conn.execute(
+            "UPDATE webhooks SET last_at = ?, last_ok = ?, last_detail = ?, "
+            "deliveries = deliveries + 1, "
+            "failures = failures + ?, "
+            "consecutive = CASE WHEN ? THEN 0 ELSE consecutive + 1 END "
+            "WHERE id = ?",
+            (_now(), 1 if ok else 0, detail[:200], 0 if ok else 1, 1 if ok else 0, webhook_id))
+        conn.execute(
+            "UPDATE webhooks SET active = 0 WHERE id = ? AND consecutive >= ?",
+            (webhook_id, notify.DISABLE_AFTER))
+        conn.commit()
+
+
 def add_alert(account_id: str, level: str, title: str, detail: str = "",
               data: dict | None = None, monitor_id: str | None = None) -> dict:
     aid = _id("alert")
@@ -494,6 +698,17 @@ def add_alert(account_id: str, level: str, title: str, detail: str = "",
              "level": level, "title": title, "detail": detail,
              "data": data or {}, "created_at": at, "read_at": None}
     _publish(account_id, alert)
+
+    # …and out of the building: webhooks always, email for the loud ones.
+    # Never allowed to fail the caller — the traversal that found the problem
+    # must not be undone by a receiver that is down.
+    try:
+        import notify
+        acct = get_account(account_id) or {}
+        notify.dispatch(account_id, alert, acct.get("email"))
+    except Exception:
+        pass
+
     return alert
 
 
@@ -576,8 +791,8 @@ def publish_state(account_id: str, payload: dict) -> None:
 # the 24-hour watch
 # --------------------------------------------------------------------------
 
-MONITOR_INTERVAL = float(os.environ.get("MONITOR_INTERVAL", "180"))
-MONITOR_STALE = float(os.environ.get("MONITOR_STALE", "900"))   # re-check after
+MONITOR_INTERVAL = config.MONITOR_INTERVAL
+MONITOR_STALE = config.MONITOR_STALE
 
 _worker_started = False
 
@@ -689,5 +904,11 @@ def stats() -> dict:
             "       (SELECT COUNT(*) FROM api_keys WHERE revoked_at IS NULL) AS keys, "
             "       (SELECT COUNT(*) FROM monitors WHERE active = 1) AS monitors, "
             "       (SELECT COUNT(*) FROM alerts) AS alerts").fetchone()
-    return {**dict(row), "auth_provider": "supabase" if SUPABASE_ON else "local",
-            "monitor_interval_s": MONITOR_INTERVAL}
+    with db() as conn:
+        hooks = conn.execute(
+            "SELECT COUNT(*) AS n FROM webhooks WHERE active = 1").fetchone()["n"]
+    return {**dict(row), "webhooks": hooks,
+            "auth_provider": "supabase" if SUPABASE_ON else "local",
+            "monitor_interval_s": MONITOR_INTERVAL,
+            "monitor_stale_s": MONITOR_STALE,
+            "worker_running": _worker_started}

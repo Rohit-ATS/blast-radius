@@ -27,6 +27,34 @@ AUTH = (
     "next request."
 )
 
+WEBHOOKS = """The watch delivers every alert to each endpoint registered on the \
+account, as a POST with a JSON body. Deliveries are signed:
+
+    X-BlastRadius-Signature: t=1787270000,v1=9f86d081...
+    X-BlastRadius-Event: alert
+
+The signature is HMAC-SHA256 over `<t>.<raw request body>` using that endpoint's
+secret. Verify against the raw bytes rather than a re-serialised object, and
+reject a timestamp more than a few minutes old — the timestamp is inside the
+signed material precisely so a captured payload cannot be replayed later.
+
+Three attempts are made per delivery with backoff. An endpoint that fails 20
+times in a row is disabled rather than retried forever: a delivery queue that
+grows without limit because someone's staging server is down is an outage of
+its own.
+
+Body:
+
+    {
+      "type": "alert",
+      "id": "alert_9c1f",
+      "level": "high",
+      "title": "debug blast radius grew by 141",
+      "detail": "Now 3,828 packages transitively exposed, was 3,687.",
+      "data": { "package": "debug", "total": 3828, "previous": 3687, "delta": 141 },
+      "created_at": 1787270000.0
+    }"""
+
 ERRORS = [
     ("200", "ok", "The query ran. `latency_ms` is the measured time."),
     ("401", "missing_key / bad_key", "No key, an unknown key, or a revoked key."),
@@ -198,6 +226,22 @@ ENDPOINTS = [
     },
     {
         "method": "GET",
+        "path": "/api/v1/webhooks",
+        "title": "Webhooks",
+        "summary": "Endpoints this account's alerts are delivered to. POST to add one; "
+                   "the signing secret is returned once. Every delivery carries "
+                   "`X-BlastRadius-Signature: t=<unix>,v1=<hmac-sha256>` over "
+                   "`<timestamp>.<raw body>` — verify it before trusting a payload.",
+        "params": [("url", "string", "POST only", "Where to deliver. Must be http(s).")],
+        "example": "/api/v1/webhooks",
+        "response": {
+            "webhooks": [{"id": "wh_ab12", "url": "https://hooks.example.com/br",
+                          "deliveries": 42, "failures": 0, "active": 1}],
+            "ok": True,
+        },
+    },
+    {
+        "method": "GET",
         "path": "/api/v1/whoami",
         "title": "Whoami",
         "summary": "Confirm a key works and see which account and key it belongs to. "
@@ -251,6 +295,7 @@ def as_json(base: str = BASE, key: str = "brk_live_...") -> dict:
         "base_url": f"{base}/api/v1",
         "intro": INTRO,
         "auth": AUTH,
+        "webhooks": WEBHOOKS,
         "free": True,
         "rate_limited": False,
         "quickstarts": [{"label": l, "lang": lang, "code": _fill(c, base, key)}
@@ -311,6 +356,7 @@ def as_text(base: str = BASE, key: str = "brk_live_...") -> str:
     for label, _lang, code in QUICKSTARTS:
         out += [f"[{label}]", _fill(code, base, key), ""]
 
+    out += ["WEBHOOKS", "-" * W, WEBHOOKS.replace("`", ""), ""]
     out += ["ENDPOINTS", "-" * W]
     for e in ENDPOINTS:
         out += [f"{e['method']} {e['path']}",

@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in — Blast Radius</title>
+<meta name="description" content="Sign in to Blast Radius to create API keys, add monitors and read your alerts.">
+<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='15' fill='none' stroke='%232f6bff' stroke-width='1' opacity='.28'/><circle cx='16' cy='16' r='10.5' fill='none' stroke='%232f6bff' stroke-width='1.5' opacity='.55'/><circle cx='16' cy='16' r='5' fill='%23d63a2f'/></svg>">
+</head>
+<body>
+
+<main class="authwrap">
+  <div class="authcard">
+    <h1 id="authtitle">Sign in</h1>
+    <p class="lede" id="authlede">
+      Your account holds your API keys, your monitors and the alerts they raise.
+      Free, no card, no limits.
+    </p>
+
+    <form id="authform" autocomplete="on">
+      <div class="field" id="namefield" hidden>
+        <label for="name">Name</label>
+        <input class="input" id="name" name="name" autocomplete="name" placeholder="Ada Lovelace">
+      </div>
+
+      <div class="field">
+        <label for="email">Email</label>
+        <input class="input" id="email" name="email" type="email" required
+               autocomplete="email" placeholder="you@company.com">
+      </div>
+
+      <div class="field">
+        <label for="password">Password</label>
+        <input class="input" id="password" name="password" type="password" required
+               autocomplete="current-password" placeholder="at least 8 characters" minlength="8">
+        <span class="hint" id="pwhint">Stored as PBKDF2-HMAC-SHA256 with a per-account salt.</span>
+      </div>
+
+      <button class="btn btn-primary btn-lg submit" type="submit" id="submit">Sign in</button>
+      <p class="authswap" id="forgotrow">
+        <button type="button" id="forgot">Forgot your password?</button>
+      </p>
+    </form>
+
+    <div class="autherr" id="autherr" hidden></div>
+
+    <p class="authswap" id="authswap">
+      New here? <button type="button" id="swap">Create an account</button>
+    </p>
+
+    <p class="authmeta" id="authmeta">
+      Blast Radius is MIT licensed and self-hostable — this account only exists so your
+      keys, monitors and alerts have somewhere to live.
+    </p>
+  </div>
+</main>
+
+<script src="/shell.js"></script>
+<script src="/signin.js"></script>
+</body>
+</html>
