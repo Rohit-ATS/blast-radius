@@ -210,7 +210,7 @@
         <h3>Blast radius of real incidents</h3>
         <span class="chip-trend" id="shifttag"><svg viewBox="0 0 24 24"><use href="#i-trend"/></svg> measuring…</span>
       </div>
-      <p class="panel-sub">Showing packages transitively exposed, to depth 5, across the crawled graph</p>
+      <p class="panel-sub">Packages transitively exposed to depth 3, measured live. <a href="/check" style="border-bottom:1px solid var(--line)">Run the full depth-5 closure</a></p>
       <div class="bars" id="cmpchart"><div class="skel">querying the graph…</div></div>
     </div>
   </div>
@@ -242,7 +242,7 @@
           <span class="avatar"><svg viewBox="0 0 24 24"><use href="#i-radius"/></svg></span>
           <h3 id="dashtitle">debug@4.4.2 exposure</h3>
         </div>
-        <p class="dash-sub">Measure how far a compromised package reaches through the dependency graph</p>
+        <p class="dash-sub">How far a compromised package reaches. Shown to depth 3 here; <a href="/check" style="border-bottom:1px solid var(--line)">the console</a> walks all five.</p>
 
         <div class="kpis">
           <div class="kpi tint"><div class="k">Packages exposed</div><div class="v" id="k-exposed">—</div><div class="d" id="k-exposed-d">depth 5 closure</div></div>

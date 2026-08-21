@@ -549,7 +549,18 @@ code, .mono { font-family: var(--mono); }
 .prompt.on { background: var(--blue); border-color: var(--blue); color: #fff; }
 
 /* the table */
-.tbl-wrap { margin-top: 22px; border: 1px solid var(--line); border-radius: 13px; overflow: hidden; }
+/* The table has five columns and a narrow phone has room for two. It scrolls
+   inside its own frame rather than widening the page: a horizontal scrollbar on
+   <body> makes every section on the page look broken, not just this one. */
+.tbl-wrap {
+  margin-top: 22px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+.tbl { min-width: 560px; }
 .tbl { width: 100%; border-collapse: collapse; }
 .tbl th {
   background: var(--wash);
@@ -1430,3 +1441,29 @@ code, .mono { font-family: var(--mono); }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .mon-cred .btn { justify-self: start; margin-top: 4px; }
+
+/* The incident bars are a bar, a label and a count on one line. On a narrow
+   phone the label and the count together are wider than the space the bar
+   leaves them, so the row wraps rather than quietly widening its container. */
+@media (max-width: 640px) {
+  .bar-row { flex-wrap: wrap; row-gap: 6px; }
+  .bar-fill { max-width: 100%; }
+  .bar-out { flex: 1 1 100%; }
+  .panel { padding: 20px 18px 24px; }
+  .bars::before { display: none; }        /* gridlines need width to mean anything */
+}
+
+/* `.range-row` is nowrap so the two range columns sit side by side with a rule
+   between them. That only works while there is room for two columns. */
+@media (max-width: 640px) {
+  .range-row { flex-wrap: wrap; }
+  /* flex-basis has to go to 100%, not just wrap: `flex: 1 1 0` lets the two
+     columns shrink forever rather than ever moving to a second line, so they
+     stayed side by side and squeezed their chips past the card edge. */
+  .range-col { flex: 1 1 100%; }
+  .range-col + .range-col {
+    padding-left: 0; border-left: 0;
+    padding-top: 14px; border-top: 1px solid var(--line-2);
+  }
+  .tags .tag { white-space: normal; }
+}
