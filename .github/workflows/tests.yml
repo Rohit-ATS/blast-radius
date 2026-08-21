@@ -3,6 +3,14 @@ name: tests
 
 on: [push, pull_request]
 
+# The default GITHUB_TOKEN is broad — on some repository settings it can write
+# contents, packages and more. Neither of these jobs pushes anything: they
+# check out the code and run a command. Declaring the minimum here means a
+# compromised dependency in the toolchain cannot use the token to write to the
+# repository, which for a supply-chain project is not a hypothetical.
+permissions:
+  contents: read
+
 jobs:
   unit:
     runs-on: ubuntu-latest

@@ -100,6 +100,16 @@ services:
       - key: DATABASE_URL
         sync: false
 
+      # Keyed digest for API keys. Any long random string; generate one with
+      #     python -c "import secrets; print(secrets.token_urlsafe(48))"
+      # It never leaves this process. Without it a copy of the api_keys table
+      # lets someone verify guessed keys offline; with it the table is inert on
+      # its own. Keys issued before it was set keep working and are upgraded
+      # the next time they are used, so it can be added to a running service —
+      # but changing it later invalidates every key at once.
+      - key: BLAST_KEY_PEPPER
+        sync: false
+
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_ANON_KEY

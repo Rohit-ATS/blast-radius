@@ -30,6 +30,7 @@ from fastapi.staticfiles import StaticFiles
 import accounts
 import apidocs_page
 import apimeta
+import errors
 import blast
 import chains
 import constraints
@@ -111,6 +112,11 @@ NPM_TOTAL = 4_311_957
 # Watch npm publish while the console is open. Disabled in DEMO_MODE, where
 # determinism matters more than liveness.
 LIVE_FEED = os.environ.get("LIVE_FEED", "1") == "1"
+
+# Whether error responses may name internal addresses and suggest local
+# commands. Off unless asked for: these are useful on a laptop and are
+# reconnaissance on a public URL.
+DEV_HINTS = os.environ.get("DEV_HINTS", "0") == "1"
 _feed = feedmod.Feed(hydra=hydra, blast_mod=blast)
 
 # Continuous multi-ecosystem ingestion. This is what keeps the graph current;
@@ -342,7 +348,12 @@ async def hydra_down(request: Request, exc: HydraError):
     looking at the console: the database is here but still paging the store in
     (transient — 503 and come back), or it is gone (a failed dependency — 424,
     and the OSV-backed half of the product is still working)."""
+    # Kept for the branching below and for the log. It does not reach the
+    # response — see errors.py for why.
     detail = str(exc)[:400]
+    apimeta.log("graph_error", path=request.url.path,
+                request_id=getattr(request.state, "request_id", None),
+                error=errors.detail(exc))
     # A refused connection is never "warming". Before this check, a graph that
     # was not listening at all reported `graph_warming` with "this clears on its
     # own" — which is exactly wrong, and sends whoever is on call away to wait
@@ -358,7 +369,7 @@ async def hydra_down(request: Request, exc: HydraError):
                          "store exceeds its own 30s query timeout on deep "
                          "traversals. This clears on its own."),
              "warmup": {k: v for k, v in _warm.items() if k != "event"},
-             "detail": detail,
+             "reason": errors.reason(exc),
              "hint": "retry in a few seconds; GET /api/health tracks the state",
              "retry_after_s": 10},
             # 503 is right *here* and nowhere else in this handler: warming is
@@ -371,19 +382,30 @@ async def hydra_down(request: Request, exc: HydraError):
     # Everything OSV-backed (audit, intel, fix, lockfile scanning) needs no
     # graph at all and keeps working while this is true; the message says so,
     # because a user who thinks the whole product is down will stop trying.
-    local = HYDRA_URL.startswith(("http://127.0.0.1", "http://localhost"))
+    # Operator hints, and the address they are about, are for operators.
+    #
+    # This used to key off "is HYDRA_URL loopback", which was a fair proxy for
+    # "this is somebody's laptop" right up until the graph moved into the same
+    # container as the app — at which point production became loopback too, and
+    # every public 424 started carrying the graph's internal address and the
+    # advice to run `docker compose up -d hydradb`. DEV_HINTS is explicit, so
+    # it cannot be made wrong by a deployment change somewhere else.
+    body = {"ok": False,
+            "error": "graph_unavailable",
+            "message": ("The dependency graph is unavailable, so blast radius "
+                        "and the traversals are answering nothing right now. "
+                        "Lockfile audit, package intel and remediation do not "
+                        "use the graph and are unaffected."),
+            "reason": errors.reason(exc)}
+    if DEV_HINTS:
+        body["hydra_url"] = HYDRA_URL
+        body["hint"] = ("docker compose up -d hydradb"
+                        if HYDRA_URL.startswith(("http://127.0.0.1",
+                                                 "http://localhost"))
+                        else "check the hydradb service and that HYDRA_URL "
+                             "matches the port it is listening on")
     return JSONResponse(
-        {"ok": False,
-         "error": "graph_unavailable",
-         "message": ("The dependency graph is unavailable, so blast radius and "
-                     "the traversals are answering nothing right now. Lockfile "
-                     "audit, package intel and remediation do not use the graph "
-                     "and are unaffected."),
-         "detail": detail,
-         "hydra_url": HYDRA_URL,
-         "hint": ("docker compose up -d hydradb" if local else
-                  "check the hydradb service and that HYDRA_URL matches the "
-                  "port it is listening on; GET /api/health reports both")},
+        body,
         # 424 Failed Dependency, not 503 Service Unavailable. This service is
         # up and most of it works — audit, intel, fix and lockfile scanning
         # need no graph at all. 503 says "come back later, nothing works here",
@@ -424,7 +446,7 @@ def not_yet(name: str, ms: float):
             f"about '{name}'. The crawler populates it continuously; try again "
             f"shortly.",
             status=503, code="graph_empty",
-            package=name, detail=str(exc)[:120],
+            package=name, reason=errors.reason(exc),
             lookup_ms=round(ms, 1))
     seen = row is not None
     with db() as conn2:
@@ -634,12 +656,17 @@ async def envelope(request: Request, call_next):
             canned.headers["X-Request-Id"] = rid
             canned.headers["X-Demo-Fallback"] = "1"
             return canned
+        # The exception text goes to the log with the request id, not to the
+        # caller. It routinely names internal hosts, ports and paths, and this
+        # handler catches everything — so whatever an attacker can provoke,
+        # they could read. `reason` is from a closed vocabulary; the request id
+        # is what turns a user's report into the log line above.
         apimeta.log("unhandled", request_id=rid, path=path,
-                    error=f"{exc.__class__.__name__}: {exc}"[:300])
+                    error=errors.detail(exc))
         response = JSONResponse(
             {"ok": False, "error": "internal_error",
              "message": "the server failed to handle this request.",
-             "detail": f"{exc.__class__.__name__}: {exc}"[:300],
+             "reason": errors.reason(exc),
              "request_id": rid},
             status_code=500)
 
@@ -743,7 +770,7 @@ def _refresh_graph_counts() -> None:
                     value["source"] = "sidecar (graph is a bounded subgraph)"
             _graph_cache.update(value=value, at=time.time(), error=None)
         except Exception as e:                       # a down server must not kill the thread
-            _graph_cache.update(error=str(e)[:200], at=time.time())
+            _graph_cache.update(error=errors.reason(e), at=time.time())
         time.sleep(GRAPH_REFRESH)
 
 
@@ -759,11 +786,15 @@ def _probe_writable() -> None:
                                 {"id": _WRITE_PROBE_ID}, retries=1)
             _writable.update(ok=True, detail="writes round-trip", at=time.time())
         except Exception as e:
-            detail = str(e)
-            if "PutMode::Update" in detail or "internal query execution error" in detail:
+            raw = str(e)
+            apimeta.log("write_probe_failed", error=errors.detail(e))
+            if "PutMode::Update" in raw or "internal query execution error" in raw:
+                # Specific, actionable, and says nothing about the environment.
                 detail = ("store is read-only: the SlateDB manifest cannot be "
                           "updated on the local filesystem backend after a "
                           "restart. Rebuild with `py rebuild.py`.")
+            else:
+                detail = errors.reason(e)
             _writable.update(ok=False, detail=detail[:220], at=time.time())
         time.sleep(WRITE_PROBE_INTERVAL)
 
@@ -820,7 +851,7 @@ def _warm_supervisor() -> None:
                 break
             except Exception as e:
                 total = len(WARM_PACKAGES) * blast.MAX_DEPTH_DEFAULT
-                _warm.update(state="warming", detail=str(e)[:160],
+                _warm.update(state="warming", detail=errors.reason(e),
                              progress=f"{len(_warm_done)}/{total}",
                              elapsed_s=round(time.time() - started, 1))
                 time.sleep(2)
@@ -832,7 +863,7 @@ def _warm_supervisor() -> None:
                                     {"id": pkg_id(WARM_PACKAGES[0])}, retries=1)
             except Exception as e:
                 _warm_done.clear()
-                _warm.update(state="warming", detail=f"probe failed: {e}"[:160])
+                _warm.update(state="warming", detail=f"probe failed: {errors.reason(e)}")
                 break
 
 
@@ -915,7 +946,7 @@ def api_health():
             "up": True, "latency_ms": round((time.perf_counter() - t0) * 1000, 1)}
     except Exception as e:
         out["components"]["hydradb"] = {
-            "up": False, "error": str(e)[:200], "url": HYDRA_URL,
+            "up": False, "error": errors.reason(e),
             # Connection refused means the address is wrong or nothing is
             # listening there — a different problem from a graph that answers
             # slowly, and worth separating because only one of them is a config
@@ -923,6 +954,10 @@ def api_health():
             "likely": ("nothing is listening on that address"
                        if _refused(e) else "reachable but not answering"),
             "latency_ms": round((time.perf_counter() - t0) * 1000, 1)}
+        # The address itself is only for whoever can act on it. /api/health is
+        # public, and this is the internal location of the datastore.
+        if DEV_HINTS:
+            out["components"]["hydradb"]["url"] = HYDRA_URL
         out["status"] = "degraded"
 
     try:
@@ -932,7 +967,7 @@ def api_health():
         q = _bounded(_stats, 4.0)
         out["components"]["sidecar"] = {
             "up": True, "packages": q["packages"], "edges": q["edges"],
-            "latency_ms": q["latency_ms"], **sidecar.describe()}
+            "latency_ms": q["latency_ms"], **sidecar.describe(include_host=DEV_HINTS)}
         out["components"]["crawl"] = q["crawl"]
     except Exception as e:
         # The predicate store is Postgres in production — a *remote* dependency,
@@ -941,7 +976,7 @@ def api_health():
         # instance out of rotation and answer 502 to the internet. Restarting
         # this process has never once fixed somebody else's database.
         out["components"]["sidecar"] = {
-            "up": False, "error": str(e)[:200], **sidecar.describe()}
+            "up": False, "error": errors.reason(e), **sidecar.describe(include_host=DEV_HINTS)}
         out["status"] = "degraded"
 
     out["components"]["warmup"] = {k: v for k, v in _warm.items() if k != "event"}
@@ -964,7 +999,7 @@ def api_health():
         if not probe.get("ok"):
             out["components"]["osv"]["error"] = probe.get("error")
     except Exception as e:
-        out["components"]["osv"] = {"up": False, "error": str(e)[:160]}
+        out["components"]["osv"] = {"up": False, "error": errors.reason(e)}
 
     out["uptime_s"] = apimeta.uptime_seconds()
     out["cache"] = _cache.stats()
@@ -1592,7 +1627,9 @@ async def api_events(request: Request):
                     yield ("event: publish\ndata: "
                            + json.dumps({"events": fresh}) + "\n\n")
             except Exception as e:
-                yield f"event: error\ndata: {json.dumps({'error': str(e)[:200]})}\n\n"
+                apimeta.log("stream_error", error=errors.detail(e))
+                yield ("event: error\ndata: "
+                       + json.dumps({"error": errors.reason(e)}) + "\n\n")
             await asyncio.sleep(2)
 
     return StreamingResponse(stream(), media_type="text/event-stream", headers={

@@ -27,8 +27,30 @@
   };
 
   function next() {
-    const to = new URLSearchParams(location.search).get('next');
-    return to && to.startsWith('/') ? to : '/dashboard';
+    // `?next=` decides where a successful sign-in lands, so it is attacker
+    // input that ends up in location.href. A lone startsWith('/') is not
+    // enough to make it safe:
+    //
+    //   //evil.example        a protocol-relative URL. Starts with '/', and
+    //                         the browser reads it as another origin.
+    //   /\evil.example        some browsers normalise the backslash to '/'
+    //                         and treat it the same way.
+    //   https://evil.example  rejected by the original check, but only by
+    //                         accident of not starting with '/'.
+    //
+    // Landing a freshly signed-in user on someone else's page is how
+    // credentials get phished, so this resolves the value against our own
+    // origin and takes it only if it stayed here. The browser's own parser
+    // decides, rather than a second guess at its normalisation rules.
+    const raw = new URLSearchParams(location.search).get('next');
+    if (!raw) return '/dashboard';
+    try {
+      const url = new URL(raw, location.origin);
+      if (url.origin !== location.origin) return '/dashboard';
+      return url.pathname + url.search + url.hash;
+    } catch (_) {
+      return '/dashboard';
+    }
   }
 
   function paint() {
