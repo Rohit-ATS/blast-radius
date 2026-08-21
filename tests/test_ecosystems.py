@@ -16,7 +16,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import ecosystems                                              # noqa: E402
-from ecosystems import crates, golang, npm, pypi               # noqa: E402
+from ecosystems import crates, golang, maven, npm, pypi        # noqa: E402
 
 
 # ==========================================================================
@@ -264,6 +264,239 @@ exclude github.com/bad/pkg v1.0.0
     assert deps["github.com/stretchr/testify"] == "v1.8.4"
     assert deps["golang.org/x/sys"] == "v0.15.0"
     assert "github.com/bad/pkg" not in deps        # exclude is not a require
+
+
+# ==========================================================================
+# Maven — soft requirements and interval notation
+# ==========================================================================
+
+def test_a_bare_maven_version_is_a_recommendation_not_a_pin():
+    """The fourth answer to "what does a bare version mean", and the only one
+    that is not a constraint at all.
+
+    npm pins, Cargo carets, Go floors — and Maven merely *suggests*. Maven's
+    nearest-wins resolution can override a bare version with one declared
+    closer to the root, so reporting `1.0` as pinned claims a guarantee Maven
+    never made. Only bracket notation is binding.
+    """
+    assert maven.is_hard_requirement("1.0") is False
+    assert maven.is_hard_requirement("[1.0]") is True
+    assert maven.is_hard_requirement("[1.0,2.0)") is True
+    assert maven.is_hard_requirement("(,1.0]") is True
+
+    # the soft form admits a newer version, because resolution may well pick one
+    assert maven.satisfies("2.0", "1.0") is True
+    # the hard form does not
+    assert maven.satisfies("2.0", "[1.0]") is False
+
+
+@pytest.mark.parametrize("version,spec,expected", [
+    # soft requirement — treated as a floor, never as a pin
+    ("1.0", "1.0", True),
+    ("2.0", "1.0", True),
+    ("0.9", "1.0", False),
+    # hard pin
+    ("1.0", "[1.0]", True),
+    ("1.0.0", "[1.0]", True),           # 1.0 == 1.0.0, trailing zeros pad
+    ("1.1", "[1.0]", False),
+    # half-open intervals
+    ("1.5", "[1.0,2.0)", True),
+    ("1.0", "[1.0,2.0)", True),         # inclusive lower
+    ("2.0", "[1.0,2.0)", False),        # exclusive upper
+    ("0.9", "[1.0,2.0)", False),
+    ("2.0", "[1.0,2.0]", True),         # inclusive upper
+    ("1.0", "(1.0,2.0)", False),        # exclusive lower
+    # unbounded on one side
+    ("0.9", "(,1.0]", True),
+    ("1.0", "(,1.0]", True),
+    ("1.1", "(,1.0]", False),
+    ("9.0", "[1.5,)", True),
+    ("1.4", "[1.5,)", False),
+    # a union of intervals, ORed
+    ("3.5", "[1.0,2.0],[3.0,4.0)", True),
+    ("1.5", "[1.0,2.0],[3.0,4.0)", True),
+    ("2.5", "[1.0,2.0],[3.0,4.0)", False),
+    ("4.0", "[1.0,2.0],[3.0,4.0)", False),
+    # qualifiers
+    ("1.0-rc1", "[1.0,2.0)", False),   # a candidate precedes its release
+    ("1.0", "[1.0-rc1,)", True),
+    ("1.0-SNAPSHOT", "[1.0,)", False),  # a snapshot precedes its release
+    # wildcards and blanks admit anything rather than raising
+    ("1.0", "*", True),
+    ("1.0", "", True),
+])
+def test_maven_ranges(version, spec, expected):
+    assert maven.satisfies(version, spec) is expected
+
+
+@pytest.mark.parametrize("spec", ["[", "]", "[,", "[1.0", "1.0]", "[a,b]", "[,]"])
+def test_maven_malformed_spec_is_false(spec):
+    assert maven.satisfies("1.0", spec) is False
+
+
+@pytest.mark.parametrize("version", ["", "   ", None, "not-a-version"])
+def test_maven_malformed_version_is_false(version):
+    assert maven.satisfies(version, "[1.0,2.0)") is False
+
+
+def test_maven_refuses_to_guess_an_unresolved_property():
+    """`${jackson.version}` is not a range. Guessing here would produce a
+    confident advisory match against a version nobody declared."""
+    assert maven.satisfies("2.19.0", "${jackson.version}") is False
+    assert maven.satisfies("2.19.0", "[${min},2.0)") is False
+
+
+@pytest.mark.parametrize("higher,lower", [
+    ("2.19.0", "2.19.0-rc2"),           # release beats its candidate
+    ("2.19.0-rc10", "2.19.0-rc2"),      # ordinals compare as numbers, not text
+    ("2.19.0-rc1", "2.19.0-milestone1"),   # alpha < beta < milestone < rc
+    ("2.19.0-milestone1", "2.19.0-beta1"),
+    ("2.19.0-beta1", "2.19.0-alpha1"),
+    ("1.0", "1.0-SNAPSHOT"),            # a snapshot precedes its release
+    ("1.0-sp1", "1.0"),                 # a service pack follows it
+    ("33.4.8-jre", "33.4.8-android"),   # unknown qualifiers order lexically
+    ("2.0", "1.9.9"),
+])
+def test_maven_version_ordering(higher, lower):
+    assert maven._cmp(maven.parse_version(higher), maven.parse_version(lower)) > 0
+    assert maven._cmp(maven.parse_version(lower), maven.parse_version(higher)) < 0
+
+
+@pytest.mark.parametrize("a,b", [
+    ("1.2", "1.2.0"),                   # missing components pad with zero
+    ("1.2", "1.2.0.0"),
+    ("2.0.0.Final", "2.0.0"),           # final/ga/release ARE the null qualifier
+    ("1.0-GA", "1.0"),
+    ("1.0-release", "1.0"),
+    ("1.0-alpha1", "1.0.alpha.1"),      # '.', '-' and '_' all separate tokens
+    ("1.0-beta-2", "1.0-beta2"),        # a number after a qualifier is its ordinal
+])
+def test_maven_versions_that_are_equal(a, b):
+    assert maven._cmp(maven.parse_version(a), maven.parse_version(b)) == 0
+
+
+def test_maven_latest_is_never_a_prerelease():
+    """Filtering on the literal string "snapshot" is not enough — Central
+    serves rc, alpha and milestone builds too, and picking one as "latest"
+    reports a version nobody's build resolves to."""
+    versions = ["2.18.3", "2.18.4", "2.19.0-rc1", "2.19.0-rc2", "2.19.0",
+                "2.19.1-SNAPSHOT", "3.0.0-alpha1", "3.0.0-M1"]
+    stable = sorted((v for v in versions if maven.is_release(v)),
+                    key=maven.sort_key)
+    assert stable[-1] == "2.19.0"
+    for pre in ("2.19.0-rc2", "3.0.0-alpha1", "2.19.1-SNAPSHOT", "3.0.0-M1"):
+        assert maven.is_release(pre) is False
+    # guava's -jre/-android are classifiers, not previews
+    assert maven.is_release("33.4.8-jre") is True
+    assert maven.is_release("33.4.8-android") is True
+
+
+def test_maven_sorting_agrees_with_comparison():
+    """A regression guard. `sort_key` and `satisfies` once disagreed: plain
+    tuple comparison put 2.19.0 BELOW its own release candidate, because the
+    release parses to the shorter tuple."""
+    versions = ["3.0.0-alpha1", "2.19.0", "2.19.0-rc2", "1.0-sp1", "1.0", "2.18.4"]
+    ordered = sorted(versions, key=maven.sort_key)
+    for i in range(len(ordered) - 1):
+        assert maven._cmp(maven.parse_version(ordered[i]),
+                          maven.parse_version(ordered[i + 1])) <= 0
+
+
+def test_maven_pom_property_substitution():
+    pom = """<project>
+  <properties>
+    <jackson.version>2.19.0</jackson.version>
+    <base.version>1.4</base.version>
+    <derived.version>${base.version}.2</derived.version>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-core</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.example</groupId>
+      <artifactId>derived</artifactId>
+      <version>${derived.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.example</groupId>
+      <artifactId>mystery</artifactId>
+      <version>${never.defined}</version>
+    </dependency>
+  </dependencies>
+</project>"""
+    props = maven.parse_properties(pom)
+    assert props["jackson.version"] == "2.19.0"
+
+    deps = {d["dep"]: d for d in maven.parse_dependencies(pom, props)}
+    assert deps["com.fasterxml.jackson.core:jackson-core"]["range"] == "2.19.0"
+    # one level of indirection resolves
+    assert deps["org.example:derived"]["range"] == "1.4.2"
+    # an undefined property is recorded as unresolved, NOT guessed
+    assert deps["org.example:mystery"]["range"] == ""
+    assert deps["org.example:mystery"]["unresolved"] is True
+
+
+def test_maven_dependency_management_supplies_missing_versions():
+    """Real POMs omit the version and inherit it from dependencyManagement."""
+    pom = """<project>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.example</groupId>
+        <artifactId>managed-lib</artifactId>
+        <version>3.1.4</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>org.example</groupId>
+      <artifactId>managed-lib</artifactId>
+    </dependency>
+  </dependencies>
+</project>"""
+    managed = maven.parse_managed(pom, {})
+    assert managed["org.example:managed-lib"] == "3.1.4"
+
+    deps = maven.parse_dependencies(pom, {}, managed)
+    # the managed block itself must not be mistaken for a declared dependency
+    assert len(deps) == 1
+    assert deps[0]["range"] == "3.1.4"
+    assert deps[0]["unresolved"] is False
+
+
+def test_maven_scope_decides_what_reaches_a_consumer():
+    """Only compile and runtime propagate transitively. A test-scoped JUnit is
+    not part of anyone else's blast radius."""
+    pom = """<project><dependencies>
+    <dependency><groupId>g</groupId><artifactId>compiled</artifactId>
+      <version>1.0</version></dependency>
+    <dependency><groupId>g</groupId><artifactId>runtime-only</artifactId>
+      <version>1.0</version><scope>runtime</scope></dependency>
+    <dependency><groupId>g</groupId><artifactId>tested</artifactId>
+      <version>1.0</version><scope>test</scope></dependency>
+    <dependency><groupId>g</groupId><artifactId>given</artifactId>
+      <version>1.0</version><scope>provided</scope></dependency>
+    <dependency><groupId>g</groupId><artifactId>maybe</artifactId>
+      <version>1.0</version><optional>true</optional></dependency>
+</dependencies></project>"""
+    kinds = {d["dep"]: d["kind"] for d in maven.parse_dependencies(pom, {})}
+    assert kinds["g:compiled"] == "prod"
+    assert kinds["g:runtime-only"] == "prod"
+    assert kinds["g:tested"] == "dev"
+    assert kinds["g:given"] == "provided"
+    assert kinds["g:maybe"] == "optional"        # optional wins over scope
+
+
+def test_maven_interval_split_respects_brackets():
+    """A single interval contains a comma, so splitting a union on commas
+    naively produces four broken fragments instead of two intervals."""
+    assert maven._split_intervals("[1.0,2.0],[3.0,4.0)") == ["[1.0,2.0]", "[3.0,4.0)"]
+    assert maven._split_intervals("[1.0,2.0]") == ["[1.0,2.0]"]
+    assert maven._split_intervals("(,1.0]") == ["(,1.0]"]
 
 
 # ==========================================================================

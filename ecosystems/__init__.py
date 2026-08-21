@@ -3,6 +3,7 @@
 from .base import Adapter, ParsedPkg, strip_env_marker, version_key
 from .crates import CratesAdapter
 from .golang import GoAdapter
+from .maven import MavenAdapter
 from .npm import NpmAdapter
 from .pypi import PyPIAdapter
 
@@ -18,6 +19,7 @@ register(NpmAdapter())
 register(PyPIAdapter())
 register(CratesAdapter())
 register(GoAdapter())
+register(MavenAdapter())
 
 DEFAULT = "npm"
 
