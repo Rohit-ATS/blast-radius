@@ -695,13 +695,40 @@ app.router.route_class = EnvelopeRoute
 # api
 # --------------------------------------------------------------------------
 
+# Measuring the graph with the graph's own count(*) is a full scan, and on a
+# small instance a full scan is not a measurement — it is an outage.
+#
+# HydraDB says so itself while planning it:
+#     "access_path":"FullEdgeScan:REQUIRED_BY","full_scan":true,
+#     "rows_estimated":1000000,"reason":"full_scan"
+# and there is no CREATE INDEX in 0.1.0 to make it cheaper. It ran on a timer
+# in the background, so it cost nothing visible until the instance was also
+# running the registry pollers — and then the scan's working set was what
+# pushed the container over its limit and got graph-node OOM-killed. The site
+# lost its graph in order to display how big the graph was.
+#
+# GRAPH_TRUE_COUNTS=1 restores it where there is memory to spare.
+TRUE_GRAPH_COUNTS = os.environ.get("GRAPH_TRUE_COUNTS", "0") == "1"
+
+
 def _refresh_graph_counts() -> None:
-    """Re-measure the graph with HydraDB's own count(*), forever, slowly."""
+    """Re-measure the graph, forever, slowly."""
     _warm["event"].wait()          # a cold full scan just burns the query timeout
     while True:
         try:
-            _graph_cache.update(value=blast.graph_stats(hydra_patient), at=time.time(),
-                                error=None)
+            if TRUE_GRAPH_COUNTS:
+                value = blast.graph_stats(hydra_patient)
+            else:
+                # The crawler writes a sidecar row and a graph vertex from the
+                # same batch, and only prod dependencies become edges, so these
+                # track what was written to HydraDB rather than approximating
+                # it. blast.quick_stats says as much where it is defined.
+                with db() as conn:
+                    quick = blast.quick_stats(conn)
+                value = {"packages": quick["packages"], "edges": quick["edges"],
+                         "measured_ms": quick.get("latency_ms", 0.0),
+                         "source": "sidecar"}
+            _graph_cache.update(value=value, at=time.time(), error=None)
         except Exception as e:                       # a down server must not kill the thread
             _graph_cache.update(error=str(e)[:200], at=time.time())
         time.sleep(GRAPH_REFRESH)

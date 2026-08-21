@@ -44,6 +44,7 @@ from collections import OrderedDict, deque
 
 import ecosystems
 from hydra import Hydra, pkg_id
+import sidecar as sidecar_store
 from ingest import CREATE_EDGES, UPSERT_PACKAGES, UPSERT_STUBS, open_sidecar
 
 # How often each registry is polled. These are not arbitrary: npm's _changes
@@ -214,11 +215,26 @@ class LiveIngest:
     def stop(self) -> None:
         self._stop.set()
 
+    def _open_store(self):
+        """Postgres when one is configured, the local SQLite file otherwise.
+
+        One call site for both so the poller cannot end up reading one store
+        and writing the other.
+        """
+        if sidecar_store.IS_POSTGRES:
+            return sidecar_store.connect()
+        return open_sidecar(self.db_path)
+
     def _load_known(self) -> None:
         try:
-            db = sqlite3.connect(self.db_path, check_same_thread=False)
-            self._known = {n for (n,) in db.execute(
-                "SELECT name FROM packages WHERE crawled = 1")}
+            # Through the sidecar, not sqlite3 directly. The predicate store
+            # moved to Postgres; opening deps.db here found no such file on a
+            # deployed instance, quietly produced an empty set, and every
+            # publish then looked like a package nobody has ever depended on —
+            # which is exactly the class of event this is built to ignore.
+            db = self._open_store()
+            self._known = {r[0] for r in db.execute(
+                "SELECT name FROM packages WHERE crawled = 1").fetchall()}
             self.edges_total = db.execute(
                 "SELECT COUNT(*) FROM deps WHERE kind = 'prod'").fetchone()[0]
             db.close()
@@ -304,7 +320,7 @@ class LiveIngest:
     # ------------------------------------------------------------------
 
     def _writer_loop(self) -> None:
-        db = open_sidecar(self.db_path)
+        db = self._open_store()
         while not self._stop.is_set():
             try:
                 adapter, name, is_known = self._queue.get(timeout=1.0)
@@ -315,6 +331,27 @@ class LiveIngest:
             except Exception as exc:
                 self.write_errors += 1
                 self.last_write_error = f"{type(exc).__name__}: {exc}"
+
+                # Postgres aborts the whole transaction on any failed statement
+                # and refuses everything after it until someone rolls back:
+                #     InFailedSqlTransaction: current transaction is aborted,
+                #     commands ignored until end of transaction block
+                # SQLite has no such state, so this loop simply carried on to
+                # the next package and worked. On Postgres the first failure of
+                # any kind ended ingestion permanently — 72 errors, 0 writes,
+                # and a status panel reporting itself live throughout, because
+                # polling was fine and only writing was dead.
+                #
+                # The rollback returns the connection to a usable state; if even
+                # that fails the connection is past saving and is replaced.
+                try:
+                    db.rollback()
+                except Exception:
+                    try:
+                        db.close()
+                    except Exception:
+                        pass
+                    db = self._open_store()
                 if "read-only" in str(exc).lower() or "500" in str(exc):
                     # HydraDB 0.1.0 leaves a restarted store permanently
                     # read-only. Saying so beats a green light over a graph
@@ -343,29 +380,33 @@ class LiveIngest:
             (vid, qual, pkg.latest, pkg.versions_seen))
 
         db.executemany(
-            "INSERT OR IGNORE INTO release_deps (name, version, dep, kind, range) "
-            "VALUES (?,?,?,?,?)",
+            "INSERT INTO release_deps (name, version, dep, kind, range) "
+            "VALUES (?,?,?,?,?) "
+            "ON CONFLICT (name, version, dep, kind) DO NOTHING",
             [(qual, d.get("version") or pkg.latest,
               qualified(eco, d["dep"]), d.get("kind", "prod"),
               str(d.get("range") or "")[:120]) for d in pkg.deps])
 
         db.executemany(
-            "INSERT OR IGNORE INTO maintainers (maintainer, package) VALUES (?,?)",
+            "INSERT INTO maintainers (maintainer, package) VALUES (?,?) "
+            "ON CONFLICT (maintainer, package) DO NOTHING",
             [(m, qual) for m in pkg.maintainers])
 
         stub_rows, edge_rows = [], []
         for d in pkg.deps:
             dep_qual = qualified(eco, d["dep"])
             cur = db.execute(
-                "INSERT OR IGNORE INTO deps (src, dst, kind, range, via) "
-                "VALUES (?,?,?,?,?)",
+                "INSERT INTO deps (src, dst, kind, range, via) "
+                "VALUES (?,?,?,?,?) "
+                "ON CONFLICT (src, dst, kind) DO NOTHING",
                 (qual, dep_qual, d.get("kind", "prod"),
                  str(d.get("range") or "")[:120], pkg.latest))
             if d.get("kind") != "prod":
                 continue
             dep_vid = pkg_id(d["dep"], eco)
             if dep_qual not in self._known:
-                db.execute("INSERT OR IGNORE INTO packages (nid, name) VALUES (?,?)",
+                db.execute("INSERT INTO packages (nid, name) VALUES (?,?) "
+                           "ON CONFLICT (nid) DO NOTHING",
                            (dep_vid, dep_qual))
                 stub_rows.append({"id": dep_vid, "name": d["dep"],
                                   "ecosystem": eco})

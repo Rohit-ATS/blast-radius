@@ -325,7 +325,7 @@ CREATE TABLE IF NOT EXISTS packages (
   nid          BIGINT PRIMARY KEY,
   name         TEXT UNIQUE NOT NULL,
   latest       TEXT,
-  versions     INTEGER,
+  versions_seen INTEGER,
   crawled      SMALLINT NOT NULL DEFAULT 0,
   ecosystem    TEXT NOT NULL DEFAULT 'npm',
   published_at TEXT,
@@ -383,12 +383,49 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 
+# Changes to tables that already exist. CREATE TABLE IF NOT EXISTS does nothing
+# to a table that is already there, so a column added after the first deploy
+# needs this to reach an existing database.
+#
+# Every statement must be safe to run on every boot.
+MIGRATIONS = """
+-- The column was created as `versions` here while the canonical schema in
+-- ingest.py has always called it `versions_seen`. Nothing ever read `versions`,
+-- but both the crawler and the live ingester write `versions_seen`, so on
+-- Postgres every package write failed with
+--     UndefinedColumn: column "versions_seen" of relation "packages"
+-- and, because a failed statement poisons a Postgres transaction, took the rest
+-- of the batch with it. Renamed rather than duplicated: two columns holding the
+-- same count is how they drift.
+--
+-- Guarded because Postgres has no IF EXISTS for RENAME COLUMN. Unguarded, this
+-- succeeds once and then fails on every boot afterwards with "column versions
+-- does not exist" — aborting the transaction it runs in and taking the whole
+-- schema setup down with it. A migration that only works once is a landmine.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns
+             WHERE table_name = 'packages' AND column_name = 'versions') THEN
+    ALTER TABLE packages RENAME COLUMN versions TO versions_seen;
+  END IF;
+END
+$$;
+
+-- `via` records which manifest field declared the dependency. The crawler and
+-- the live ingester both write it and the migration to Postgres dropped it, so
+-- every edge insert failed the same way the package insert did. ADD COLUMN does
+-- support IF NOT EXISTS, so this one needs no guard.
+ALTER TABLE deps ADD COLUMN IF NOT EXISTS via TEXT;
+"""
+
+
 def ensure_schema(conn=None) -> None:
     own = conn is None
     conn = conn or connect()
     try:
         if IS_POSTGRES:
             conn.executescript(SCHEMA)
+            conn.executescript(MIGRATIONS)
         else:
             from ingest import SIDECAR_SCHEMA
             conn.executescript(SIDECAR_SCHEMA)
