@@ -33,22 +33,44 @@ FORBIDDEN = re.compile(
         pooler\.supabase\.com | aws-0- | \.supabase\.co |
         /app/ | /usr/local/ | site-packages |
         docker\s+compose |
-        127\.0\.0\.1 | localhost
+        127\.0\.0\.1 | localhost | hydradb-internal | Errno\s+111
     )""",
     re.IGNORECASE | re.VERBOSE)
 
 
-@pytest.fixture(scope="module")
-def client():
-    """A server whose graph is unreachable, so the error paths actually run."""
-    os.environ["HYDRA_URL"] = "http://127.0.0.1:9"       # discard port
-    os.environ["HYDRA_ADMIN_URL"] = "http://127.0.0.1:9"
-    os.environ["HYDRA_TOKEN"] = "x"
-    os.environ["LIVE_INGEST"] = "0"
-    os.environ["LIVE_FEED"] = "0"
-    os.environ.pop("DEV_HINTS", None)                    # production default
+@pytest.fixture()
+def client(monkeypatch):
+    """A server whose graph fails, deterministically.
+
+    The first version of this pointed HYDRA_URL at a discard port and reloaded
+    the module. That worked alone and failed in a full run: other suites reload
+    `server` and `config` for their own reasons, and whichever ran last decided
+    what these tests were actually pointed at — so a graph that was supposed to
+    be unreachable answered fine and the assertions inverted.
+
+    Making the failure a property of the test rather than of the environment
+    removes the ordering question entirely. Every graph call raises HydraError,
+    which is exactly the path the disclosure rules are about, and nothing here
+    depends on what ran before.
+    """
     import server
-    importlib.reload(server)
+    from hydra import HydraError
+
+    def refuse(*a, **kw):
+        raise HydraError(
+            "HTTPConnectionPool(host='hydradb-internal', port=8443): Max "
+            "retries exceeded with url: /v1/graphs/default/query (Caused by "
+            "NewConnectionError('<urllib3.connection.HTTPConnection object at "
+            "0x7f8b8c0d1234>: Failed to establish a new connection: "
+            "[Errno 111] Connection refused'))")
+
+    for name in ("hydra", "hydra_probe", "hydra_patient"):
+        target = getattr(server, name, None)
+        if target is not None:
+            monkeypatch.setattr(target, "query", refuse)
+            monkeypatch.setattr(target, "timed", refuse, raising=False)
+
+    monkeypatch.setattr(server, "DEV_HINTS", False)      # production default
     return TestClient(server.app, raise_server_exceptions=False)
 
 
