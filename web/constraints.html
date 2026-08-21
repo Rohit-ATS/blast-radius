@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What HydraDB 0.1.0 cannot do — Blast Radius</title>
+<meta name="description" content="An empirical map of HydraDB 0.1.0's query surface and its silent-failure modes, re-derived against the running database every five minutes. Not a claim — a measurement.">
+<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/constraints.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='15' fill='none' stroke='%232f6bff' stroke-width='1' opacity='.28'/><circle cx='16' cy='16' r='10.5' fill='none' stroke='%232f6bff' stroke-width='1.5' opacity='.55'/><circle cx='16' cy='16' r='5' fill='%23d63a2f'/></svg>">
+</head>
+<body>
+
+<header class="hdr">
+  <div class="wrap">
+    <a class="logo" href="/">
+      <span class="mark"><svg viewBox="0 0 32 32">
+        <circle cx="16" cy="16" r="15" fill="none" stroke="currentColor" stroke-width="1" opacity=".22"/>
+        <circle cx="16" cy="16" r="10.5" fill="none" stroke="currentColor" stroke-width="1.7" opacity=".5"/>
+        <circle cx="16" cy="16" r="5.6" fill="currentColor"/>
+      </svg></span>
+      <span class="word">Blast Radius</span>
+    </a>
+    <nav class="hnav">
+      <a href="/">Console</a>
+      <a href="/#monitor">Monitor</a>
+      <a href="/api/docs">API</a>
+    </nav>
+    <div class="hcta">
+      <div class="hstat" id="cstat" aria-live="polite">
+        <span class="pulse" id="cpulse" aria-hidden="true"></span>
+        <span id="cstatline">probing hydradb…</span>
+      </div>
+      <button type="button" class="btn ghost-sm" id="creload">Re-run now</button>
+    </div>
+  </div>
+</header>
+
+<main id="top">
+
+<section class="sec rails grid-bg">
+  <div class="wrap">
+    <p class="eyebrow-lg">Hack Hydra · findings</p>
+    <h1 class="h-hero">What HydraDB&nbsp;0.1.0 <span class="mut">cannot do</span></h1>
+    <p class="lede lede-wide">
+      The organizers asked people to surface what does not work. A list in a README
+      is a claim, so this page re-derives the whole thing against the running
+      database instead — <b>every probe below was executed live</b>, and the page
+      says how long ago.
+    </p>
+    <p class="lede lede-wide">
+      The parse-time rejections are the cheap half: they are loud, the error tells
+      you what happened, and you lose minutes. <b>The silent failures are the
+      expensive half.</b> Nothing raises, the shape looks right, and the answer is
+      wrong — the first one below made every uncrawled package report an empty
+      blast radius, which reads as <i>safe</i>. That is the worst possible way for
+      a security tool to be wrong, and it cost days to find.
+    </p>
+
+    <div class="cbanner" id="cbanner"><div class="skel">measuring…</div></div>
+  </div>
+</section>
+
+<section class="sec-tight rails" id="traps">
+  <div class="wrap">
+    <div class="head-split">
+      <h2 class="h-sec">The ones that fail silently <span class="mut">— far more expensive</span></h2>
+      <p class="lede">
+        Each is re-run live, wrong version beside corrected version, so the
+        difference is visible rather than described.
+      </p>
+    </div>
+    <div id="trapcards"><div class="skel">measuring…</div></div>
+  </div>
+</section>
+
+<section class="sec rails" id="surface">
+  <div class="wrap">
+    <div class="head-split">
+      <h2 class="h-sec">The query surface <span class="mut">, probe by probe</span></h2>
+      <p class="lede">
+        The same probe set that produced the constraint table in the README —
+        imported from <code>probe_constraints.py</code> rather than copied, so the
+        two cannot drift apart.
+      </p>
+    </div>
+    <div id="groups"><div class="skel">measuring…</div></div>
+  </div>
+</section>
+
+<section class="sec-tight rails" id="narrative">
+  <div class="wrap">
+    <div class="head-split">
+      <h2 class="h-sec">Two findings <span class="mut">a probe cannot answer</span></h2>
+      <p class="lede">
+        Real, measured, and not a boolean — so they are listed as prose and
+        labelled as such rather than dressed up as live checks.
+      </p>
+    </div>
+    <div id="narrativerows"></div>
+  </div>
+</section>
+
+<footer class="ftr">
+  <div class="wrap">
+    <p class="fnote">
+      Probes run against <code id="chydra">hydradb</code> and clean up after
+      themselves. Cached for five minutes; a stale reading says so. Source:
+      <code>constraints.py</code>, <code>probe_constraints.py</code>,
+      <code>probe_counts.py</code>.
+    </p>
+  </div>
+</footer>
+
+</main>
+<script src="/constraints.js"></script>
+</body>
+</html>

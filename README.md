@@ -307,6 +307,15 @@ The organizers asked people to surface what does not work. Everything here was
 found empirically; [`probe_constraints.py`](probe_constraints.py) prints a
 PASS/FAIL table and flags any row where a constraint no longer holds.
 
+**A list in a README is a claim, so the running server publishes it as a
+measurement instead.** [`/constraints`](constraints.py) re-derives this entire
+section against the live database every five minutes — 25 probes, each with the
+query it ran and what came back. The silent-failure traps below are shown
+*twice*: the query that lies, beside the query that does not, with both results
+as they came back seconds ago. If a constraint ever stops holding, the page says
+SURPRISE and shows what it got instead, because a page that can only agree with
+itself is not evidence of anything.
+
 ### Rejected outright
 
 | what we tried | what HydraDB said | what we did instead |
@@ -519,6 +528,7 @@ it runs in a bare CI container.
 | `GET /api/resolve` | exposed vs shielded by pin |
 | `GET /api/maintainers` | what else those maintainers publish |
 | `GET /api/search` | package name autocomplete |
+| `GET /api/constraints` | re-derive HydraDB's limits against the live database |
 | `GET /api/live/status` | per-registry ingestion health, edge budget |
 | `GET /api/live/events` | packages written into the graph, newest first |
 | `POST /api/watch/register` | register a lockfile or manifest for monitoring |
@@ -572,6 +582,7 @@ ecosystems/            one adapter per registry — each with its OWN range gram
                          crates.py  bare version == caret, the inverse of npm
                          golang.py  no ranges at all; a require is an MVS floor
                          maven.py   bare version is a soft *recommendation*
+constraints.py         live verification of HydraDB's limits -> /constraints
 intel.py               live registry + OSV: real, current, compromised
 live.py                continuous ingestion — five change feeds -> HydraDB
 watch.py               project registration + alert routing by traversal
