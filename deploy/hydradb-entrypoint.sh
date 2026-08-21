@@ -42,6 +42,13 @@ else
     log "no \$PORT; GRAPH_HTTP_ADDR=${GRAPH_HTTP_ADDR}"
 fi
 
+# Say the whole address out loud. This translation was correct and still cost an
+# outage, because Render defaults $PORT to 10000 and the peers were configured
+# to dial 8443: nothing logged the two numbers next to each other, so both sides
+# looked right in isolation. Printing the URL peers must use turns that into a
+# one-line diff instead of a packet capture.
+log "peers must use HYDRA_URL=http://<this-service-name>:${GRAPH_HTTP_ADDR##*:}"
+
 # --------------------------------------------------------------- the layout
 mkdir -p "${DATA_DIR}/store" "${DATA_DIR}/cache"
 

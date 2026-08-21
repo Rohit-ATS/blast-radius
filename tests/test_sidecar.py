@@ -119,7 +119,11 @@ def test_the_direct_endpoint_is_flagged(monkeypatch):
 
 # ---------------------------------------------------------------- postgres
 
-pg = pytest.mark.skipif(not os.environ.get("DATABASE_URL"),
+# config loads .env; without importing it first this reads a bare environment
+# and skips the Postgres tests on a machine that is perfectly well configured.
+import config  # noqa: E402
+
+pg = pytest.mark.skipif(not config.get("DATABASE_URL"),
                         reason="no DATABASE_URL; see this module's docstring")
 
 

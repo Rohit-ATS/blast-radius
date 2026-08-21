@@ -41,7 +41,7 @@ import platform_api
 import scan
 import sidecar
 import watch as watchmod
-from hydra import Hydra, HydraError, pkg_id
+from hydra import HYDRA_URL, Hydra, HydraError, pkg_id
 from ingest import DEPS_DB, SIDECAR_SCHEMA
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -59,6 +59,15 @@ hydra = Hydra(budget=20.0)
 # The crawler and the warm-up thread are not on a request path and want the
 # patient behaviour instead.
 hydra_patient = Hydra(timeout=180.0, budget=None)
+
+# The liveness check gets its own client with a hard, short budget. A health
+# endpoint that blocks on the dependency it is reporting on is worse than no
+# health endpoint: Render times the check out, marks the instance unhealthy and
+# stops routing, so a *reachable* app serving OSV-backed features to nobody
+# returns 502 to the whole internet. The check must answer quickly and honestly
+# whether or not the graph is there, which means it may never inherit the
+# request client's 20-second budget.
+hydra_probe = Hydra(timeout=2.5, budget=3.0)
 
 # HydraDB's own count(*) over the whole graph is a full scan with no index to
 # lean on — at ~23k packages the package and edge counts together take over a
@@ -223,6 +232,48 @@ async def read_capped_body(request: Request, limit: int = MAX_LOCKFILE_BYTES):
     return b"".join(chunks), None
 
 
+def _bounded(fn, seconds: float):
+    """Run `fn` with a hard wall-clock ceiling, raising TimeoutError past it.
+
+    The health check must be fast whether or not its dependencies are. The
+    Postgres pool waits 15 seconds for a connection, which is a sensible number
+    for a query and a terrible one for a liveness probe: the check took 19.5s
+    with both stores down, long enough for Render to time it out, pull the
+    instance and answer 502 — the precise outcome the degraded status exists to
+    prevent. The worker thread is abandoned rather than killed, which is fine
+    here: it is a read that will finish or fail on its own.
+    """
+    box: dict = {}
+
+    def run():
+        try:
+            box["value"] = fn()
+        except BaseException as exc:      # noqa: BLE001 — re-raised below
+            box["error"] = exc
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout=seconds)
+    if t.is_alive():
+        raise TimeoutError(f"probe exceeded {seconds:g}s")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def _refused(exc: Exception) -> bool:
+    """Is this "nothing is listening" rather than "it answered badly"?
+
+    Worth distinguishing on the health page: a refused connection is a wrong
+    address or a dead process — someone has to change config — while a timeout
+    is a graph that exists and is busy, which usually clears on its own.
+    """
+    text = str(exc).lower()
+    return any(t in text for t in (
+        "refused", "connectionerror", "failed to establish", "name or service",
+        "nodename nor servname", "no address associated", "getaddrinfo"))
+
+
 def fail(message: str, status: int = 400, code: str = "bad_request", **extra):
     """Every failure carries a machine-readable code as well as prose."""
     return JSONResponse({"ok": False, "error": code, "message": message, **extra},
@@ -235,9 +286,14 @@ async def hydra_down(request: Request, exc: HydraError):
     looking at the console: the database is gone, or it is here but still
     paging the store in and timing out its own 30-second query limit."""
     detail = str(exc)[:400]
-    warming = (_warm["state"] != "warm"
-               or "query_timeout" in detail
-               or "Timeout" in detail)
+    # A refused connection is never "warming". Before this check, a graph that
+    # was not listening at all reported `graph_warming` with "this clears on its
+    # own" — which is exactly wrong, and sends whoever is on call away to wait
+    # instead of to the port mismatch that is actually causing it.
+    warming = (not _refused(exc)
+               and (_warm["state"] != "warm"
+                    or "query_timeout" in detail
+                    or "Timeout" in detail))
     if warming:
         return JSONResponse(
             {"error": "graph_warming",
@@ -248,10 +304,24 @@ async def hydra_down(request: Request, exc: HydraError):
              "detail": detail,
              "hint": "retry in a few seconds; GET /api/health tracks the state"},
             status_code=503)
+    # A graph endpoint with no graph is a clear, typed 503 — never a 500, and
+    # never an empty result, which would read as "nothing depends on this".
+    # Everything OSV-backed (audit, intel, fix, lockfile scanning) needs no
+    # graph at all and keeps working while this is true; the message says so,
+    # because a user who thinks the whole product is down will stop trying.
+    local = HYDRA_URL.startswith(("http://127.0.0.1", "http://localhost"))
     return JSONResponse(
-        {"error": "HydraDB is not answering.",
+        {"ok": False,
+         "error": "graph_unavailable",
+         "message": ("The dependency graph is unavailable, so blast radius and "
+                     "the traversals are answering nothing right now. Lockfile "
+                     "audit, package intel and remediation do not use the graph "
+                     "and are unaffected."),
          "detail": detail,
-         "hint": "docker compose up -d hydradb"},
+         "hydra_url": HYDRA_URL,
+         "hint": ("docker compose up -d hydradb" if local else
+                  "check the hydradb service and that HYDRA_URL matches the "
+                  "port it is listening on; GET /api/health reports both")},
         status_code=503)
 
 
@@ -652,24 +722,40 @@ def api_health():
 
     t0 = time.perf_counter()
     try:
-        hydra.query("MATCH (p:Package {id: $id}) RETURN p.name",
-                    {"id": pkg_id("debug")}, retries=1)
+        hydra_probe.query("MATCH (p:Package {id: $id}) RETURN p.name",
+                          {"id": pkg_id("debug")}, retries=1)
         out["components"]["hydradb"] = {
             "up": True, "latency_ms": round((time.perf_counter() - t0) * 1000, 1)}
     except Exception as e:
-        out["components"]["hydradb"] = {"up": False, "error": str(e)[:200]}
+        out["components"]["hydradb"] = {
+            "up": False, "error": str(e)[:200], "url": HYDRA_URL,
+            # Connection refused means the address is wrong or nothing is
+            # listening there — a different problem from a graph that answers
+            # slowly, and worth separating because only one of them is a config
+            # bug someone has to go and fix.
+            "likely": ("nothing is listening on that address"
+                       if _refused(e) else "reachable but not answering"),
+            "latency_ms": round((time.perf_counter() - t0) * 1000, 1)}
         out["status"] = "degraded"
 
     try:
-        with db() as conn:
-            q = blast.quick_stats(conn)
+        def _stats():
+            with db() as conn:
+                return blast.quick_stats(conn)
+        q = _bounded(_stats, 4.0)
         out["components"]["sidecar"] = {
             "up": True, "packages": q["packages"], "edges": q["edges"],
             "latency_ms": q["latency_ms"], **sidecar.describe()}
         out["components"]["crawl"] = q["crawl"]
     except Exception as e:
-        out["components"]["sidecar"] = {"up": False, "error": str(e)[:200]}
-        out["status"] = "down"
+        # The predicate store is Postgres in production — a *remote* dependency,
+        # exactly like the graph. It was previously treated as a local fault and
+        # set status "down", which became a 503, which made Render pull the
+        # instance out of rotation and answer 502 to the internet. Restarting
+        # this process has never once fixed somebody else's database.
+        out["components"]["sidecar"] = {
+            "up": False, "error": str(e)[:200], **sidecar.describe()}
+        out["status"] = "degraded"
 
     out["components"]["warmup"] = {k: v for k, v in _warm.items() if k != "event"}
     out["components"]["writable"] = dict(_writable)
@@ -678,7 +764,11 @@ def api_health():
 
     t_osv = time.perf_counter()
     try:
-        probe = intel.osv_query("debug", "4.4.2")
+        # Bounded for the same reason as the graph probe. This is cached for
+        # fifteen minutes, so the cost is only paid on a miss — but a miss that
+        # coincides with osv.dev being slow must not be what takes the health
+        # check, and therefore the whole service, down.
+        probe = intel.osv_query("debug", "4.4.2", timeout=4.0)
         out["components"]["osv"] = {
             "up": bool(probe.get("ok")),
             "latency_ms": round((time.perf_counter() - t_osv) * 1000, 1),
@@ -714,7 +804,14 @@ def api_health():
     # because that is the case a restart can actually resolve.
     #
     # `restart_recommended` is the machine-readable version of that judgement.
-    unrecoverable = not (out["components"].get("sidecar") or {}).get("up", False)
+    # A restart is worth recommending only for a fault restarting could clear:
+    # a *local* store this process owns and cannot open. Every remote dependency
+    # — the graph, Postgres, OSV — is reported as degraded and served through,
+    # because bouncing the process changes nothing about any of them and only
+    # takes the working half of the product offline with it.
+    sidecar_state = out["components"].get("sidecar") or {}
+    unrecoverable = (not sidecar_state.get("up", False)
+                     and sidecar_state.get("backend") == "sqlite")
     out["restart_recommended"] = unrecoverable
     out["degraded_reason"] = (
         None if out["status"] == "ok"
@@ -723,6 +820,9 @@ def api_health():
             for name, c in out["components"].items()
             if isinstance(c, dict) and c.get("up") is False) or out["status"])
 
+    # 200 while this process can answer at all. Liveness is "should I be
+    # restarted", not "is every dependency healthy" — and the body says exactly
+    # which parts are working, so nothing is hidden by the status code.
     return JSONResponse(out, status_code=503 if unrecoverable else 200)
 
 

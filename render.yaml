@@ -47,6 +47,22 @@ services:
                               # crawl for a long time at ~130k edges today
 
     envVars:
+      # THE PORT THE REST OF THE BLUEPRINT DIALS.
+      #
+      # Render injects $PORT into every service and, left alone, picks 10000.
+      # The entrypoint faithfully translates that into
+      # GRAPH_HTTP_ADDR=0.0.0.0:10000 — so HydraDB listened on 10000 while the
+      # web and worker services dialled http://hydradb:8443 and got connection
+      # refused. The entrypoint was right, the URL was right, and they were
+      # right about different numbers.
+      #
+      # Setting PORT explicitly is the documented way to tell Render which port
+      # a service listens on, so pinning it here makes all three agree and
+      # keeps 8443 — the port this project has used everywhere since day one —
+      # true in the URL, in the code and on the wire.
+      - key: PORT
+        value: "8443"
+
       # The shared secret. Generate with `openssl rand -hex 32` and paste the
       # SAME value into the web and worker services' HYDRA_TOKEN.
       - key: GRAPH_AUTH_TOKEN
