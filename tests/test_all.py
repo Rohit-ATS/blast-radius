@@ -708,6 +708,13 @@ def page(requests_mod):
     # networkidle never fires — the header polls /api/stats every 4 seconds.
     pg.goto(BASE, wait_until="domcontentloaded")
     pg.wait_for_selector("#peek-hist .skel", state="detached", timeout=40_000)
+    # ...and separately for the header's first successful poll. The histogram
+    # and the header are fed by different endpoints, so the skeleton detaching
+    # says nothing about whether the stats have landed — waiting only on the
+    # first one made every header assertion a race it usually won.
+    pg.wait_for_function(
+        "!document.querySelector('#statline').textContent.includes('connecting')",
+        timeout=40_000)
     yield pg
     browser.close()
     pw.stop()
