@@ -30,7 +30,7 @@ Three consequences worth knowing before you deploy:
   reach it. That is a stronger boundary than the private service had — that one
   was reachable by anything else on the account's private network.
 * **The graph is bounded** to what the instance can hold (`REHYDRATE_MAX_EDGES`,
-  55,000 on a 512MB Starter). The API reports coverage on every response, so a
+  48,000 on a 512MB Starter). The API reports coverage on every response, so a
   partial graph tells the caller it is partial instead of quietly answering with
   a smaller number.
 * **There is no worker,** so `LIVE_INGEST` and `LIVE_FEED` are off. Nothing that
@@ -84,8 +84,8 @@ for these lines in the deploy log —
 [entrypoint] graph ready: http://127.0.0.1:9090/readyz -> 200
 [rehydrate] pin budget of 1000 edges reached at 'debug'; the popular pins past it are left to the main budget
 [rehydrate] +1000 pinned edges so the incident packages the popularity cut drops answer completely
-[rehydrate] 56000 edges touching 15049 packages
-[rehydrate] 15049 vertices, 56000 edges in 9.2s
+[rehydrate] 49000 edges touching 14069 packages
+[rehydrate] 14069 vertices, 49000 edges in 7.0s
 [entrypoint] watching graph-node (pid 10)
 ```
 
@@ -241,19 +241,29 @@ Email is the escalation path, not the only one.
 `render.yaml` ships `plan: starter` — 512MB — and the numbers below are measured
 in the real container at that size, not estimated.
 
-| | resident |
-| --- | --- |
-| graph node, 137,688 edges (the whole crawl) | ~812MB |
-| graph node, 55,000 edges | ~303MB |
-| everything: graph + gunicorn + rebuild peak | ~330MB of 512MB |
+**Measure under load, not at idle.** This is the mistake worth not repeating.
+`REHYDRATE_MAX_EDGES` was originally 55,000, picked from an idle container
+sitting at ~330MB, which looked like comfortable headroom. It was not: under
+concurrent audits and depth-8 traversals the same container ran at 485MB of
+512MB, and the full test suite pushed it over — the cgroup killed graph-node six
+minutes in (`OOMKilled=true`), which is the precise failure the watchdog exists
+to catch.
 
-Which is why `REHYDRATE_MAX_EDGES` is 55,000 here. Three settings work together
+| edges rebuilt | idle | under load | |
+| --- | --- | --- | --- |
+| 40,000 | 221MB | 252MB | 49% |
+| 48,000 | 327MB | 352MB | 69% |
+| 56,000 | 376MB | 485MB | 95% — OOM under the test suite |
+
+The jump lives in the traversal working set rather than the resident graph,
+which is exactly why measuring at idle hides it. `REHYDRATE_MAX_EDGES` is
+therefore **48,000**, leaving ~160MB of headroom. Three settings work together
 to make a 512MB instance viable, and all three are worth raising together on a
 larger plan:
 
 * **`REHYDRATE_MAX_EDGES`** — how much graph to rebuild. 2GB fits the whole
-  137,688-edge set with room to spare, so set it to `0`/unset there and every
-  answer becomes complete.
+  137,688-edge set with room to spare, so unset it there and every answer
+  becomes complete, with no coverage caveat on anything.
 * **`GRAPH_MEM_BUDGET_MB`** — sizes the graph node's caches. Its own defaults
   assume it owns the machine and allocate a 1GB object-store cache; inside a
   512MB container that walked to 508MB and the cgroup killed it.
@@ -265,8 +275,8 @@ larger plan:
 **Edges are loaded most-depended-upon first**, so a bounded graph keeps the
 packages anyone actually asks about during an incident — plus an explicitly
 pinned set of historical compromises that the popularity ranking would
-otherwise drop. That pinning is not a nicety. At 55,000 edges the cutoff lands
-at 28 dependents, and `event-stream` (11), `ua-parser-js` (16), `rc` (12),
+otherwise drop. That pinning is not a nicety. At this budget the cutoff lands
+around 28 dependents, and `event-stream` (11), `ua-parser-js` (16), `rc` (12),
 `coa` (1) and `node-ipc` (1) all fall below it — a list of real npm
 supply-chain attacks, every one of them evicted by ranking on popularity.
 Attackers pick small packages buried in the tree precisely because nobody

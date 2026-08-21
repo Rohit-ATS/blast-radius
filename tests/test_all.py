@@ -848,9 +848,20 @@ def test_ui_ecosystem_rail_shows_every_registry(landing):
     The states are asserted against the vocabulary `live.py` can actually
     produce, so a card that renders a made-up status fails here rather than
     reassuring somebody during an incident.
+
+    Continuous ingestion is off on a 512MiB instance — it and the graph do not
+    fit together, see LIVE_FEED in render.yaml — so the rail has two legitimate
+    shapes and this covers both. What it will not accept is a rail that renders
+    nothing at all: an empty strip reads as "no registries" when the truth is
+    "not asked", which is the same failure as a blank results panel.
     """
-    landing.wait_for_selector(".eco", timeout=40_000)
+    landing.wait_for_selector(".eco, .eco-rail .skel", timeout=40_000)
     cards = landing.eval_on_selector_all(".eco", "e => e.length")
+    if not cards:
+        said = (landing.text_content(".eco-rail") or "").lower()
+        assert "not running" in said or "disabled" in said or "unavailable" in said, said
+        return
+
     assert cards == 5, f"expected five registries, got {cards}"
 
     states = landing.eval_on_selector_all(".eco .eco-state",
