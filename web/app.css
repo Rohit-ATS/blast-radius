@@ -358,3 +358,19 @@
 
 /* The landing page's console card is a preview that hands off to /check. */
 .dashcta { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 18px; }
+
+/* Same rule as the console table: wide content scrolls inside its own frame
+   rather than widening the document. The reference tables on /developers and
+   the security log both have more columns than a phone is wide. */
+.surface > .logtable,
+.surface-hd + .logtable { display: block; overflow-x: auto; }
+.logtable { min-width: 100%; }
+
+@media (max-width: 640px) {
+  .surface { overflow-x: hidden; }
+  #endpoints .logtable { display: block; overflow-x: auto; white-space: nowrap; }
+  .row { flex-wrap: wrap; }
+  .row .acts { margin-left: auto; }
+  .surface-hd .sp { margin-left: 0; width: 100%; flex-wrap: wrap; }
+  .code pre { font-size: 12px; }
+}

@@ -27,6 +27,26 @@
     return body;
   };
 
+  /* The landing page draws three incidents and a dashboard card. At depth 5 a
+     traversal over this graph takes several seconds, and firing four of them at
+     once on first paint pushed the server past its request budget — a 503 on
+     the very first thing a visitor sees.
+
+     So the page reads to depth 3, says so, and links to /check where a human
+     who actually wants the full closure gets depth 5. Every result is also
+     cached per package, so the bars, the curves and the card share one walk
+     instead of racing each other for the same answer. */
+  const PAGE_DEPTH = 3;
+  const inflight = new Map();
+
+  const blastFor = name => {
+    if (!inflight.has(name)) {
+      inflight.set(name, getJSON(
+        `/api/blast?name=${encodeURIComponent(name)}&depth=${PAGE_DEPTH}`));
+    }
+    return inflight.get(name);
+  };
+
   const INCIDENTS = [
     { name: 'debug',        version: '4.4.2',  note: 'qix account takeover · sep 2025',    color: '#d63a2f' },
     { name: 'event-stream', version: '3.3.6',  note: 'flatmap-stream backdoor · nov 2018', color: '#0b0f19' },
@@ -43,7 +63,7 @@
     const rows = [];
     for (const inc of INCIDENTS) {
       try {
-        const r = await getJSON(`/api/blast?name=${encodeURIComponent(inc.name)}&depth=5`);
+        const r = await blastFor(inc.name);
         rows.push({ ...inc, total: r.total, ms: r.latency_ms, hist: r.histogram || [], known: true });
       } catch (e) {
         rows.push({ ...inc, known: false, why: (e.body && e.body.message) || e.message });
@@ -110,7 +130,7 @@
 
     let blast;
     try {
-      blast = await getJSON(`/api/blast?name=${encodeURIComponent(inc.name)}&depth=5`);
+      blast = await blastFor(inc.name);
     } catch (e) {
       const why = (e.body && e.body.message) || e.message;
       if (rows) rows.innerHTML = `<tr><td class="empty" colspan="5">${esc(why)}</td></tr>`;
@@ -421,6 +441,9 @@
   wireIncidents();
   band();
   publishes();
-  dashboard(INCIDENTS[0]);
-  incidentBars().then(curves);
+  // Sequential on purpose: the bars warm the cache the card then reads from.
+  incidentBars().then(rows => {
+    curves(rows);
+    return dashboard(INCIDENTS[0]);
+  });
 })();
