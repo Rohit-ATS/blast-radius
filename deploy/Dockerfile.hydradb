@@ -1,0 +1,25 @@
+# HydraDB, wrapped for Render.
+#
+# The upstream image is correct and multi-arch; it just cannot be deployed to a
+# platform that assigns the port and mounts the disk root-owned. This adds an
+# entrypoint that translates $PORT into GRAPH_HTTP_ADDR, writes the auth token
+# from an environment variable into the file HydraDB expects, and hands the
+# disk to the uid the image actually runs as. See the script for the evidence
+# behind each of those.
+#
+# Nothing else is changed. The binary, the version and the behaviour are
+# upstream's.
+
+FROM ghcr.io/hydra-db/hydradb:latest
+
+# The entrypoint has to seed a root-owned disk before dropping privileges, so
+# it starts as root and drops to uid 10001 itself.
+USER root
+
+COPY deploy/hydradb-entrypoint.sh /usr/local/bin/hydradb-entrypoint.sh
+RUN chmod +x /usr/local/bin/hydradb-entrypoint.sh
+
+# A cold node exceeds its own query timeout on deep traversals without this.
+ENV RUST_MIN_STACK=33554432
+
+ENTRYPOINT ["/usr/local/bin/hydradb-entrypoint.sh"]

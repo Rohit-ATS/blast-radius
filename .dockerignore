@@ -1,0 +1,31 @@
+# Build context hygiene. Render bills build minutes, and every byte here is
+# uploaded before the first layer is even considered.
+
+# secrets — belt and braces; these are gitignored too, but a build context is
+# built from the working tree, not from git
+.env
+.env.*
+!.env.example
+
+# data. deps.db alone is 125MB and is rebuilt by the crawler, not shipped.
+*.db
+*.db-wal
+*.db-shm
+.hydradb/
+.crawl_state.json
+.changes_state.json
+
+# development only
+tests/
+docs/
+.github/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+scratch_out*/
+*.log
+
+# the repo's own history is not needed to run it
+.git/
+.gitignore

@@ -1,0 +1,209 @@
+# Blast Radius on Render — three services on the private network.
+#
+#   blast-radius-web      public HTTPS, autodeploys from main
+#   hydradb               private service, 10GB disk, NO public URL
+#   blast-radius-worker   background worker: crawl, changes tail, monitor sweeps
+#
+# Only the web service is reachable from the internet. HydraDB has no public
+# URL at all — that is what a Render private service *is*, and it is why the
+# graph is addressed as http://hydradb:8443 from inside and nowhere from
+# outside. Nothing here published a port to achieve that; the absence of a
+# public URL is the mechanism.
+#
+# Two things about HydraDB on Render needed solving before this file could work,
+# both handled in deploy/hydradb-entrypoint.sh:
+#
+#   * HydraDB does not read $PORT. It reads GRAPH_HTTP_ADDR. Verified against
+#     ghcr.io/hydra-db/hydradb:latest — starting it with
+#     GRAPH_HTTP_ADDR=0.0.0.0:9999 logs
+#     `"graph node listeners started","http_addr":"0.0.0.0:9999"`.
+#   * A freshly attached disk is root-owned and the image runs as uid 10001,
+#     so the stock image dies with PermissionDenied on first boot.
+#
+# Secrets are `sync: false`, which means Render prompts for them at deploy time
+# and stores them encrypted. They are never in this file and never in the repo.
+#
+# Apply:  render.com -> Blueprints -> New Blueprint Instance -> point at this repo
+
+previewsEnabled: false
+
+services:
+  # ======================================================================
+  # 1 · the graph — private, disk-backed, no public URL
+  # ======================================================================
+  - type: pserv
+    name: hydradb
+    runtime: docker
+    plan: standard            # measured, not guessed — see PHASE 3 in DEPLOY.md
+    region: oregon
+    dockerfilePath: ./deploy/Dockerfile.hydradb
+    dockerContext: .
+    autoDeploy: false         # the graph should not restart because the app changed
+
+    disk:
+      name: hydradb-data
+      mountPath: /data
+      sizeGB: 10              # cannot be resized down later; 10GB fits the
+                              # crawl for a long time at ~130k edges today
+
+    envVars:
+      # The shared secret. Generate with `openssl rand -hex 32` and paste the
+      # SAME value into the web and worker services' HYDRA_TOKEN.
+      - key: GRAPH_AUTH_TOKEN
+        sync: false
+
+      # Written into the disk by the entrypoint on every boot, so rotating the
+      # env var above actually rotates the token.
+      - key: GRAPH_AUTH_TOKEN_FILE
+        value: /data/auth-token
+
+      - key: CLOUD_PROVIDER
+        value: local
+      - key: LOCAL_PATH
+        value: /data/store
+      - key: GRAPH_DATA_CACHE_DIR
+        value: /data/cache
+
+      - key: GRAPH_NAMESPACE
+        value: default
+      - key: GRAPH_ID
+        value: default
+      - key: GRAPH_CELL_ID
+        value: cell-0
+      - key: GRAPH_CELLS
+        value: cell-0
+      - key: GRAPH_NODE_ID
+        value: node-0
+      - key: GRAPH_BOLT_NODE_ADDRESSES
+        value: node-0=0.0.0.0:7687
+      - key: GRAPH_ADVERTISED_BOLT_ADDR
+        value: 127.0.0.1:7687
+
+      # No TLS between services on Render's private network, which is already
+      # isolated. Without this the node refuses to start.
+      - key: GRAPH_ALLOW_PLAINTEXT
+        value: "true"
+
+      # A cold node exceeds its own 30s query timeout on deep traversals
+      # without a larger stack. Found the hard way.
+      - key: RUST_MIN_STACK
+        value: "33554432"
+
+      - key: GRAPH_LOG_FORMAT
+        value: json
+
+  # ======================================================================
+  # 2 · the app — the only service with a public URL
+  # ======================================================================
+  - type: web
+    name: blast-radius-web
+    runtime: docker
+    plan: standard            # revisit after measuring; see DEPLOY.md
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: /usr/local/bin/app-entrypoint.sh web
+    autoDeploy: true
+    branch: main
+
+    # Render restarts the service when this stops answering. /api/health
+    # reports each component separately and returns 503 when the graph is
+    # genuinely gone, so a restart is the right response to a red one.
+    healthCheckPath: /api/health
+
+    envVars:
+      # Reachable only inside Render's private network. There is no public
+      # route to this host.
+      - key: HYDRA_URL
+        value: http://hydradb:8443
+      - key: HYDRA_TOKEN
+        sync: false           # must equal hydradb's GRAPH_AUTH_TOKEN
+
+      - key: PUBLIC_URL
+        sync: false           # e.g. https://blastradius.dev — used in emails,
+                              # webhook payloads and the docs examples
+      - key: SECURE_COOKIES
+        value: "1"            # Render terminates TLS; the cookie must say Secure
+
+      # Accounts. Leave blank to use the local password store.
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+
+      # Alert email. Not SMTP from the instance IP — a fresh cloud IP has no
+      # sending reputation and lands in spam. See DEPLOY.md.
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+
+      # The web process serves; the worker crawls. Both would fight over the
+      # same checkpoint file.
+      - key: LIVE_INGEST
+        value: "0"
+      - key: WEB_CONCURRENCY
+        value: "2"
+      - key: LOG_FORMAT
+        value: json
+
+  # ======================================================================
+  # 3 · the worker — crawl, changes tail, monitor sweeps. Never sleeps.
+  # ======================================================================
+  - type: worker
+    name: blast-radius-worker
+    runtime: docker
+    plan: standard
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: /usr/local/bin/app-entrypoint.sh worker
+    autoDeploy: true
+    branch: main
+
+    envVars:
+      - key: HYDRA_URL
+        value: http://hydradb:8443
+      - key: HYDRA_TOKEN
+        sync: false           # same value again
+
+      - key: WORKER_CRAWL
+        value: "1"
+      - key: WORKER_CHANGES
+        value: "1"
+      - key: WORKER_MONITORS
+        value: "1"
+
+      # Where the changes cursor and the crawl checkpoint live. On a worker
+      # without its own disk this is ephemeral, and the cursor is re-anchored
+      # to `now` after a redeploy — see the note in DEPLOY.md about attaching a
+      # small disk here if gapless replay matters to you.
+      - key: WORKER_STATE_DIR
+        value: /app/state
+
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+      - key: PUBLIC_URL
+        sync: false
+      - key: LOG_FORMAT
+        value: json
