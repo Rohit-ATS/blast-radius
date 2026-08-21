@@ -25,9 +25,12 @@ accounts.db
 accounts.db-shm
 accounts.db-wal
 
-# secrets — copy .env.example to .env and fill it in
+# secrets — copy .env.example to .env and fill it in.
+# Deliberately a glob: .env.production was not covered by the explicit list,
+# which is the failure mode this pattern exists to prevent.
 .env
-.env.local
+.env.*
+!.env.example
 
 # SQLite side files, for every database this project grows. Listing each one by
 # name has already failed once: the -shm and -wal here were git added first and
