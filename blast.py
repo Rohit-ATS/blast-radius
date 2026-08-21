@@ -120,18 +120,32 @@ def blast_radius(h: Hydra, name: str, depth: int = 5, limit: int = 5000,
         victims = names_job.result()
     ms_total = (time.perf_counter() - t0) * 1000.0
 
+    # These d+1 queries run concurrently against a graph that continuous
+    # ingestion is writing to, so they do not all observe the same instant: a
+    # dependent added between two of them makes the count and the list disagree
+    # by one. When nothing was truncated the enumerated list *is* the answer, so
+    # it becomes the ground truth and the cumulative counts are clamped to it.
+    # That keeps the histogram summing to the headline instead of shipping a
+    # visible off-by-one that reads as a bug. Only a truncated page has to trust
+    # the count instead, and it says so.
+    truncated = len(victims) >= limit
+    total = cumulative[-1] if cumulative else 0
+    if not truncated:
+        total = len(victims)
+        cumulative = [min(c, total) for c in cumulative]
+
     # Differencing the cumulative reach gives packages *first* reached at k.
     histogram = []
     prev = 0
-    for k, total in enumerate(cumulative, start=1):
-        histogram.append({"depth": k, "packages": max(total - prev, 0)})
-        prev = total
+    for k, reached in enumerate(cumulative, start=1):
+        histogram.append({"depth": k, "packages": max(reached - prev, 0)})
+        prev = reached
 
     return {
-        "total": cumulative[-1] if cumulative else 0,
+        "total": total,
         "histogram": histogram,
         "victims": victims,
-        "truncated": len(victims) >= limit,
+        "truncated": truncated,
         "depth": d,
         "queries": d + 1,
     }, ms_total

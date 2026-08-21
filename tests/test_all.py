@@ -820,6 +820,96 @@ def test_ui_typosquat_panel(page):
     assert (page.text_content("#typos") or "").strip()
 
 
+def test_ui_ecosystem_rail_shows_every_registry(page):
+    """One card per registry, each carrying the state the daemon recorded.
+
+    The states are asserted against the vocabulary `live.py` can actually
+    produce, so a card that renders a made-up status fails here rather than
+    reassuring somebody during an incident.
+    """
+    page.wait_for_selector(".eco", timeout=40_000)
+    cards = page.eval_on_selector_all(".eco", "e => e.length")
+    assert cards == 5, f"expected five registries, got {cards}"
+
+    states = page.eval_on_selector_all(".eco .eco-state",
+                                       "e => e.map(x => x.textContent.trim())")
+    allowed = {"live", "starting", "degraded", "backoff", "stopped"}
+    assert set(states) <= allowed, states
+
+    # every card carries a real count, not a dash
+    counts = page.eval_on_selector_all(".eco .eco-n",
+                                       "e => e.map(x => x.textContent.trim())")
+    assert all(c and c != "—" for c in counts), counts
+
+
+def test_ui_ingest_ticker_carries_real_publishes(page):
+    """The ticker must show packages the daemon actually wrote, with the
+    ecosystem it came from — or say plainly that nothing has landed."""
+    page.wait_for_selector("#ingestticker .tick, #ingestticker .empty",
+                           timeout=40_000)
+    ticks = page.eval_on_selector_all("#ingestticker .tick", "e => e.length")
+    if not ticks:
+        assert "no publish" in page.text_content("#ingestticker").lower()
+        return
+    badges = page.eval_on_selector_all(
+        "#ingestticker .tick .badge", "e => e.map(x => x.textContent.trim())")
+    assert set(badges) <= {"npm", "PyPI", "crates.io", "Go", "Maven"}, badges
+    stat = page.text_content("#ingeststat")
+    assert "graph writes" in stat, stat
+
+
+def test_ui_monitor_registers_and_streams(page, tmp_path):
+    """The whole integration path, driven the way a user drives it: drop a
+    lockfile, get credentials back, hold an SSE stream open, then stop."""
+    lock = tmp_path / "package-lock.json"
+    lock.write_text(json.dumps({
+        "name": "ui-test", "lockfileVersion": 3,
+        "packages": {"": {"name": "ui-test"},
+                     "node_modules/express": {"name": "express", "version": "4.18.2"},
+                     "node_modules/ms": {"name": "ms", "version": "2.1.3"}}}))
+
+    page.set_input_files("#monfile", str(lock))
+    # 'registering…' is an intermediate state, so waiting for "not the initial
+    # text" passes before anything has actually happened.
+    page.wait_for_function(
+        "document.querySelector('#mon-stat').textContent.includes('watching')",
+        timeout=90_000)
+
+    stat = page.text_content("#mon-stat")
+    assert "watching" in stat and "npm" in stat and "exact" in stat, stat
+
+    # credentials come back and the token is not echoed into the URL bar
+    creds = page.eval_on_selector_all(".cred-row code", "e => e.map(x => x.textContent)")
+    assert len(creds) >= 2 and len(creds[1]) > 20, creds
+    assert creds[1] not in page.url
+
+    page.wait_for_function(
+        "document.querySelector('#mon-alertstat').textContent.includes('streaming')",
+        timeout=60_000)
+
+    page.click("#monstop")
+    page.wait_for_function(
+        "document.querySelector('#mon-stat').textContent.includes('no project')",
+        timeout=60_000)
+    assert page.eval_on_selector("#moncred", "e => e.hidden") is True
+
+
+def test_ui_monitor_refuses_a_file_that_is_not_a_manifest(page, tmp_path):
+    """A readable failure beats a registered project watching nothing."""
+    junk = tmp_path / "notes.txt"
+    junk.write_text("this is not a lockfile, it is a shopping list")
+    page.set_input_files("#monfile", str(junk))
+    page.wait_for_function(
+        "document.querySelector('#mon-stat').textContent.includes('could not')",
+        timeout=60_000)
+    # ...and the reason is shown rather than a blank panel
+    assert page.text_content("#monalerts").strip()
+    # This test deliberately provokes a 400, which the browser logs as a failed
+    # resource. Leaving it in the shared error list would make the console-error
+    # test fail on an error the suite asked for on purpose.
+    page.errors[:] = [e for e in page.errors if "400" not in e]
+
+
 def test_ui_no_console_errors(page):
     """Runs last: by now the page has loaded, queried, dragged and scanned."""
     assert page.errors == [], page.errors
