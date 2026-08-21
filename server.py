@@ -983,6 +983,48 @@ def api_health():
     return JSONResponse(out, status_code=200)
 
 
+def coverage_check(name: str, result: dict) -> dict | None:
+    """Does the graph actually hold this package's dependents?
+
+    The sidecar records every dependency edge the crawler ever wrote; the graph
+    may hold fewer, because a small instance rebuilds a bounded subgraph (see
+    rehydrate.py). When it holds fewer *for this package*, a traversal returns a
+    number that is real but incomplete — and at the extreme it returns zero,
+    which renders as "0 packages exposed": a clean bill of health for a package
+    we simply have no topology for.
+
+    That is the one output this tool must never produce, so the two counts are
+    compared on every traversal. The sidecar side is a single indexed count on
+    deps(dst), which is why this is affordable per request.
+    """
+    try:
+        with db() as conn:
+            row = conn.execute(
+                "SELECT count(*) FROM deps WHERE dst = ? AND kind = 'prod'",
+                (name,)).fetchone()
+    except Exception:
+        return None                       # never fail a good answer over this
+    expected = int(row[0]) if row else 0
+    if not expected:
+        return None                       # nothing depends on it anywhere
+
+    hist = {h["depth"]: h["packages"] for h in (result.get("histogram") or [])}
+    direct = int(hist.get(1, 0))
+    if direct >= expected:
+        return None                       # the graph has them all
+
+    return {
+        "complete": False,
+        "direct_dependents_in_graph": direct,
+        "direct_dependents_known": expected,
+        "message": (
+            f"the graph holds {direct} of the {expected} packages that depend on "
+            f"'{name}' directly, so the number below is a floor, not the answer. "
+            f"This instance rebuilds a bounded subgraph to fit its memory; the "
+            f"packages with the most dependents are loaded first."),
+    }
+
+
 @app.get("/api/blast")
 def api_blast(name: str = Query(..., min_length=1, max_length=214,
                                 pattern=PACKAGE_NAME_PATTERN),
@@ -1008,19 +1050,27 @@ def api_blast(name: str = Query(..., min_length=1, max_length=214,
     cached, was_hit = _cache.get(key, apimeta.TTL_GRAPH)
     if was_hit:
         result, ms = cached
-        return {**result, "name": name, "vertex_id": pkg_id(name),
-                "latency_ms": round(ms, 1), "lookup_ms": round(ms_lookup, 1),
-                "cached": True, "coalesced": False}
+        out = {**result, "name": name, "vertex_id": pkg_id(name),
+               "latency_ms": round(ms, 1), "lookup_ms": round(ms_lookup, 1),
+               "cached": True, "coalesced": False}
+        gap = coverage_check(name, result)
+        if gap:
+            out["coverage"] = gap
+        return out
 
     (result, ms), shared = _flight.run(
         key, lambda: blast.blast_radius(hydra, name, depth, limit))
     _cache.put(key, (result, ms))
-    return {**result, "name": name, "vertex_id": pkg_id(name),
-            "latency_ms": round(ms, 1), "lookup_ms": round(ms_lookup, 1),
-            # A follower waited for somebody else's traversal, so its latency
-            # is that traversal's, not its own work. Saying so keeps the number
-            # honest instead of implying this request was mysteriously fast.
-            "coalesced": shared}
+    out = {**result, "name": name, "vertex_id": pkg_id(name),
+           "latency_ms": round(ms, 1), "lookup_ms": round(ms_lookup, 1),
+           # A follower waited for somebody else's traversal, so its latency
+           # is that traversal's, not its own work. Saying so keeps the number
+           # honest instead of implying this request was mysteriously fast.
+           "coalesced": shared}
+    gap = coverage_check(name, result)
+    if gap:
+        out["coverage"] = gap
+    return out
 
 
 @app.get("/api/resolve")

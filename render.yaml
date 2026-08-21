@@ -1,24 +1,31 @@
-# Blast Radius on Render — three services on the private network.
+# Blast Radius on Render — one service.
 #
 #   blast-radius-web      public HTTPS, autodeploys from main
-#   hydradb               private service, 10GB disk, NO public URL
-#   blast-radius-worker   background worker: crawl, changes tail, monitor sweeps
 #
-# Only the web service is reachable from the internet. HydraDB has no public
-# URL at all — that is what a Render private service *is*, and it is why the
-# graph is addressed as http://hydradb:8443 from inside and nowhere from
-# outside. Nothing here published a port to achieve that; the absence of a
-# public URL is the mechanism.
+# It used to be three: the app, HydraDB as a private service with a 10GB disk,
+# and a background worker. That layout was correct and it was also most of the
+# hosting bill, because a private service and a disk are both paid tiers. When
+# the credit ran out the graph service went away, and with it every traversal
+# on the site — the console's blast radius, chains and paths panels all showing
+# "the dependency graph is unavailable" while the OSV-backed half kept working.
 #
-# Two things about HydraDB on Render needed solving before this file could work,
-# both handled in deploy/hydradb-entrypoint.sh:
+# So the graph runs inside the web container now. That is sound rather than a
+# shortcut, for one specific reason: the graph is *derived* data. Postgres holds
+# every edge the crawler has ever written, so the graph node can live on an
+# ephemeral filesystem and be rebuilt from the sidecar at boot — seconds, and no
+# traffic to npm. See rehydrate.py and deploy/app-entrypoint.sh. What would be
+# reckless for a system of record is routine for a cache.
 #
-#   * HydraDB does not read $PORT. It reads GRAPH_HTTP_ADDR. Verified against
-#     ghcr.io/hydra-db/hydradb:latest — starting it with
-#     GRAPH_HTTP_ADDR=0.0.0.0:9999 logs
-#     `"graph node listeners started","http_addr":"0.0.0.0:9999"`.
-#   * A freshly attached disk is root-owned and the image runs as uid 10001,
-#     so the stock image dies with PermissionDenied on first boot.
+# Consequences worth knowing before editing this file:
+#
+#   * The graph binds 127.0.0.1 inside the container. Nothing outside can reach
+#     it, which is a stronger boundary than the private service had — that one
+#     was reachable by anything else on the account's network.
+#   * The graph is bounded to what the instance can hold (REHYDRATE_MAX_EDGES).
+#     The API reports coverage per response, so a partial graph is visible to
+#     the caller rather than quietly answering with a smaller number.
+#   * There is no worker. The crawl's discovery half is off here; see
+#     LIVE_INGEST below for what that does and does not cost.
 #
 # Secrets are `sync: false`, which means Render prompts for them at deploy time
 # and stores them encrypted. They are never in this file and never in the repo.
@@ -28,86 +35,6 @@
 previewsEnabled: false
 
 services:
-  # ======================================================================
-  # 1 · the graph — private, disk-backed, no public URL
-  # ======================================================================
-  - type: pserv
-    name: hydradb
-    runtime: docker
-    plan: standard            # measured, not guessed — see PHASE 3 in DEPLOY.md
-    region: oregon
-    dockerfilePath: ./deploy/Dockerfile.hydradb
-    dockerContext: .
-    autoDeploy: false         # the graph should not restart because the app changed
-
-    disk:
-      name: hydradb-data
-      mountPath: /data
-      sizeGB: 10              # cannot be resized down later; 10GB fits the
-                              # crawl for a long time at ~130k edges today
-
-    envVars:
-      # Deliberately NOT set.
-      #
-      # An earlier revision pinned PORT=8443 to keep the number this project
-      # has used since day one. Render assigns $PORT itself and the override
-      # did not take: the service came up on 10000, while every peer was still
-      # dialling 8443 and getting nothing. Two numbers, both looking correct in
-      # isolation, in different files.
-      #
-      # So the blueprint no longer states a port at all. The entrypoint reads
-      # whatever Render assigns and maps it onto GRAPH_HTTP_ADDR, and it logs
-      # the address peers must dial so the two halves can be compared in one
-      # place. The peers below carry the real value.
-
-      # The shared secret. Generate with `openssl rand -hex 32` and paste the
-      # SAME value into the web and worker services' HYDRA_TOKEN.
-      - key: GRAPH_AUTH_TOKEN
-        sync: false
-
-      # Written into the disk by the entrypoint on every boot, so rotating the
-      # env var above actually rotates the token.
-      - key: GRAPH_AUTH_TOKEN_FILE
-        value: /data/auth-token
-
-      - key: CLOUD_PROVIDER
-        value: local
-      - key: LOCAL_PATH
-        value: /data/store
-      - key: GRAPH_DATA_CACHE_DIR
-        value: /data/cache
-
-      - key: GRAPH_NAMESPACE
-        value: default
-      - key: GRAPH_ID
-        value: default
-      - key: GRAPH_CELL_ID
-        value: cell-0
-      - key: GRAPH_CELLS
-        value: cell-0
-      - key: GRAPH_NODE_ID
-        value: node-0
-      - key: GRAPH_BOLT_NODE_ADDRESSES
-        value: node-0=0.0.0.0:7687
-      - key: GRAPH_ADVERTISED_BOLT_ADDR
-        value: 127.0.0.1:7687
-
-      # No TLS between services on Render's private network, which is already
-      # isolated. Without this the node refuses to start.
-      - key: GRAPH_ALLOW_PLAINTEXT
-        value: "true"
-
-      # A cold node exceeds its own 30s query timeout on deep traversals
-      # without a larger stack. Found the hard way.
-      - key: RUST_MIN_STACK
-        value: "33554432"
-
-      - key: GRAPH_LOG_FORMAT
-        value: json
-
-  # ======================================================================
-  # 2 · the app — the only service with a public URL
-  # ======================================================================
   - type: web
     name: blast-radius-web
     runtime: docker
@@ -119,28 +46,33 @@ services:
     autoDeploy: true
     branch: main
 
-    # Render restarts the service when this stops answering. /api/health
-    # reports each component separately and returns 503 when the graph is
-    # genuinely gone, so a restart is the right response to a red one.
+    # Render restarts the service when this stops answering.
+    #
+    # /api/health answers 200 whenever the process can compose a response, and
+    # says what is wrong in the body rather than in the status code. That is
+    # deliberate and it is not an oversight to "fix": a health check wired to
+    # dependency health means every OSV or Postgres hiccup restarts the app,
+    # which repairs none of them and takes the working half of the product down
+    # with it. It has already cost this deployment one outage.
+    #
+    # The one failure a restart *does* fix — graph-node dying inside this
+    # container — is handled where it can be observed directly, by the watchdog
+    # in deploy/app-entrypoint.sh, not by inference from a status code.
     healthCheckPath: /api/health
 
     envVars:
-      # Reachable only inside Render's private network. There is no public
-      # route to this host.
-      # The graph listens on two ports and they are not interchangeable:
-      # queries on $PORT (Render assigned 10000), readiness on 9090. A probe
-      # aimed at the wrong one returns 404 against a perfectly healthy database.
+      # The graph is a process in this container, reachable on loopback and
+      # nowhere else, so HYDRA_URL and HYDRA_ADMIN_URL are baked into the image
+      # rather than set here — see the Dockerfile. They were a pair of
+      # hand-maintained hostnames carrying Render's own service suffix, and
+      # they were the single most breakage-prone thing in this file: recreate
+      # the service, the suffix changes, and every traversal fails against a
+      # database that is perfectly healthy.
       #
-      # The hostname carries Render's own suffix. If the service is ever
-      # recreated the suffix changes, so this is the one pair of values to
-      # re-check after any blueprint rebuild — the entrypoint logs the address
-      # it is actually serving on to make that a one-line comparison.
-      - key: HYDRA_URL
-        value: http://hydradb-l2lg:10000
-      - key: HYDRA_ADMIN_URL
-        value: http://hydradb-l2lg:9090
+      # Still required: the token. The graph authenticates against a file, and
+      # the entrypoint writes this into it at boot.
       - key: HYDRA_TOKEN
-        sync: false           # must equal hydradb's GRAPH_AUTH_TOKEN
+        sync: false           # any 32-byte secret: openssl rand -hex 32
 
       - key: PUBLIC_URL
         sync: false           # e.g. https://blastradius.dev — used in emails,
@@ -181,8 +113,48 @@ services:
 
       # The web process serves; the worker crawls. Both would fight over the
       # same checkpoint file.
+      # Off on a 512MiB instance, and this is a measured limit rather than a
+      # cautious guess. With the crawler running in-process the web process
+      # reached 496MiB on its own — it holds the visited set and the frontier
+      # queue in memory — and the kernel took graph-node instead, leaving a
+      # site that crawls diligently and cannot answer a single traversal.
+      #
+      # Nothing is lost by having it off here. The sidecar already holds the
+      # crawl (39,387 packages, 137,688 prod edges) and the graph is rebuilt
+      # from it at boot, so every answer is real crawled data. What stops is
+      # discovery of packages not yet seen.
+      #
+      # Set to "1" on a 2GB plan, where both fit, or run `docker run ... worker`
+      # elsewhere against the same DATABASE_URL to extend the crawl.
       - key: LIVE_INGEST
         value: "0"
+
+      # Same reason, same measurement. The npm _changes tail held the web
+      # process at 378MiB, which again left no room for the graph. The live
+      # ticker is the most decorative thing on the site and the traversals are
+      # the point of it, so the ticker is what goes.
+      - key: LIVE_FEED
+        value: "0"
+
+      # How much of the graph to rebuild at boot, in edges.
+      #
+      # graph-node's resident size tracks the graph. Measured in the real
+      # container: the full 137,688-edge set settles at ~812MiB, and 55,000
+      # edges at ~303MiB, which leaves comfortable room for the app inside a
+      # 512MiB Starter instance. Raise this on a larger plan — 2GB fits the
+      # whole graph with room to spare.
+      #
+      # Edges load most-depended-upon first, so what a bounded graph keeps is
+      # the packages anyone actually asks about during an incident. Any package
+      # whose dependents were not all loaded is reported as incomplete on the
+      # response rather than answered with a smaller number.
+      - key: REHYDRATE_MAX_EDGES
+        value: "55000"
+
+      # Sizes the graph node's caches to the instance. See app-entrypoint.sh:
+      # its defaults assume it owns the machine and allocate a 1GiB cache.
+      - key: GRAPH_MEM_BUDGET_MB
+        value: "512"
       # One worker. Two gunicorn workers are two full copies of the app —
       # interpreter, fixtures, Supabase client, connection pool — and on a
       # 512Mi Starter instance that was an OOM kill loop rather than a
@@ -191,78 +163,5 @@ services:
       # buys concurrency this workload was not short of.
       - key: WEB_CONCURRENCY
         value: "1"
-      - key: LOG_FORMAT
-        value: json
-
-  # ======================================================================
-  # 3 · the worker — crawl, changes tail, monitor sweeps. Never sleeps.
-  # ======================================================================
-  - type: worker
-    name: blast-radius-worker
-    runtime: docker
-    plan: starter
-    region: oregon
-    dockerfilePath: ./Dockerfile
-    dockerContext: .
-    dockerCommand: /usr/local/bin/app-entrypoint.sh worker
-    autoDeploy: true
-    branch: main
-
-    envVars:
-      # The graph listens on two ports and they are not interchangeable:
-      # queries on $PORT (Render assigned 10000), readiness on 9090. A probe
-      # aimed at the wrong one returns 404 against a perfectly healthy database.
-      #
-      # The hostname carries Render's own suffix. If the service is ever
-      # recreated the suffix changes, so this is the one pair of values to
-      # re-check after any blueprint rebuild — the entrypoint logs the address
-      # it is actually serving on to make that a one-line comparison.
-      - key: HYDRA_URL
-        value: http://hydradb-l2lg:10000
-      - key: HYDRA_ADMIN_URL
-        value: http://hydradb-l2lg:9090
-      - key: HYDRA_TOKEN
-        sync: false           # same value again
-
-      - key: WORKER_CRAWL
-        value: "1"
-      - key: WORKER_CHANGES
-        value: "1"
-      - key: WORKER_MONITORS
-        value: "1"
-
-      # Where the changes cursor and the crawl checkpoint live. On a worker
-      # without its own disk this is ephemeral, and the cursor is re-anchored
-      # to `now` after a redeploy — see the note in DEPLOY.md about attaching a
-      # small disk here if gapless replay matters to you.
-      - key: WORKER_STATE_DIR
-        value: /app/state
-
-      # The predicate store: semver ranges and maintainers, in Supabase
-      # Postgres. Without it the process falls back to a local SQLite file no
-      # crawler has ever written to, every dependent lookup runs against an
-      # empty database, and health reports the store down. Use the POOLER
-      # endpoint (aws-0-<region>.pooler.supabase.com:6543) — the direct
-      # db.<ref>.supabase.co endpoint holds a real backend per connection and
-      # resolves on fewer networks. Keep its region matched to this blueprint's.
-      - key: DATABASE_URL
-        sync: false
-
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_ANON_KEY
-        sync: false
-      - key: SMTP_HOST
-        sync: false
-      - key: SMTP_PORT
-        value: "587"
-      - key: SMTP_USER
-        sync: false
-      - key: SMTP_PASSWORD
-        sync: false
-      - key: SMTP_FROM
-        sync: false
-      - key: PUBLIC_URL
-        sync: false
       - key: LOG_FORMAT
         value: json
