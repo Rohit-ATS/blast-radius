@@ -1,0 +1,129 @@
+/* The constraints page. Its own file so it cannot collide with style.css,
+   and so this page can be deleted in one move if it ever stops being true. */
+
+.eyebrow-lg {
+  font-family: var(--mono); font-size: 11.5px; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--ink-3); margin-bottom: 14px;
+}
+.h-hero {
+  font-family: var(--display); font-size: clamp(38px, 6.2vw, 74px);
+  font-weight: 800; letter-spacing: -.045em; line-height: 1.02; margin-bottom: 22px;
+}
+.lede-wide { max-width: 68ch; margin-bottom: 14px; }
+
+/* ------------------------------------------------------------- the banner */
+
+.cbanner { margin-top: 34px; }
+.cb-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+@media (max-width: 860px) { .cb-grid { grid-template-columns: repeat(2, 1fr); } }
+.cb {
+  border: 1px solid var(--line); border-radius: 14px; background: var(--card);
+  padding: 16px 16px 14px;
+}
+.cb b { display: block; font-family: var(--mono); font-size: 30px; font-weight: 600; line-height: 1; }
+.cb span { display: block; margin-top: 7px; font-size: 12px; color: var(--ink-3); }
+.cb.ok  { border-color: var(--green-line); background: var(--green-bg); }
+.cb.ok b { color: var(--green); }
+.cb.bad { border-color: var(--red-line); background: var(--red-bg); }
+.cb.bad b { color: var(--red); }
+
+.cb-surprise {
+  margin-top: 14px; border: 1px solid var(--red-line); background: var(--red-bg);
+  border-radius: 14px; padding: 15px 17px; font-size: 13px;
+}
+.csrow { margin-top: 9px; font-family: var(--mono); font-size: 12px; }
+.cdet { display: block; color: var(--ink-2); margin-top: 3px; }
+
+/* -------------------------------------------------------------- the traps */
+
+.trap {
+  border: 1px solid var(--line); border-radius: 18px; background: var(--card);
+  padding: 20px 22px; margin-bottom: 16px;
+}
+.trap.na { opacity: .72; }
+.trap-head { display: flex; align-items: center; gap: 11px; margin-bottom: 9px; flex-wrap: wrap; }
+.trap-head b { font-family: var(--display); font-size: 18.5px; letter-spacing: -.02em; }
+.tbadge {
+  font-family: var(--mono); font-size: 10px; letter-spacing: .07em;
+  text-transform: uppercase; border-radius: 6px; padding: 3px 9px;
+  border: 1px solid var(--line); flex: none;
+}
+.tbadge.yes { background: var(--red-bg);   border-color: var(--red-line);   color: var(--red); }
+.tbadge.no  { background: var(--green-bg); border-color: var(--green-line); color: var(--green); }
+.tbadge.na  { background: var(--wash);     color: var(--ink-3); }
+.trap-cost { font-size: 13.5px; color: var(--ink-2); margin-bottom: 15px; max-width: 78ch; }
+
+.trap-split { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+@media (max-width: 900px) { .trap-split { grid-template-columns: 1fr; } }
+.tside { border: 1px solid var(--line-2); border-radius: 13px; padding: 13px 14px; }
+.tside.bad  { background: var(--red-bg);   border-color: var(--red-line); }
+.tside.good { background: var(--green-bg); border-color: var(--green-line); }
+.tside-t {
+  font-family: var(--mono); font-size: 10.5px; letter-spacing: .07em;
+  text-transform: uppercase; color: var(--ink-3); margin-bottom: 9px;
+}
+.tq {
+  font-family: var(--mono); font-size: 12px; line-height: 1.55; margin: 0 0 9px;
+  white-space: pre-wrap; word-break: break-word; color: var(--ink);
+}
+.tres { font-family: var(--mono); font-size: 12px; font-weight: 600; word-break: break-word; }
+.tread { margin-top: 6px; font-size: 12.5px; color: var(--ink-2); }
+.tms { margin-top: 8px; font-family: var(--mono); font-size: 10.5px; color: var(--ink-3); }
+
+/* ------------------------------------------------------- the query surface */
+
+.gwrap { margin-bottom: 30px; }
+.gtitle {
+  font-family: var(--display); font-size: 15px; letter-spacing: -.01em;
+  margin-bottom: 12px; display: flex; align-items: center; gap: 9px;
+}
+.gcount {
+  font-family: var(--mono); font-size: 11px; font-weight: 500; color: var(--ink-3);
+  border: 1px solid var(--line); border-radius: 20px; padding: 1px 9px;
+}
+.gtable { border: 1px solid var(--line); border-radius: 16px; overflow: hidden; background: var(--card); }
+.grow {
+  display: grid; grid-template-columns: 92px 1fr 62px; gap: 12px;
+  padding: 13px 16px; border-bottom: 1px solid var(--line-2); align-items: start;
+}
+.grow:last-child { border-bottom: 0; }
+.grow.surprise { background: var(--red-bg); }
+@media (max-width: 760px) { .grow { grid-template-columns: 1fr; } .gms { display: none; } }
+.rbadge {
+  font-family: var(--mono); font-size: 10px; letter-spacing: .06em;
+  border-radius: 6px; padding: 3px 8px; border: 1px solid var(--line);
+  display: inline-block;
+}
+.rbadge.fails    { background: var(--wash); color: var(--ink-2); }
+.rbadge.works    { background: var(--blue-bg); border-color: var(--blue-line); color: var(--blue-2); }
+.rbadge.surprise { background: var(--red-bg); border-color: var(--red-line); color: var(--red); }
+.glabel { font-size: 13.5px; font-weight: 600; margin-bottom: 6px; }
+.gq {
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.55; margin: 0 0 6px;
+  white-space: pre-wrap; word-break: break-word; color: var(--ink-2);
+  background: var(--wash); border: 1px solid var(--line-2);
+  border-radius: 8px; padding: 7px 9px;
+}
+.gdetail {
+  font-family: var(--mono); font-size: 11px; color: var(--ink-3);
+  word-break: break-word; line-height: 1.5;
+}
+.ginstead { margin-top: 7px; font-size: 12.5px; color: var(--ink-2); }
+.ginstead b { color: var(--ink); }
+.gms { font-family: var(--mono); font-size: 11px; color: var(--ink-3); text-align: right; }
+
+/* ---------------------------------------------------------- the narrative */
+
+.nrow {
+  border: 1px solid var(--line); border-radius: 14px; background: var(--card);
+  padding: 16px 18px; margin-bottom: 12px;
+}
+.nlabel { font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+.ndetail { font-size: 13px; color: var(--ink-2); max-width: 82ch; line-height: 1.65; }
+
+.ftr { padding: 40px 0 60px; border-top: 1px solid var(--line); margin-top: 40px; }
+.fnote { font-size: 12.5px; color: var(--ink-3); }
+.fnote code {
+  font-family: var(--mono); font-size: 11.5px; background: var(--wash);
+  border: 1px solid var(--line-2); border-radius: 5px; padding: 1px 6px;
+}
