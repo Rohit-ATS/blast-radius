@@ -97,6 +97,25 @@ def _translate(sql: str) -> str:
 # the adapter
 # --------------------------------------------------------------------------
 
+class Row(dict):
+    """A row that answers to a column name or to a position, as sqlite3.Row does.
+
+    Call sites written against SQLite use both — `row["email"]` reads better,
+    `row[0]` is shorter for a single-column count — and code shared between the
+    two backends must not have to care which it is talking to.
+    """
+
+    __slots__ = ()
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return dict.__getitem__(self, key)
+
+    def keys(self):                      # sqlite3.Row exposes this
+        return list(dict.keys(self))
+
+
 class _Cursor:
     """Just enough of sqlite3.Cursor for the call sites that exist."""
 
@@ -135,13 +154,21 @@ class PgConnection:
         self._putback = putback
         self.row_factory = None
 
+    def _cursor(self):
+        # row_factory is set by the caller exactly as it would be on sqlite3.
+        # When it is, rows come back keyed by column name instead of position.
+        if self.row_factory is not None:
+            from psycopg.rows import class_row
+            return self._conn.cursor(row_factory=class_row(Row))
+        return self._conn.cursor()
+
     def execute(self, sql: str, params: Sequence[Any] = ()):
-        cur = self._conn.cursor()
+        cur = self._cursor()
         cur.execute(_translate(sql), tuple(params))
         return _Cursor(cur)
 
     def executemany(self, sql: str, rows: Iterable[Sequence[Any]]):
-        cur = self._conn.cursor()
+        cur = self._cursor()
         cur.executemany(_translate(sql), [tuple(r) for r in rows])
         return _Cursor(cur)
 
@@ -220,7 +247,19 @@ def pool():
             timeout=float(config.number("PG_POOL_TIMEOUT", 15)),
             max_idle=300.0,
             kwargs={"autocommit": False,
-                    "application_name": "blast-radius"},
+                    "application_name": "blast-radius",
+                    # psycopg3 promotes a statement to a server-side PREPARE
+                    # after it has been seen a few times. Supabase's pooler runs
+                    # in transaction mode, where consecutive statements can land
+                    # on different backends, so the prepare and its reuse do not
+                    # share a session:
+                    #     DuplicatePreparedStatement: "_pg3_0" already exists
+                    # It appears only after a statement crosses the threshold,
+                    # which is why a first request succeeds and a later
+                    # identical one fails. Disabled outright — the pooler is the
+                    # supported way to reach Supabase from several workers, and
+                    # the plans this saves are for queries already indexed.
+                    "prepare_threshold": None},
             open=True,
         )
         # Without this the pool's finaliser tries to join its worker threads

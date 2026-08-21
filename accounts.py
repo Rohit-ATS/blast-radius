@@ -29,12 +29,19 @@ import os
 import re
 import secrets
 import sqlite3
+
+import sidecar
 import threading
 import time
 
 import config
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# Setting ACCOUNTS_DB explicitly means "use this SQLite file" and overrides the
+# Postgres routing in db(). Tests rely on it for isolation, and without the
+# override they would all share one real database and collide on email
+# uniqueness. Deployment does not set it, so production takes the Postgres path.
+_ACCOUNTS_DB_EXPLICIT = bool(os.environ.get("ACCOUNTS_DB"))
 ACCOUNTS_DB = os.environ.get("ACCOUNTS_DB", os.path.join(HERE, "accounts.db"))
 
 SUPABASE_URL = config.SUPABASE_URL
@@ -44,7 +51,10 @@ SUPABASE_ON = config.SUPABASE_ON
 
 KEY_PREFIX = "brk_live_"
 PBKDF2_ROUNDS = 310_000
-SESSION_DAYS = 30
+# A year, and renewed on every use (see session_account). "Logged in until I
+# log out" is the behaviour people expect from a tool they check during an
+# incident; being silently signed out mid-investigation is worse than useless.
+SESSION_DAYS = 365
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s.]+\.[^@\s]+$")
 
@@ -181,6 +191,26 @@ def db() -> sqlite3.Connection:
     several processes applying it at once is harmless once they can take turns.
     """
     global _ready
+
+    # Accounts belong in Postgres whenever there is one.
+    #
+    # This file used to live on the container filesystem, and on Render the web
+    # service has no disk — only the graph does. So every deploy, every restart
+    # and every OOM kill destroyed every account, every API key and every
+    # session on the instance. Users were not staying logged out because the
+    # cookie was short; they were staying logged out because the account the
+    # cookie pointed at no longer existed. Nothing about a 30-day cookie can
+    # survive a database that is deleted twice a day.
+    if sidecar.IS_POSTGRES and not _ACCOUNTS_DB_EXPLICIT:
+        conn = sidecar.connect()
+        conn.row_factory = sidecar.Row
+        if not _ready:
+            with _init_lock:
+                if not _ready:
+                    conn.executescript(_pg_schema())
+                    _ready = True
+        return conn
+
     conn = sqlite3.connect(ACCOUNTS_DB, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=30000")
@@ -204,6 +234,24 @@ def db() -> sqlite3.Connection:
                         f"{ACCOUNTS_DB} stayed locked while applying the schema; "
                         "another process may be holding a long write transaction")
     return conn
+
+
+def _pg_schema() -> str:
+    """The same schema, in the dialect Postgres accepts.
+
+    Only three constructs differ, and each is mechanical: PRAGMAs are a SQLite
+    configuration surface with no Postgres equivalent, AUTOINCREMENT is spelled
+    BIGSERIAL, and an index on a column that a CREATE TABLE already made UNIQUE
+    is redundant either way. Keeping one SCHEMA and translating it here means
+    the two backends cannot drift; maintaining two copies is how they would.
+    """
+    out = []
+    for line in SCHEMA.splitlines():
+        if line.strip().upper().startswith("PRAGMA"):
+            continue
+        out.append(line.replace("INTEGER PRIMARY KEY AUTOINCREMENT",
+                                "BIGSERIAL PRIMARY KEY"))
+    return chr(10).join(out)
 
 
 def _now() -> float:
@@ -356,8 +404,8 @@ def _mirror(user: dict, email: str) -> str:
         row = conn.execute("SELECT id FROM accounts WHERE id = ?", (uid,)).fetchone()
         if not row:
             conn.execute(
-                "INSERT OR IGNORE INTO accounts (id, email, name, provider, created_at) "
-                "VALUES (?,?,?,?,?)",
+                "INSERT INTO accounts (id, email, name, provider, created_at) "
+                "VALUES (?,?,?,?,?) ON CONFLICT (id) DO NOTHING",
                 (uid, email, (user.get("user_metadata") or {}).get("name"),
                  "supabase", _now()))
         conn.execute("UPDATE accounts SET last_seen_at = ? WHERE id = ?", (_now(), uid))
@@ -501,19 +549,49 @@ def start_session(account_id: str, ip: str = "", agent: str = "") -> str:
     return token
 
 
+# Renew a session when it has less than this much of its life left. Writing on
+# every request would mean a database write per page view for no added safety.
+SESSION_RENEW_AFTER = 30 * 86400
+
+
 def session_account(token: str | None) -> dict | None:
+    """Resolve a session cookie to its account.
+
+    Deliberately uncached. Caching this was tempting — it runs on every
+    authenticated request — but a cached session keeps authenticating after it
+    has been revoked or has expired, and the window is exactly the period in
+    which revoking mattered. On Render the database is in the same region as
+    the app, so the honest version is a single-digit-millisecond query; the
+    cache was buying speed against a problem that only existed when testing
+    from the other side of the country.
+    """
     if not token:
         return None
+
+    # One query, not two. The session row is useless without the account it
+    # points at, so fetching them separately doubled the latency of every
+    # authenticated request to learn something a join already knows.
     with db() as conn:
         row = conn.execute(
-            "SELECT account_id, expires_at FROM sessions WHERE token = ?", (token,)).fetchone()
+            "SELECT s.expires_at, a.id, a.email, a.name, a.provider, "
+            "       a.created_at, a.last_seen_at "
+            "FROM sessions s JOIN accounts a ON a.id = s.account_id "
+            "WHERE s.token = ?", (token,)).fetchone()
         if not row:
             return None
         if row["expires_at"] < _now():
             conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
             conn.commit()
             return None
-    return get_account(row["account_id"])
+        # Sliding expiry: someone who keeps using the tool never reaches the
+        # deadline. A fixed one logs out the people using it most.
+        if row["expires_at"] - _now() < SESSION_RENEW_AFTER:
+            conn.execute("UPDATE sessions SET expires_at = ? WHERE token = ?",
+                         (_now() + SESSION_DAYS * 86400, token))
+            conn.commit()
+
+    return {k: row[k] for k in
+            ("id", "email", "name", "provider", "created_at", "last_seen_at")}
 
 
 def end_session(token: str | None) -> None:

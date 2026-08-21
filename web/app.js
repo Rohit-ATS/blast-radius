@@ -295,6 +295,21 @@ async function renderMaintainers(name) {
 
 let running = false;
 
+function renderSidePanels(name, version) {
+  // Deliberately not awaited and deliberately not Promise.all'd: a rejection
+  // in one must not cancel or mask the others.
+  const panels = [
+    () => renderSemver(name, version),
+    () => renderMaintainers(name),
+    () => renderTyposquats(name),
+    () => loadMap(name),
+  ];
+  for (const run of panels) {
+    try { Promise.resolve(run()).catch(() => {}); } catch (_) { /* keep going */ }
+  }
+}
+
+
 async function runQuery(name, version) {
   if (running) return;
   running = true;
@@ -309,6 +324,19 @@ async function runQuery(name, version) {
   $('#latencysub').textContent = '';
   $('#hist').innerHTML = '<div class="skel">…</div>';
   $('#victims').innerHTML = '<div class="empty">…</div>';
+
+  // Started before the traversal is awaited, not after it resolves.
+  //
+  // Four of these five do not touch the graph — maintainer pivot and typosquats
+  // are sidecar queries and semver resolution is range arithmetic — and none of
+  // them need the traversal's answer. Running them afterwards meant they sat
+  // unstarted for the ~20s an unreachable graph takes to fail, and then, if the
+  // traversal threw, never ran at all: one red box and five empty frames, with
+  // the answers sitting one query away the whole time. Now they fill in as they
+  // land, and the traversal is just the slowest of six independent panels.
+  renderSidePanels(name, version);
+  syncUrl(name, version);
+  results.scrollIntoView({ behavior: 'smooth', block: 'start' });
 
   const t0 = performance.now();
   try {
@@ -339,25 +367,25 @@ async function runQuery(name, version) {
 
     renderHistogram(b.histogram);
     renderVictims(b);
-    renderSemver(name, version);
-    renderMaintainers(name);
-    renderTyposquats(name);
-    loadMap(name);
-    syncUrl(name, version);
-    results.scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (err) {
+    // Only the traversal failed. Everything below reads a different store and
+    // is started regardless — see the note above renderSidePanels.
     $('#latency').textContent = '—';
     $('#latencysub').textContent = '';
-    $('#verdictline').innerHTML = '';
-    $('#hist').innerHTML = '';
+    $('#verdictline').innerHTML =
+      `<b>${esc(name)}</b>${version ? '@' + esc(version) : ''} — blast radius unavailable`;
+    // A blank frame reads as "nothing to report", which is the opposite of
+    // what happened. Say which panel could not be filled and why.
+    $('#hist').innerHTML =
+      `<div class="note">the depth histogram comes from the graph traversal, which
+        did not answer. The panels below that do not use the graph are unaffected.</div>`;
     errorBox($('#victims'), err);
-    $('#semver').innerHTML = '';
-    $('#maint').innerHTML = '';
   } finally {
     running = false;
     btn.disabled = false;
     btn.textContent = 'check blast radius';
   }
+
 }
 
 /* ------------------------------------------------------------- lockfile */
