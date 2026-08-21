@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dashboard — Blast Radius</title>
+<meta name="description" content="Your monitors, alerts, API keys and security log.">
+<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='15' fill='none' stroke='%232f6bff' stroke-width='1' opacity='.28'/><circle cx='16' cy='16' r='10.5' fill='none' stroke='%232f6bff' stroke-width='1.5' opacity='.55'/><circle cx='16' cy='16' r='5' fill='%23d63a2f'/></svg>">
+</head>
+<body>
+
+<section class="pagehead rails">
+  <div class="wrap">
+    <p class="crumb"><a href="/">Blast Radius</a> <span>/</span> <span>Dashboard</span></p>
+    <div class="headrow">
+      <div>
+        <h1 id="hello">Your watch</h1>
+        <p class="lede" id="subhead">
+          Everything this instance is measuring on your behalf, updating live.
+        </p>
+      </div>
+      <div class="headcta">
+        <span class="st ok" id="rtstat"><svg viewBox="0 0 24 24"><use href="#i-pulse"/></svg> connecting</span>
+        <a class="btn" href="/check"><svg viewBox="0 0 24 24"><use href="#i-search"/></svg> Run a check</a>
+        <button class="btn" id="signout"><svg viewBox="0 0 24 24"><use href="#i-out"/></svg> Sign out</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<main class="pagebody rails">
+  <div class="wrap">
+    <div class="dashgrid">
+
+      <nav class="dashnav">
+        <button class="on" data-tab="overview"><svg viewBox="0 0 24 24"><use href="#i-radius"/></svg> Overview</button>
+        <button data-tab="monitors"><svg viewBox="0 0 24 24"><use href="#i-pulse"/></svg> Monitors <span class="count" id="c-mon">0</span></button>
+        <button data-tab="alerts"><svg viewBox="0 0 24 24"><use href="#i-alert"/></svg> Alerts <span class="count" id="c-alert">0</span></button>
+        <button data-tab="keys"><svg viewBox="0 0 24 24"><use href="#i-key"/></svg> API keys <span class="count" id="c-key">0</span></button>
+        <button data-tab="delivery"><svg viewBox="0 0 24 24"><use href="#i-out"/></svg> Notifications <span class="count" id="c-hook">0</span></button>
+        <button data-tab="security"><svg viewBox="0 0 24 24"><use href="#i-shield"/></svg> Security log</button>
+      </nav>
+
+      <div>
+        <!-- ---------------------------------------------------- overview -->
+        <section class="tabpane" data-pane="overview">
+          <div class="statgrid" id="stats"></div>
+
+          <div class="surface" style="margin-top:24px">
+            <div class="surface-hd">
+              <h3>Latest alerts</h3>
+              <div class="sp"><button class="btn" data-tab-jump="alerts">View all</button></div>
+            </div>
+            <div id="recentalerts"></div>
+          </div>
+
+          <div class="surface" style="margin-top:20px">
+            <div class="surface-hd">
+              <h3>What the watch is doing</h3>
+              <p class="full" id="watchnote">Each monitor is re-measured on a timer against the live graph.</p>
+            </div>
+            <div id="recentmonitors"></div>
+          </div>
+        </section>
+
+        <!-- ---------------------------------------------------- monitors -->
+        <section class="tabpane" data-pane="monitors" hidden>
+          <div class="block">
+            <h2><svg viewBox="0 0 24 24"><use href="#i-pulse"/></svg> 24-hour monitoring</h2>
+            <p class="lede">
+              Add a package and this instance keeps measuring its blast radius. Any movement
+              raises an alert here and on <code>/api/v1/alerts</code>.
+            </p>
+
+            <div class="surface surface-pad">
+              <form class="formrow" id="monform">
+                <div class="field" style="flex:1 1 260px">
+                  <label for="monpkg">Package</label>
+                  <input class="input mono" id="monpkg" placeholder="debug" spellcheck="false" required>
+                </div>
+                <div class="field" style="flex:1 1 200px">
+                  <label for="monlabel">Label <span class="muted">(optional)</span></label>
+                  <input class="input" id="monlabel" placeholder="production dependency">
+                </div>
+                <button class="btn btn-primary" type="submit">
+                  <svg viewBox="0 0 24 24"><use href="#i-plus"/></svg> Add monitor
+                </button>
+              </form>
+            </div>
+
+            <div class="surface" style="margin-top:20px">
+              <div class="surface-hd">
+                <h3>Watched packages</h3>
+                <div class="sp"><span class="st" id="monint">—</span></div>
+              </div>
+              <div id="monlist"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ------------------------------------------------------ alerts -->
+        <section class="tabpane" data-pane="alerts" hidden>
+          <div class="block">
+            <h2><svg viewBox="0 0 24 24"><use href="#i-alert"/></svg> Alerts</h2>
+            <p class="lede">Raised by the watch, newest first. These arrive over a live stream —
+              nothing on this page polls.</p>
+            <div class="surface">
+              <div class="surface-hd">
+                <h3>Alert stream</h3>
+                <div class="sp"><button class="btn" id="markread">Mark all read</button></div>
+              </div>
+              <div id="alertlist"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- -------------------------------------------------------- keys -->
+        <section class="tabpane" data-pane="keys" hidden>
+          <div class="block">
+            <h2><svg viewBox="0 0 24 24"><use href="#i-key"/></svg> API keys</h2>
+            <p class="lede">
+              Stored only as a SHA-256 digest and shown once at creation. Every call a key
+              makes is written to your security log.
+            </p>
+            <div id="keysurface"></div>
+            <p class="lede" style="margin-top:18px;font-size:14.5px">
+              Full reference, quickstarts and a live playground are on the
+              <a href="/developers" style="border-bottom:1px solid #e6e9ef">API page</a>.
+            </p>
+          </div>
+        </section>
+
+        <!-- ---------------------------------------------------- delivery -->
+        <section class="tabpane" data-pane="delivery" hidden>
+          <div class="block">
+            <h2><svg viewBox="0 0 24 24"><use href="#i-out"/></svg> Notifications</h2>
+            <p class="lede">
+              Alerts always land on this dashboard. Add a webhook and they also reach your
+              systems — a signed POST the moment the watch sees something move, so nothing
+              on your side has to poll.
+            </p>
+
+            <div class="notice blue" id="emailstate">
+              <svg viewBox="0 0 24 24"><use href="#i-at"/></svg>
+              <div>Checking email delivery…</div>
+            </div>
+
+            <div class="surface surface-pad" style="margin-top:20px">
+              <form class="formrow" id="hookform">
+                <div class="field" style="flex:1 1 340px">
+                  <label for="hookurl">Endpoint URL</label>
+                  <input class="input mono" id="hookurl" type="url"
+                         placeholder="https://hooks.example.com/blast-radius" required>
+                </div>
+                <div class="field" style="flex:1 1 180px">
+                  <label for="hooklabel">Label <span class="muted">(optional)</span></label>
+                  <input class="input" id="hooklabel" placeholder="ops slack relay">
+                </div>
+                <button class="btn btn-primary" type="submit">
+                  <svg viewBox="0 0 24 24"><use href="#i-plus"/></svg> Add endpoint
+                </button>
+              </form>
+            </div>
+
+            <div class="surface" style="margin-top:20px">
+              <div class="surface-hd">
+                <h3>Endpoints</h3>
+                <p class="full">Every delivery is signed. Verify
+                  <code>X-BlastRadius-Signature</code> against the endpoint secret before
+                  trusting a payload.</p>
+              </div>
+              <div id="hooklist"></div>
+            </div>
+
+            <div class="surface" style="margin-top:20px">
+              <div class="surface-hd"><h3>Verifying a delivery</h3></div>
+              <div class="surface-pad">
+                <div class="code">
+                  <div class="code-hd">
+                    <span class="lang">node</span>
+                    <span class="sp"><button class="ghost-btn" data-copy="#verifysnip">
+                      <svg viewBox="0 0 24 24"><use href="#i-copy"/></svg> Copy</button></span>
+                  </div>
+                  <pre id="verifysnip">const crypto = require('crypto');
+
+// req.body must be the RAW bytes, not the parsed object
+function verify(rawBody, header, secret) {
+  const parts = Object.fromEntries(header.split(',').map(p => p.split('=')));
+  const expected = crypto
+    .createHmac('sha256', secret)
+    .update(parts.t + '.' + rawBody)
+    .digest('hex');
+  const fresh = Math.abs(Date.now() / 1000 - Number(parts.t)) &lt; 300;
+  return fresh &amp;&amp; crypto.timingSafeEqual(
+    Buffer.from(expected), Buffer.from(parts.v1));
+}</pre>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ---------------------------------------------------- security -->
+        <section class="tabpane" data-pane="security" hidden>
+          <div class="block">
+            <h2><svg viewBox="0 0 24 24"><use href="#i-shield"/></svg> Security log</h2>
+            <p class="lede">
+              Every sign-in, key creation, key revocation and API call made with your keys,
+              with the address and agent that made it. Visible only to you.
+            </p>
+            <div class="surface">
+              <table class="logtable" id="logtable"></table>
+            </div>
+          </div>
+        </section>
+      </div>
+
+    </div>
+  </div>
+</main>
+
+<script src="/shell.js"></script>
+<script src="/dashboard.js"></script>
+</body>
+</html>

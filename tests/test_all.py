@@ -705,8 +705,10 @@ def page(requests_mod):
     pg.errors = []
     pg.on("console", lambda m: pg.errors.append(m.text) if m.type == "error" else None)
     pg.on("pageerror", lambda e: pg.errors.append(str(e)))
+    # The console lives at /check now; the landing page is marketing plus the
+    # live-ingest rail, which `landing` below covers.
     # networkidle never fires — the header polls /api/stats every 4 seconds.
-    pg.goto(BASE, wait_until="domcontentloaded")
+    pg.goto(f"{BASE}/check", wait_until="domcontentloaded")
     pg.wait_for_selector("#peek-hist .skel", state="detached", timeout=40_000)
     # ...and separately for the header's first successful poll. The histogram
     # and the header are fed by different endpoints, so the skeleton detaching
@@ -718,6 +720,26 @@ def page(requests_mod):
     yield pg
     browser.close()
     pw.stop()
+
+
+@pytest.fixture(scope="session")
+def landing(page):
+    """A second page on the landing route. `page` is session-scoped and drives
+    the console at /check; the ingest rail and project monitor render on / and
+    would otherwise have nowhere to be asserted against."""
+    # `page` was opened with browser.new_page(), which owns its context, so a
+    # sibling tab has to come from a context of its own.
+    ctx = page.context.browser.new_context(viewport={"width": 1600, "height": 1100})
+    pg = ctx.new_page()
+    pg.errors = []
+    pg.on("console", lambda m: pg.errors.append(m.text) if m.type == "error" else None)
+    pg.on("pageerror", lambda e: pg.errors.append(str(e)))
+    pg.goto(BASE, wait_until="domcontentloaded")
+    pg.wait_for_function(
+        "!document.querySelector('#statline').textContent.includes('connecting')",
+        timeout=40_000)
+    yield pg
+    ctx.close()
 
 
 def test_ui_loads_with_live_stats(page):
@@ -820,45 +842,45 @@ def test_ui_typosquat_panel(page):
     assert (page.text_content("#typos") or "").strip()
 
 
-def test_ui_ecosystem_rail_shows_every_registry(page):
+def test_ui_ecosystem_rail_shows_every_registry(landing):
     """One card per registry, each carrying the state the daemon recorded.
 
     The states are asserted against the vocabulary `live.py` can actually
     produce, so a card that renders a made-up status fails here rather than
     reassuring somebody during an incident.
     """
-    page.wait_for_selector(".eco", timeout=40_000)
-    cards = page.eval_on_selector_all(".eco", "e => e.length")
+    landing.wait_for_selector(".eco", timeout=40_000)
+    cards = landing.eval_on_selector_all(".eco", "e => e.length")
     assert cards == 5, f"expected five registries, got {cards}"
 
-    states = page.eval_on_selector_all(".eco .eco-state",
+    states = landing.eval_on_selector_all(".eco .eco-state",
                                        "e => e.map(x => x.textContent.trim())")
     allowed = {"live", "starting", "degraded", "backoff", "stopped"}
     assert set(states) <= allowed, states
 
     # every card carries a real count, not a dash
-    counts = page.eval_on_selector_all(".eco .eco-n",
+    counts = landing.eval_on_selector_all(".eco .eco-n",
                                        "e => e.map(x => x.textContent.trim())")
     assert all(c and c != "—" for c in counts), counts
 
 
-def test_ui_ingest_ticker_carries_real_publishes(page):
+def test_ui_ingest_ticker_carries_real_publishes(landing):
     """The ticker must show packages the daemon actually wrote, with the
     ecosystem it came from — or say plainly that nothing has landed."""
-    page.wait_for_selector("#ingestticker .tick, #ingestticker .empty",
+    landing.wait_for_selector("#ingestticker .tick, #ingestticker .empty",
                            timeout=40_000)
-    ticks = page.eval_on_selector_all("#ingestticker .tick", "e => e.length")
+    ticks = landing.eval_on_selector_all("#ingestticker .tick", "e => e.length")
     if not ticks:
-        assert "no publish" in page.text_content("#ingestticker").lower()
+        assert "no publish" in landing.text_content("#ingestticker").lower()
         return
-    badges = page.eval_on_selector_all(
+    badges = landing.eval_on_selector_all(
         "#ingestticker .tick .badge", "e => e.map(x => x.textContent.trim())")
     assert set(badges) <= {"npm", "PyPI", "crates.io", "Go", "Maven"}, badges
-    stat = page.text_content("#ingeststat")
+    stat = landing.text_content("#ingeststat")
     assert "graph writes" in stat, stat
 
 
-def test_ui_monitor_registers_and_streams(page, tmp_path):
+def test_ui_monitor_registers_and_streams(landing, tmp_path):
     """The whole integration path, driven the way a user drives it: drop a
     lockfile, get credentials back, hold an SSE stream open, then stop."""
     lock = tmp_path / "package-lock.json"
@@ -868,46 +890,46 @@ def test_ui_monitor_registers_and_streams(page, tmp_path):
                      "node_modules/express": {"name": "express", "version": "4.18.2"},
                      "node_modules/ms": {"name": "ms", "version": "2.1.3"}}}))
 
-    page.set_input_files("#monfile", str(lock))
+    landing.set_input_files("#monfile", str(lock))
     # 'registering…' is an intermediate state, so waiting for "not the initial
     # text" passes before anything has actually happened.
-    page.wait_for_function(
+    landing.wait_for_function(
         "document.querySelector('#mon-stat').textContent.includes('watching')",
         timeout=90_000)
 
-    stat = page.text_content("#mon-stat")
+    stat = landing.text_content("#mon-stat")
     assert "watching" in stat and "npm" in stat and "exact" in stat, stat
 
     # credentials come back and the token is not echoed into the URL bar
-    creds = page.eval_on_selector_all(".cred-row code", "e => e.map(x => x.textContent)")
+    creds = landing.eval_on_selector_all(".cred-row code", "e => e.map(x => x.textContent)")
     assert len(creds) >= 2 and len(creds[1]) > 20, creds
-    assert creds[1] not in page.url
+    assert creds[1] not in landing.url
 
-    page.wait_for_function(
+    landing.wait_for_function(
         "document.querySelector('#mon-alertstat').textContent.includes('streaming')",
         timeout=60_000)
 
-    page.click("#monstop")
-    page.wait_for_function(
+    landing.click("#monstop")
+    landing.wait_for_function(
         "document.querySelector('#mon-stat').textContent.includes('no project')",
         timeout=60_000)
-    assert page.eval_on_selector("#moncred", "e => e.hidden") is True
+    assert landing.eval_on_selector("#moncred", "e => e.hidden") is True
 
 
-def test_ui_monitor_refuses_a_file_that_is_not_a_manifest(page, tmp_path):
+def test_ui_monitor_refuses_a_file_that_is_not_a_manifest(landing, tmp_path):
     """A readable failure beats a registered project watching nothing."""
     junk = tmp_path / "notes.txt"
     junk.write_text("this is not a lockfile, it is a shopping list")
-    page.set_input_files("#monfile", str(junk))
-    page.wait_for_function(
+    landing.set_input_files("#monfile", str(junk))
+    landing.wait_for_function(
         "document.querySelector('#mon-stat').textContent.includes('could not')",
         timeout=60_000)
     # ...and the reason is shown rather than a blank panel
-    assert page.text_content("#monalerts").strip()
+    assert landing.text_content("#monalerts").strip()
     # This test deliberately provokes a 400, which the browser logs as a failed
     # resource. Leaving it in the shared error list would make the console-error
     # test fail on an error the suite asked for on purpose.
-    page.errors[:] = [e for e in page.errors if "400" not in e]
+    landing.errors[:] = [e for e in landing.errors if "400" not in e]
 
 
 def test_ui_no_console_errors(page):

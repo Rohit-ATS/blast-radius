@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Run a check — Blast Radius</title>
+<meta name="description" content="Measure the blast radius of a compromised npm package: who is transitively exposed, whose semver ranges would have pulled it, and whether your lockfile is hit.">
+<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='15' fill='none' stroke='%232f6bff' stroke-width='1' opacity='.28'/><circle cx='16' cy='16' r='10.5' fill='none' stroke='%232f6bff' stroke-width='1.5' opacity='.55'/><circle cx='16' cy='16' r='5' fill='%23d63a2f'/></svg>">
+</head>
+<body>
+
+<!-- ============================================================= page head -->
+<section class="pagehead rails">
+  <div class="wrap">
+    <p class="crumb"><a href="/">Blast Radius</a> <span>/</span> <span>Run a check</span></p>
+    <div class="headrow">
+      <div>
+        <h1>Measure a compromise <span class="mut">before it measures you</span></h1>
+        <p class="lede">
+          Name the package and the bad version. This walks the dependency graph five hops
+          out, resolves every declared range against that version, and tells you which of
+          the two numbers actually matters.
+        </p>
+      </div>
+      <div class="headcta">
+        <a class="btn" href="/developers"><svg viewBox="0 0 24 24"><use href="#i-doc"/></svg> Use the API</a>
+        <a class="btn" href="/dashboard"><svg viewBox="0 0 24 24"><use href="#i-pulse"/></svg> Monitor it</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<main class="pagebody rails">
+  <div class="wrap stack">
+
+    <!-- ------------------------------------------------------------ query -->
+    <section class="block">
+      <h2><svg viewBox="0 0 24 24"><use href="#i-search"/></svg> The incident</h2>
+      <p class="lede">Pick a documented compromise or type any package in the crawled graph.</p>
+
+      <div class="surface surface-pad">
+        <form class="query" id="queryform" autocomplete="off" style="max-width:none">
+          <div class="pill">
+            <label class="f grow">
+              <span>Package</span>
+              <input id="pkg" name="pkg" placeholder="debug" spellcheck="false" required>
+            </label>
+            <span class="sep" aria-hidden="true"></span>
+            <label class="f ver">
+              <span>Bad version</span>
+              <input id="ver" name="ver" placeholder="4.4.2" spellcheck="false">
+            </label>
+            <button type="submit" id="go">Check blast radius</button>
+          </div>
+          <div class="suggest" id="suggest" hidden></div>
+        </form>
+
+        <div class="chips" id="chips" style="margin-top:20px">
+          <span class="chiplabel">Real incidents:</span>
+          <button class="chip" data-pkg="debug" data-ver="4.4.2">debug@4.4.2 <small>qix account takeover · sep 2025</small></button>
+          <button class="chip" data-pkg="event-stream" data-ver="3.3.6">event-stream@3.3.6 <small>flatmap-stream backdoor · nov 2018</small></button>
+          <button class="chip" data-pkg="ua-parser-js" data-ver="0.7.29">ua-parser-js@0.7.29 <small>cryptominer · oct 2021</small></button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------- results -->
+    <section class="block" id="results" hidden>
+      <h2><svg viewBox="0 0 24 24"><use href="#i-radius"/></svg> The answer</h2>
+      <p class="lede" id="lede-answer">Every figure below came back from a query measured in real time.</p>
+
+      <div class="surface surface-pad" style="text-align:center">
+        <div class="verdictline" id="verdictline"></div>
+        <div class="latencyblock">
+          <div class="latency" id="latency">—</div>
+          <div class="latencysub" id="latencysub"></div>
+        </div>
+      </div>
+
+      <div class="resultgrid" style="margin-top:20px">
+        <div class="win span2">
+          <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">blast radius by depth</span></div>
+          <div class="body"><div class="hist" id="hist"></div></div>
+          <div class="cap">depth-histogram.log</div>
+        </div>
+
+        <div class="win">
+          <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">would this range have pulled it?</span></div>
+          <div class="body" id="semver"></div>
+          <div class="cap">semver-resolution.txt</div>
+        </div>
+
+        <div class="win">
+          <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">exposed packages</span></div>
+          <div class="body nopad"><div class="scroll" id="victims"></div></div>
+          <div class="cap">victims.list</div>
+        </div>
+
+        <div class="win">
+          <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">what the attacker owns next</span></div>
+          <div class="body nopad"><div class="scroll" id="maint"></div></div>
+          <div class="cap">maintainer-pivot.json</div>
+        </div>
+
+        <div class="win">
+          <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">names one typo away</span></div>
+          <div class="body nopad"><div class="scroll" id="typos"></div></div>
+          <div class="cap">typosquat-ring.json</div>
+        </div>
+
+        <div class="win span2">
+          <div class="bar">
+            <i class="dot r"></i><i class="dot a"></i><i class="dot g"></i>
+            <span class="title">the blast radius, drawn</span>
+            <span class="barctl">
+              <button type="button" class="mini" data-mapdepth="1">1</button>
+              <button type="button" class="mini" data-mapdepth="2">2</button>
+              <button type="button" class="mini on" data-mapdepth="3">3</button>
+              <button type="button" class="mini" data-mapdepth="4">4</button>
+            </span>
+          </div>
+          <div class="body nopad">
+            <div class="mapwrap">
+              <svg id="map" viewBox="0 0 760 760" role="img" aria-label="radial map of the packages exposed by this compromise"></svg>
+              <div class="maptip" id="maptip" hidden></div>
+              <div class="maplegend" id="maplegend"></div>
+            </div>
+          </div>
+          <div class="cap">blast-map.svg — click any package to pivot the whole check onto it</div>
+        </div>
+      </div>
+
+      <div class="surface surface-pad" id="watchcta" style="margin-top:20px">
+        <div class="formrow">
+          <div class="grow" style="flex:1 1 320px">
+            <div class="row-t" style="font-weight:600;font-size:15.5px;letter-spacing:-.02em">Keep watching this package</div>
+            <p class="lede" style="margin-top:6px;font-size:14px">
+              Add it to the 24-hour watch and every change in its blast radius raises an
+              alert on your dashboard — no polling on your side.
+            </p>
+          </div>
+          <button class="btn btn-primary" id="watchbtn">
+            <svg viewBox="0 0 24 24"><use href="#i-pulse"/></svg> <span>Monitor this package</span>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- --------------------------------------------------------- lockfile -->
+    <section class="block" id="lockfile">
+      <h2><svg viewBox="0 0 24 24"><use href="#i-lock"/></svg> Is my app affected?</h2>
+      <p class="lede">
+        Drop a real package-lock.json. It is read in your browser, posted once, and never
+        stored. The check runs against the incident above and returns the exact dependency
+        path that reaches you.
+      </p>
+
+      <div class="drop" id="drop" tabindex="0" role="button" aria-label="drop your package-lock.json here">
+        <div class="dropinner">
+          <div class="dropicon" aria-hidden="true">
+            <svg viewBox="0 0 40 48" width="40" height="48"><path d="M6 2h20l10 10v34H6Z" fill="#eef3ff" stroke="#c3d2ee" stroke-width="1.6"/><path d="M26 2v10h10" fill="none" stroke="#c3d2ee" stroke-width="1.6"/><path d="M20 20v16M13 29l7 7 7-7" fill="none" stroke="#2f6bff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+          <div class="droptext">Drop your <b>package-lock.json</b></div>
+          <div class="dropsub">or <button type="button" class="linkbtn" id="pick">choose a file</button> · v1, v2 and v3 all work</div>
+        </div>
+        <input type="file" id="file" accept=".json,application/json" hidden>
+      </div>
+
+      <div class="lockresult" id="lockresult" hidden style="margin-top:22px">
+        <div class="verdict" id="verdict"></div>
+        <div class="win">
+          <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">how it reaches you</span></div>
+          <div class="body" id="lockdetail"></div>
+          <div class="cap">lockfile-scan.txt</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------------ audit -->
+    <section class="block" id="audit">
+      <h2><svg viewBox="0 0 24 24"><use href="#i-shield"/></svg> Is anything already malicious?</h2>
+      <p class="lede">
+        The check above answers "am I exposed to <i>this</i> incident". This one answers the
+        question you have before anyone tells you there is an incident — every package in
+        your lockfile against <a href="https://osv.dev" style="border-bottom:1px solid #e6e9ef">osv.dev</a>,
+        including <code>MAL-</code> identifiers for confirmed malicious packages.
+      </p>
+
+      <div class="drop" id="auditdrop" tabindex="0" role="button" aria-label="drop a package-lock.json to scan for known malware">
+        <div class="dropinner">
+          <div class="dropicon" aria-hidden="true">
+            <svg viewBox="0 0 40 48" width="40" height="48"><path d="M6 2h20l10 10v34H6Z" fill="#eef3ff" stroke="#c3d2ee" stroke-width="1.6"/><path d="M26 2v10h10" fill="none" stroke="#c3d2ee" stroke-width="1.6"/><circle cx="20" cy="30" r="7" fill="none" stroke="#2f6bff" stroke-width="2"/><path d="M25 35l6 6" stroke="#2f6bff" stroke-width="2" stroke-linecap="round"/></svg>
+          </div>
+          <div class="droptext">Scan my <b>package-lock.json</b> for known malware</div>
+          <div class="dropsub">or <button type="button" class="linkbtn" id="auditpick">choose a file</button> · checked live against osv.dev · nothing is stored</div>
+        </div>
+        <input type="file" id="auditfile" accept=".json,application/json" hidden>
+      </div>
+
+      <div class="auditresult" id="auditresult" hidden style="margin-top:22px">
+        <div class="verdict" id="auditverdict"></div>
+        <div class="win">
+          <div class="bar"><i class="dot r"></i><i class="dot a"></i><i class="dot g"></i><span class="title">what is in your tree</span></div>
+          <div class="body nopad"><div id="auditfindings"></div></div>
+          <div class="cap">osv-audit.json</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- --------------------------------------------------------- explorer -->
+    <section class="block" id="explorer">
+      <h2><svg viewBox="0 0 24 24"><use href="#i-graph"/></svg> Walk the graph yourself</h2>
+      <p class="lede">
+        Every node is a real vertex in HydraDB. Click one and the browser asks the database
+        what is adjacent to it — packages, the people who publish them, and the advisories
+        filed against them.
+      </p>
+
+      <div class="win">
+        <div class="bar">
+          <i class="dot r"></i><i class="dot a"></i><i class="dot g"></i>
+          <span class="title">graph explorer</span>
+          <span class="barctl">
+            <button type="button" class="mini" data-seed="debug" data-kind="package">debug</button>
+            <button type="button" class="mini" data-seed="qix" data-kind="maintainer">qix</button>
+            <button type="button" class="mini" data-seed="getcookies" data-kind="package">getcookies</button>
+            <button type="button" class="mini" id="explorerreset">reset</button>
+          </span>
+        </div>
+        <div class="body nopad">
+          <div class="graphwrap">
+            <svg id="graph" viewBox="0 0 1000 620" role="img" aria-label="interactive view of the hydradb graph"></svg>
+            <div class="maptip" id="graphtip" hidden></div>
+            <div class="graphlegend" id="graphlegend"></div>
+            <div class="graphstat" id="graphstat"></div>
+          </div>
+        </div>
+        <div class="cap">hydradb-explorer — click a node to expand it, drag to rearrange</div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------- live + sys -->
+    <section class="block" id="live">
+      <h2><svg viewBox="0 0 24 24"><use href="#i-pulse"/></svg> npm, right now</h2>
+      <p class="lede">
+        Every package published to npm in the last few minutes, checked against the graph as
+        it arrives. The ones worth watching are the packages thousands of things already
+        depend on.
+      </p>
+
+      <div class="win">
+        <div class="bar">
+          <i class="dot r"></i><i class="dot a"></i><i class="dot g"></i>
+          <span class="title">live publish feed</span>
+          <span class="barctl"><span class="feedstat" id="feedstat">connecting…</span></span>
+        </div>
+        <div class="body nopad"><div class="ticker" id="ticker"></div></div>
+        <div class="cap">npm-changes.log — polled from replicate.npmjs.com every few seconds</div>
+      </div>
+    </section>
+
+    <section class="block" id="status">
+      <h2><svg viewBox="0 0 24 24"><use href="#i-cube"/></svg> The system, right now</h2>
+      <p class="lede">Pushed over server-sent events, not polled. The same health check
+        <code>verify.py</code> and <code>chaos.py</code> assert against.</p>
+      <div class="syscards" id="syscards"></div>
+      <p class="sysnote" id="sysnote"></p>
+    </section>
+
+  </div>
+</main>
+
+<!-- app.js warms three panels the landing page used to carry. This page has no
+     place for them, so they stay as sinks rather than being torn out of a file
+     this page does not own. -->
+<div hidden aria-hidden="true">
+  <div id="peek-hist"><div class="skel">querying graph…</div></div>
+  <div id="peek-maint"><div class="skel">querying sidecar…</div></div>
+  <div id="peek-graph"><div class="skel">counting…</div></div>
+  <button id="resetall" type="button"></button>
+</div>
+
+<script src="/shell.js"></script>
+<script src="/app.js"></script>
+<script src="/check.js"></script>
+</body>
+</html>

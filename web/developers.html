@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>API — Blast Radius</title>
+<meta name="description" content="The Blast Radius API: free, unlimited, MIT licensed. Create a key, call the same endpoints the console uses, and copy the whole reference as text or Markdown for your agent.">
+<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='15' fill='none' stroke='%232f6bff' stroke-width='1' opacity='.28'/><circle cx='16' cy='16' r='10.5' fill='none' stroke='%232f6bff' stroke-width='1.5' opacity='.55'/><circle cx='16' cy='16' r='5' fill='%23d63a2f'/></svg>">
+</head>
+<body>
+
+<!-- ============================================================= page head -->
+<section class="pagehead rails">
+  <div class="wrap">
+    <p class="crumb"><a href="/">Blast Radius</a> <span>/</span> <span>API</span></p>
+    <div class="headrow">
+      <div>
+        <h1>One API for npm <span class="mut">supply-chain exposure</span></h1>
+        <p class="lede">
+          The same code path the console runs, behind a stable <code>/api/v1</code> contract.
+          Free forever, no rate limit, no usage cap, no card. Create a key and start calling.
+        </p>
+        <div style="display:flex;gap:9px;flex-wrap:wrap;margin-top:22px">
+          <span class="st ok"><svg viewBox="0 0 24 24"><use href="#i-check"/></svg> No rate limit</span>
+          <span class="st ok"><svg viewBox="0 0 24 24"><use href="#i-check"/></svg> No quota</span>
+          <span class="st ok"><svg viewBox="0 0 24 24"><use href="#i-check"/></svg> No card</span>
+          <span class="st blue"><svg viewBox="0 0 24 24"><use href="#i-github"/></svg> MIT licensed</span>
+        </div>
+      </div>
+      <div class="headcta">
+        <a class="btn" href="/api/docs" target="_blank" rel="noopener">
+          <svg viewBox="0 0 24 24"><use href="#i-out"/></svg> OpenAPI
+        </a>
+        <a class="btn btn-primary" href="#keys"><svg viewBox="0 0 24 24"><use href="#i-key"/></svg> Get a key</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<main class="pagebody rails">
+  <div class="wrap stack">
+
+    <!-- -------------------------------------------------------- your keys -->
+    <section class="block" id="keys">
+      <h2><svg viewBox="0 0 24 24"><use href="#i-key"/></svg> Your API keys</h2>
+      <p class="lede">
+        Keys are shown once and stored only as a SHA-256 digest — a copy of the database
+        yields nothing usable. Revoking takes effect on the very next request.
+      </p>
+      <div id="keysurface"></div>
+    </section>
+
+    <!-- ------------------------------------------------------- quickstart -->
+    <section class="block" id="quickstart">
+      <h2><svg viewBox="0 0 24 24"><use href="#i-bolt"/></svg> Quickstart</h2>
+      <p class="lede">Every snippet below is filled in with your live host, and with your key
+        if you have one selected.</p>
+      <div class="surface">
+        <div class="surface-hd">
+          <h3>Call it from anywhere</h3>
+          <div class="sp"><div class="tabs" id="qstabs"></div></div>
+        </div>
+        <div class="surface-pad" id="qsbody"></div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------- playground -->
+    <section class="block" id="playground">
+      <h2><svg viewBox="0 0 24 24"><use href="#i-search"/></svg> Try it now</h2>
+      <p class="lede">
+        A real request against this instance, using a real key. What comes back here is what
+        comes back to your code.
+      </p>
+
+      <div class="surface">
+        <div class="surface-hd">
+          <h3>Playground</h3>
+          <div class="sp"><span class="st" id="playstat">ready</span></div>
+        </div>
+        <div class="surface-pad">
+          <div class="field" style="margin-bottom:16px">
+            <label for="playkey">API key</label>
+            <input class="input mono" id="playkey" type="password"
+                   placeholder="brk_live_… — paste one, or create a key above"
+                   autocomplete="off" spellcheck="false">
+            <span class="hint">Used only by this tab, for this request. Never stored,
+              never sent anywhere but this instance.</span>
+          </div>
+
+          <div class="formrow">
+            <div class="field" style="flex:1 1 260px">
+              <label for="playep">Endpoint</label>
+              <select class="input" id="playep"></select>
+            </div>
+            <div class="field" style="flex:1 1 180px">
+              <label for="playname">Package</label>
+              <input class="input mono" id="playname" value="debug" spellcheck="false">
+            </div>
+            <div class="field" style="flex:0 1 150px">
+              <label for="playver">Bad version</label>
+              <input class="input mono" id="playver" value="4.4.2" spellcheck="false">
+            </div>
+            <button class="btn btn-primary" id="playrun">Send request</button>
+          </div>
+
+          <div class="code" style="margin-top:18px">
+            <div class="code-hd">
+              <span class="lang">request</span>
+              <span class="sp">
+                <button class="ghost-btn" id="copyreq"><svg viewBox="0 0 24 24"><use href="#i-copy"/></svg> Copy</button>
+              </span>
+            </div>
+            <pre id="playreq">select an endpoint</pre>
+          </div>
+
+          <div class="code tall" style="margin-top:14px">
+            <div class="code-hd">
+              <span class="lang">response</span>
+              <span class="sp">
+                <button class="ghost-btn" id="copyres"><svg viewBox="0 0 24 24"><use href="#i-copy"/></svg> Copy</button>
+              </span>
+            </div>
+            <pre id="playres">// press "Send request"</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------------- docs -->
+    <section class="block" id="reference">
+      <h2><svg viewBox="0 0 24 24"><use href="#i-book"/></svg> Reference</h2>
+      <p class="lede">
+        Rendered from the same definition the server routes from, so it cannot drift.
+        Copy the whole thing as plain text or Markdown — the Markdown is written to be
+        pasted straight into an AI agent's context.
+      </p>
+
+      <div class="surface">
+        <div class="surface-hd">
+          <h3>Full API reference</h3>
+          <div class="sp">
+            <button class="btn" id="copytxt"><svg viewBox="0 0 24 24"><use href="#i-copy"/></svg> Copy as text</button>
+            <button class="btn" id="copymd"><svg viewBox="0 0 24 24"><use href="#i-copy"/></svg> Copy as Markdown</button>
+            <a class="btn" href="/api/docs.md" download="blast-radius-api.md">
+              <svg viewBox="0 0 24 24"><use href="#i-doc"/></svg> Download .md
+            </a>
+          </div>
+          <p class="full">
+            Also served raw at <code>/api/docs.md</code>, <code>/api/docs.txt</code> and
+            <code>/api/docs.json</code> — point an agent straight at those.
+          </p>
+        </div>
+        <div id="endpoints"></div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------- monitoring -->
+    <section class="block" id="monitoring">
+      <h2><svg viewBox="0 0 24 24"><use href="#i-pulse"/></svg> 24-hour monitoring</h2>
+      <p class="lede">
+        Register a package once and this instance keeps measuring it. When its blast radius
+        moves, an alert lands on your dashboard and on <code>/api/v1/alerts</code> — you do
+        not poll, and you do not run the traversal yourself.
+      </p>
+
+      <div class="surface surface-pad">
+        <div class="code">
+          <div class="code-hd">
+            <span class="lang">bash</span>
+            <span class="sp"><button class="ghost-btn" data-copy="#monitorsnip"><svg viewBox="0 0 24 24"><use href="#i-copy"/></svg> Copy</button></span>
+          </div>
+          <pre id="monitorsnip"></pre>
+        </div>
+        <p class="lede" style="margin-top:18px;font-size:14.5px">
+          Alerts carry a level — <code>info</code>, <code>notable</code>, <code>high</code>,
+          <code>critical</code> — derived from how far the exposure moved, plus the before
+          and after counts so you can gate a deploy on the delta rather than on the absolute.
+        </p>
+      </div>
+    </section>
+
+    <!-- ----------------------------------------------------------- errors -->
+    <section class="block" id="errors">
+      <h2><svg viewBox="0 0 24 24"><use href="#i-alert"/></svg> Errors</h2>
+      <p class="lede">Every failure carries a machine-readable <code>error</code> code as well
+        as prose. There is no 500 without a body.</p>
+      <div class="surface">
+        <table class="logtable" id="errtable"></table>
+      </div>
+    </section>
+
+  </div>
+</main>
+
+<script src="/shell.js"></script>
+<script src="/developers.js"></script>
+</body>
+</html>
