@@ -17,6 +17,8 @@ before anyone opens an advisory.**
 
 ---
 
+[![Try it here](https://blast-radius-web-zc8b.onrender.com/)
+
 Four questions matter during a supply-chain incident, and none of them is
 "which packages are similar to this one":
 
