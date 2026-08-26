@@ -803,6 +803,17 @@ computed live from the crawled graph.
   crawler records the name→id map and the suite asserts zero collisions across
   the entire corpus.
 
+## How this was built
+
+Built with [Claude Code](https://claude.com/claude-code) (Claude Opus), directed by
+[@Rohit-ATS](https://github.com/Rohit-ATS). The architecture, the data modelling, the HydraDB
+constraint work documented above and every accuracy call in this README are mine; the AI wrote
+code against those decisions, and I reviewed and tested what it produced. The 381 tests are the
+part that decides whether any of it was right.
+
+Built for Hack Hydra, and stated here so the AI assistance behind it is on the record rather
+than left to be inferred.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
